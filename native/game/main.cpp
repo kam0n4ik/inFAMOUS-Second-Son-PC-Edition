@@ -13,6 +13,7 @@
 //   --package <file.xpps>   character package override
 //   --modules <file.txt>    write the list of loaded DLLs at exit (dependency audit)
 //   --autoplay              scripted input for automated runs (walk, turn, jump)
+//   --chunk <path.xpps>     world chunk override (relative to [Game] DataDir)
 #include <windows.h>
 #include <psapi.h>
 #include <shellapi.h>
@@ -38,6 +39,7 @@
 #include "scene/camera.h"
 #include "scene/character_model.h"
 #include "scene/primitives.h"
+#include "scene/world_scene.h"
 
 using namespace sspc;
 
@@ -51,6 +53,7 @@ struct Args {
     std::wstring package;
     std::wstring modules;
     bool autoplay = false;
+    std::string chunk;
 };
 
 Args ParseArgs() {
@@ -67,6 +70,7 @@ Args ParseArgs() {
         else if (s == L"--package") a.package = next();
         else if (s == L"--modules") a.modules = next();
         else if (s == L"--autoplay") a.autoplay = true;
+        else if (s == L"--chunk") a.chunk = log::Narrow(next());
     }
     LocalFree(argv);
     return a;
@@ -179,20 +183,32 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         log::Error("app", "set [Game] DataDir / CharacterPackage in SecondSonPC.ini (game files are not shipped)");
     }
 
-    res::MeshData ground_even, ground_odd;
-    MakeGroundGrid(40, 1.0f, ground_even, ground_odd);
-    const MeshHandle h_even = renderer.UploadMesh(ground_even, "ground-even");
-    const MeshHandle h_odd = renderer.UploadMesh(ground_odd, "ground-odd");
-    const std::vector<Aabb> obstacles = {
-        {{3, -1, 0}, {4.5f, 1, 0.5f}},   {{5, 2, 0}, {6, 3, 1.0f}},
-        {{-4, 3, 0}, {-2, 5, 0.3f}},     {{-6, -5, 0}, {-5, -2, 2.0f}},
-    };
+    // World: a chunk of the original environment, or the test ground with crates.
+    WorldScene world;
+    bool have_world = false;
+    const std::string chunk = args.chunk.empty() ? cfg.GetString("World", "ChunkPackage", "") : args.chunk;
+    if (!chunk.empty()) {
+        std::string world_error;
+        have_world = LoadWorldChunk(Join(data_dir, log::Widen(chunk)), renderer, jobs, world, world_error);
+        if (!have_world) log::Error("app", "world chunk not loaded: {} (using the test ground)", world_error);
+    }
+    MeshHandle h_even = kInvalidMesh, h_odd = kInvalidMesh;
+    std::vector<Aabb> obstacles;
     std::vector<MeshHandle> obstacle_meshes;
-    for (const Aabb& b : obstacles) obstacle_meshes.push_back(renderer.UploadMesh(MakeBox(b.min, b.max), "crate"));
+    if (!have_world) {
+        res::MeshData ground_even, ground_odd;
+        MakeGroundGrid(40, 1.0f, ground_even, ground_odd);
+        h_even = renderer.UploadMesh(ground_even, "ground-even");
+        h_odd = renderer.UploadMesh(ground_odd, "ground-odd");
+        obstacles = {
+            {{3, -1, 0}, {4.5f, 1, 0.5f}}, {{5, 2, 0}, {6, 3, 1.0f}},
+            {{-4, 3, 0}, {-2, 5, 0.3f}},   {{-6, -5, 0}, {-5, -2, 2.0f}},
+        };
+        for (const Aabb& b : obstacles) obstacle_meshes.push_back(renderer.UploadMesh(MakeBox(b.min, b.max), "crate"));
+    }
 
-    // Model space: normalised so that the whole character spans z in [-1, 1] (feet at -1).
-    const float model_scale = static_cast<float>(cfg.GetFloat("Character", "ModelScale", 0.9));
-    const float model_feet = have_model ? model.bounds_min.z : -1.0f;
+    // Meshes are decoded in metres with the model origin at the feet (game centimetres / 100).
+    const float model_scale = static_cast<float>(cfg.GetFloat("Character", "ModelScale", 1.0));
 
     // --- Loop --------------------------------------------------------------------------------
     CharacterParams params;
@@ -200,8 +216,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     params.run_speed = static_cast<float>(cfg.GetFloat("Character", "RunSpeed", params.run_speed));
     params.jump_speed = static_cast<float>(cfg.GetFloat("Character", "JumpSpeed", params.jump_speed));
     params.gravity = static_cast<float>(cfg.GetFloat("Character", "Gravity", params.gravity));
+    params.ground_plane = !have_world;
     CharacterState player;
+    if (have_world) player.position = world.spawn;
     CharacterState prev_player = player;
+    const float kill_z = have_world ? world.terrain.BoundsMin().z - 30.0f : -100.0f;
     OrbitCamera orbit;
     orbit.sensitivity = static_cast<float>(cfg.GetFloat("Input", "MouseSensitivity", orbit.sensitivity));
     FreeCamera free_cam;
@@ -274,28 +293,38 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 mi.jump = pending_jump;
             }
             mi.camera_yaw = orbit.ForwardYaw();
-            StepCharacter(player, params, mi, static_cast<float>(sim.Step()), obstacles);
+            StepCharacter(player, params, mi, static_cast<float>(sim.Step()), obstacles,
+                          have_world ? &world.terrain : nullptr);
             pending_jump = false;
+            if (player.position.z < kill_z) {  // fell through a hole in the walkable surfaces: respawn
+                player = CharacterState{};
+                player.position = have_world ? world.spawn : Vec3{0, 0, 0};
+                prev_player = player;
+                log::Info("app", "respawned (fell below {:.1f} m)", kill_z);
+            }
         }
         const float alpha = static_cast<float>(sim.Alpha());
         const Vec3 render_pos = Lerp(prev_player.position, player.position, alpha);
         orbit.target = render_pos + Vec3{0, 0, 1.45f};
 
         std::vector<DrawItem> items;
-        items.push_back({h_even, Mat4::Identity(), {0.46f, 0.47f, 0.45f, 1}});
-        items.push_back({h_odd, Mat4::Identity(), {0.38f, 0.39f, 0.37f, 1}});
-        for (MeshHandle h : obstacle_meshes) items.push_back({h, Mat4::Identity(), {0.55f, 0.40f, 0.26f, 1}});
-        const Mat4 world = Mat4::Translation(render_pos) * Mat4::RotationZ(player.yaw) * Mat4::Scale(model_scale) *
-                           Mat4::Translation({0, 0, -model_feet});
+        if (have_world) {
+            items.insert(items.end(), world.draws.begin(), world.draws.end());
+        } else {
+            items.push_back({h_even, Mat4::Identity(), {0.46f, 0.47f, 0.45f, 1}});
+            items.push_back({h_odd, Mat4::Identity(), {0.38f, 0.39f, 0.37f, 1}});
+            for (MeshHandle h : obstacle_meshes) items.push_back({h, Mat4::Identity(), {0.55f, 0.40f, 0.26f, 1}});
+        }
+        const Mat4 hero_world = Mat4::Translation(render_pos) * Mat4::RotationZ(player.yaw) * Mat4::Scale(model_scale);
         for (size_t i = 0; i < part_handles.size(); ++i) {
             if (!part_visible[i] || part_handles[i] == kInvalidMesh) continue;
             Vec4 c = PartColor(i);
             if (i == selected_part && window.MouseCaptured() == false) c = {0.95f, 0.55f, 0.20f, 1};
-            items.push_back({part_handles[i], world, c});
+            items.push_back({part_handles[i], hero_world, c});
         }
         FrameView fv;
         fv.view = free_mode ? free_cam.View() : orbit.View();
-        fv.projection = Mat4::Perspective(60.0f * kPi / 180.0f, renderer.AspectRatio(), 0.05f, 500.0f);
+        fv.projection = Mat4::Perspective(60.0f * kPi / 180.0f, renderer.AspectRatio(), 0.1f, 2000.0f);
         if (args.frames >= 0 && frame + 1 == static_cast<u64>(args.frames) && !args.screenshot.empty()) {
             renderer.RequestScreenshot(args.screenshot);
         }

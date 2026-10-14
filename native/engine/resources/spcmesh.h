@@ -3,7 +3,7 @@
 // Little-endian. Layout:
 //   SpcMeshHeader (64 bytes) | SpcMeshEntry[mesh_count] (96 bytes each) | vertex/index blobs
 // Every offset/size is validated against the file size; a CRC-32 covers everything after the
-// header. Version 1 vertex layout: position f32x3 [+ normal f32x3] [+ uv0 f32x2]; indices u32.
+// header. Vertex layout (v1 and v2; v2 stores metres instead of normalised units): position f32x3 [+ normal f32x3] [+ uv0 f32x2]; indices u32.
 #pragma once
 
 #include <span>
@@ -16,7 +16,7 @@
 namespace sspc::res {
 
 inline constexpr char kSpcMeshMagic[4] = {'S', 'P', 'C', 'M'};
-inline constexpr u16 kSpcMeshVersion = 1;
+inline constexpr u16 kSpcMeshVersion = 2;  // 2: positions in metres (dequantised)
 inline constexpr u16 kSpcMeshByteOrder = 0xFEFF;
 
 enum SpcVertexFlags : u32 {

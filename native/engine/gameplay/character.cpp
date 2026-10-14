@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "gameplay/terrain.h"
+
 namespace sspc {
 namespace {
 
@@ -12,9 +14,15 @@ float WrapAngle(float a) {
     return a;
 }
 
+constexpr float kNoGround = -1e30f;
+
 // Highest support under the cylinder footprint at height <= feet + step.
-float GroundHeight(const Vec3& feet, float radius, float step, std::span<const Aabb> obstacles) {
-    float g = 0.0f;
+float GroundHeight(const Vec3& feet, float radius, float step, std::span<const Aabb> obstacles,
+                   const TerrainGrid* terrain, bool plane) {
+    float g = plane ? 0.0f : kNoGround;
+    if (terrain) {
+        if (auto h = terrain->HeightAt(feet.x, feet.y, feet.z + step)) g = std::max(g, *h);
+    }
     for (const Aabb& b : obstacles) {
         if (feet.x + radius <= b.min.x || feet.x - radius >= b.max.x || feet.y + radius <= b.min.y ||
             feet.y - radius >= b.max.y) {
@@ -60,7 +68,7 @@ void ResolveHorizontal(CharacterState& s, const CharacterParams& p, std::span<co
 }  // namespace
 
 void StepCharacter(CharacterState& s, const CharacterParams& p, const MoveInput& in, float dt,
-                   std::span<const Aabb> obstacles) {
+                   std::span<const Aabb> obstacles, const TerrainGrid* terrain) {
     s.landed_this_step = false;
     // Desired horizontal velocity, camera relative.
     const float cy = std::cos(in.camera_yaw), sy = std::sin(in.camera_yaw);
@@ -100,7 +108,7 @@ void StepCharacter(CharacterState& s, const CharacterParams& p, const MoveInput&
     ResolveHorizontal(s, p, obstacles);
     s.position.z += s.velocity.z * dt;
 
-    const float ground = GroundHeight(s.position, p.radius * 0.7f, p.step_height, obstacles);
+    const float ground = GroundHeight(s.position, p.radius * 0.7f, p.step_height, obstacles, terrain, p.ground_plane);
     if (s.position.z <= ground) {
         if (!s.grounded) s.landed_this_step = true;
         s.position.z = ground;

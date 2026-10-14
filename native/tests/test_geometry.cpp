@@ -38,6 +38,8 @@ std::vector<u8> GeometryPackage(const GeoOpts& o = {}) {
     b.Put<u64>(b.cpu, g + 0x18, 1ull | (0x600bull << 16) | (0ull << 48) | (6ull << 56));
     const float aabb[6] = {0, 0, 0, o.aabb_max_x, 1, 0};
     std::memcpy(b.cpu.data() + g + 0x20, aabb, sizeof(aabb));
+    const float dequant[4] = {0, 0, 0, 100.0f};  // offset 0, scale 100 cm -> normalised 1 = 1 m
+    std::memcpy(b.cpu.data() + g + 0x38, dequant, sizeof(dequant));
     b.Put<u32>(b.cpu, g + 0x58, gpu + 0x80);
     b.Put<u32>(b.cpu, g + 0x60, vs);
     b.Put<u32>(b.cpu, g + 0x68, o.index_count);
@@ -178,7 +180,7 @@ TEST(spcmesh_roundtrip_and_corruption) {
     bad.resize(bad.size() - 4);
     CHECK(!ReadSpcMesh(bad, out, &err));
     bad = file;
-    bad[4] = 2;  // version
+    bad[4] = 9;  // unsupported version
     CHECK(!ReadSpcMesh(bad, out, &err) && err.find("version") != std::string::npos);
     CHECK(!ReadSpcMesh(std::span<const u8>(file.data(), 10), out, &err));
 

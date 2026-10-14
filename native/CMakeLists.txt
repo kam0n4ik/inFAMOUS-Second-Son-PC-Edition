@@ -84,6 +84,9 @@ add_library(sspc_engine STATIC
     engine/gameplay/character.cpp
     engine/scene/primitives.cpp
     engine/scene/character_model.cpp
+    engine/scene/world_scene.cpp
+    engine/resources/world_chunk.cpp
+    engine/gameplay/terrain.cpp
 )
 add_dependencies(sspc_engine sspc_shaders)
 target_include_directories(sspc_engine PUBLIC engine ${SSPC_GEN_DIR} "${SSPC_VULKAN_SDK}/Include")
@@ -113,6 +116,7 @@ add_executable(sspc_tests
     tests/test_geometry.cpp
     tests/test_gameplay.cpp
     tests/test_real_assets.cpp
+    tests/test_world.cpp
 )
 target_link_libraries(sspc_tests PRIVATE sspc_engine)
 target_include_directories(sspc_tests PRIVATE tests)

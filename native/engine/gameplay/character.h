@@ -11,6 +11,8 @@
 
 namespace sspc {
 
+class TerrainGrid;
+
 struct CharacterParams {
     float walk_speed = 2.4f;    // m/s
     float run_speed = 6.0f;     // m/s
@@ -23,6 +25,7 @@ struct CharacterParams {
     float step_height = 0.35f;  // ledge the character walks up without jumping
     float turn_rate = 10.0f;    // 1/s, yaw smoothing towards the move direction
     float max_fall_speed = 40.0f;
+    bool ground_plane = true;   // infinite floor at z = 0 (test scene); off when a world is loaded
 };
 
 struct MoveInput {
@@ -45,9 +48,9 @@ struct CharacterState {
     float air_time = 0;
 };
 
-// Advances one fixed step. Ground = plane z = 0 plus the tops of `obstacles`; obstacles also block
-// horizontal movement (cylinder vs box, resolved by axis push-out).
+// Advances one fixed step. Ground = optional plane z = 0, the tops of `obstacles` and the walkable
+// surfaces of `terrain`; obstacles also block horizontal movement (cylinder vs box, axis push-out).
 void StepCharacter(CharacterState& s, const CharacterParams& p, const MoveInput& in, float dt,
-                   std::span<const Aabb> obstacles);
+                   std::span<const Aabb> obstacles, const TerrainGrid* terrain = nullptr);
 
 }  // namespace sspc

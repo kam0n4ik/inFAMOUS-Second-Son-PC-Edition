@@ -5,7 +5,8 @@
 //   +0x00 u8[16]  id
 //   +0x10 ptr     (owner/description, not decoded yet)
 //   +0x18 u64     bits 0..15 triangle count, 16..31 view mask, 48..55 s8 LOD min, 56..63 s8 LOD max
-//   +0x20 f32[3]  AABB min, +0x2C f32[3] AABB max (same units as positions)
+//   +0x20 f32[3]  AABB min, +0x2C f32[3] AABB max (normalised units, = raw snorm / 32767)
+//   +0x38 f32[3]  position offset, +0x44 f32 position scale: centimetres = offset + scale * snorm
 //   +0x58 ptr     index buffer (16-bit indices, triangle list)
 //   +0x60 ptr     V# array (16 bytes per stream), +0x68 u32 index count, +0x6C u8 stream count
 #pragma once
@@ -30,7 +31,9 @@ struct VertexStream {
 struct GeometryRecord {
     u32 offset = 0;
     std::array<u8, 16> id{};
-    Vec3 aabb_min, aabb_max;
+    Vec3 aabb_min, aabb_max;       // normalised
+    Vec3 position_offset;          // centimetres
+    float position_scale = 0;      // centimetres per normalised unit
     u32 index_buffer = 0;
     u32 index_count = 0;
     u32 vsharp_array = 0;
@@ -55,6 +58,7 @@ std::vector<GeometryRecord> FindGeometry(const KcapPackage& pkg);
 // Reads one record at `offset`; nullopt if it does not validate.
 std::optional<GeometryRecord> ReadGeometry(const KcapPackage& pkg, u32 offset);
 
+// Decoded mesh in model space, metres (the game works in centimetres; Z up).
 struct MeshData {
     std::array<u8, 16> id{};
     u32 source_offset = 0;
@@ -67,8 +71,8 @@ struct MeshData {
 };
 
 // Decodes positions (stream 0), normals (first 2_10_10_10 snorm stream) and UV0 (first 16_16 float
-// stream) plus the index buffer. Positions are checked against the record's AABB. Returns false and
-// sets `error` if anything is out of range or inconsistent.
+// stream) plus the index buffer. Normalised positions are checked against the record's AABB, then
+// dequantised to metres. Returns false and sets `error` if anything is out of range or inconsistent.
 bool DecodeGeometry(const KcapPackage& pkg, const GeometryRecord& rec, MeshData& out, std::string* error);
 
 }  // namespace sspc::res

@@ -45,6 +45,10 @@ std::optional<GeometryRecord> ReadGeometry(const KcapPackage& pkg, u32 g) {
     r.lod_min = static_cast<s8>(lod_word >> 48);
     r.lod_max = static_cast<s8>(lod_word >> 56);
     if (!ReadVec3(pkg, g + 0x20, r.aabb_min) || !ReadVec3(pkg, g + 0x2c, r.aabb_max)) return std::nullopt;
+    if (!ReadVec3(pkg, g + 0x38, r.position_offset) || !pkg.Read(g + 0x44, r.position_scale) ||
+        !std::isfinite(r.position_scale) || r.position_scale <= 0.0f) {
+        return std::nullopt;
+    }
     r.index_buffer = *ib;
     r.vsharp_array = *vs;
     pkg.Read(g + 0x68, r.index_count);
@@ -126,8 +130,12 @@ bool DecodeGeometry(const KcapPackage& pkg, const GeometryRecord& rec, MeshData&
         }
     }
     if (outside > 0) return fail(std::format("{} of {} positions outside the record AABB", outside, vertex_count));
-    out.bounds_min = rec.aabb_min;
-    out.bounds_max = rec.aabb_max;
+    // Dequantise: centimetres = offset + scale * normalised; the engine works in metres.
+    const float scale_m = rec.position_scale * 0.01f;
+    const Vec3 o = rec.position_offset * 0.01f;
+    for (Vec3& p : out.positions) p = o + p * scale_m;
+    out.bounds_min = o + rec.aabb_min * scale_m;
+    out.bounds_max = o + rec.aabb_max * scale_m;
 
     for (size_t s = 1; s < rec.streams.size(); ++s) {
         const VSharp& v = rec.streams[s].vsharp;
