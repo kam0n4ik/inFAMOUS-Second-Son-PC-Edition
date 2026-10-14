@@ -68,6 +68,11 @@ struct MeshData {
     std::vector<Vec3> normals;  // empty if the geometry has no recognised normal stream
     std::vector<Vec2> uv0;      // empty if no UV stream
     std::vector<u32> indices;
+    // Skinning (empty for rigid meshes): joint indices into the model's skeleton and weights that
+    // sum to 255. In the file joint 0's weight is implicit (255 - w1 - w2 - w3), stored bytes are
+    // the weights of joints 1..3 (confirmed by bending joints, tools/research/kcap_skin_test.py).
+    std::vector<std::array<u16, 4>> joints;
+    std::vector<std::array<u8, 4>> weights;
 };
 
 // Decodes positions (stream 0), normals (first 2_10_10_10 snorm stream) and UV0 (first 16_16 float

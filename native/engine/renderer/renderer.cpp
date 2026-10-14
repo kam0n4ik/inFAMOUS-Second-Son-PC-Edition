@@ -11,6 +11,7 @@
 #include "platform/window.h"
 #include "shaders/mesh_frag_spv.h"
 #include "shaders/mesh_vert_spv.h"
+#include "shaders/skinned_vert_spv.h"
 
 namespace sspc {
 
@@ -19,6 +20,7 @@ using vk::api;
 namespace {
 
 constexpr u32 kVertexStride = 32;
+constexpr u32 kSkinnedVertexStride = 48;
 
 struct PushConstants {
     float mvp[16];
@@ -436,7 +438,7 @@ bool Renderer::CreatePipeline() {
         VK_CHECK(api.vkCreatePipelineCache(device_, &pcci, nullptr, &pipeline_cache_));
     }
 
-    VkShaderModule vs, fs;
+    VkShaderModule vs, fs, svs;
     VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smci.codeSize = sizeof(kMeshVertSpv);
     smci.pCode = kMeshVertSpv;
@@ -444,11 +446,15 @@ bool Renderer::CreatePipeline() {
     smci.codeSize = sizeof(kMeshFragSpv);
     smci.pCode = kMeshFragSpv;
     VK_CHECK(api.vkCreateShaderModule(device_, &smci, nullptr, &fs));
+    smci.codeSize = sizeof(kSkinnedVertSpv);
+    smci.pCode = kSkinnedVertSpv;
+    VK_CHECK(api.vkCreateShaderModule(device_, &smci, nullptr, &svs));
 
     VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants)};
+    const VkDescriptorSetLayout set_layouts[2] = {set_layout_, palette_layout_};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.setLayoutCount = 1;
-    plci.pSetLayouts = &set_layout_;
+    plci.setLayoutCount = 2;
+    plci.pSetLayouts = set_layouts;
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &range;
     VK_CHECK(api.vkCreatePipelineLayout(device_, &plci, nullptr, &pipeline_layout_));
@@ -516,14 +522,30 @@ bool Renderer::CreatePipeline() {
     gp.pColorBlendState = &cb;
     gp.pDynamicState = &dy;
     gp.layout = pipeline_layout_;
-    const VkResult r = api.vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &gp, nullptr, &pipeline_);
+    VkResult r = api.vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &gp, nullptr, &pipeline_);
+    if (r == VK_SUCCESS) {
+        // Skinned variant: + uvec4 joints (u16x4) and vec4 weights (unorm8x4), 48-byte vertices.
+        VkVertexInputBindingDescription sbinding{0, kSkinnedVertexStride, VK_VERTEX_INPUT_RATE_VERTEX};
+        VkVertexInputAttributeDescription sattrs[5] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
+                                                       {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12},
+                                                       {2, 0, VK_FORMAT_R32G32_SFLOAT, 24},
+                                                       {3, 0, VK_FORMAT_R16G16B16A16_UINT, 32},
+                                                       {4, 0, VK_FORMAT_R8G8B8A8_UNORM, 40}};
+        vi.pVertexBindingDescriptions = &sbinding;
+        vi.vertexAttributeDescriptionCount = 5;
+        vi.pVertexAttributeDescriptions = sattrs;
+        stages[0].module = svs;
+        r = api.vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &gp, nullptr, &skinned_pipeline_);
+    }
     api.vkDestroyShaderModule(device_, vs, nullptr);
     api.vkDestroyShaderModule(device_, fs, nullptr);
+    api.vkDestroyShaderModule(device_, svs, nullptr);
     if (r != VK_SUCCESS) {
         log::Error("vulkan", "vkCreateGraphicsPipelines failed: {}", vk::ResultString(r));
         return false;
     }
     SetName(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(pipeline_), "mesh-lit");
+    SetName(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(skinned_pipeline_), "mesh-skinned");
     return true;
 }
 
@@ -604,22 +626,26 @@ MeshHandle Renderer::UploadMesh(const res::MeshData& mesh, const char* debug_nam
                                             ? std::vector<Vec3>{}
                                             : ComputeNormals(mesh);
     const std::vector<Vec3>& normals = generated.empty() ? mesh.normals : generated;
-    std::vector<float> verts(mesh.positions.size() * 8);
+    const bool skinned = mesh.joints.size() == mesh.positions.size() && mesh.weights.size() == mesh.positions.size() &&
+                         !mesh.joints.empty();
+    const u32 stride = skinned ? kSkinnedVertexStride : kVertexStride;
+    std::vector<u8> verts(mesh.positions.size() * stride);
     for (size_t i = 0; i < mesh.positions.size(); ++i) {
-        float* v = &verts[i * 8];
-        v[0] = mesh.positions[i].x;
-        v[1] = mesh.positions[i].y;
-        v[2] = mesh.positions[i].z;
-        v[3] = normals[i].x;
-        v[4] = normals[i].y;
-        v[5] = normals[i].z;
-        v[6] = mesh.uv0.empty() ? 0.0f : mesh.uv0[i].x;
-        v[7] = mesh.uv0.empty() ? 0.0f : mesh.uv0[i].y;
+        float v[8] = {mesh.positions[i].x, mesh.positions[i].y, mesh.positions[i].z,
+                      normals[i].x,        normals[i].y,        normals[i].z,
+                      mesh.uv0.empty() ? 0.0f : mesh.uv0[i].x, mesh.uv0.empty() ? 0.0f : mesh.uv0[i].y};
+        u8* dst = verts.data() + i * stride;
+        std::memcpy(dst, v, sizeof(v));
+        if (skinned) {
+            std::memcpy(dst + 32, mesh.joints[i].data(), 8);
+            std::memcpy(dst + 40, mesh.weights[i].data(), 4);
+        }
     }
-    const VkDeviceSize vbytes = verts.size() * sizeof(float);
+    const VkDeviceSize vbytes = verts.size();
     const VkDeviceSize ibytes = mesh.indices.size() * sizeof(u32);
     Buffer staging;
     GpuMesh gm;
+    gm.skinned = skinned;
     if (!CreateBuffer(vbytes + ibytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging) ||
         !CreateBuffer(vbytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -669,12 +695,42 @@ bool Renderer::CreateTextureResources() {
     lci.bindingCount = 1;
     lci.pBindings = &b;
     VK_CHECK(api.vkCreateDescriptorSetLayout(device_, &lci, nullptr, &set_layout_));
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192};
+    VkDescriptorSetLayoutBinding pb{};
+    pb.binding = 0;
+    pb.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    pb.descriptorCount = 1;
+    pb.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    lci.pBindings = &pb;
+    VK_CHECK(api.vkCreateDescriptorSetLayout(device_, &lci, nullptr, &palette_layout_));
+    const VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kFramesInFlight}};
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pci.maxSets = 8192;
-    pci.poolSizeCount = 1;
-    pci.pPoolSizes = &ps;
+    pci.maxSets = 8192 + kFramesInFlight;
+    pci.poolSizeCount = 2;
+    pci.pPoolSizes = ps;
     VK_CHECK(api.vkCreateDescriptorPool(device_, &pci, nullptr, &descriptor_pool_));
+    // Joint palettes: one host-visible storage buffer per frame in flight, identity at start.
+    for (u32 f = 0; f < kFramesInFlight; ++f) {
+        if (!CreateBuffer(sizeof(Mat4) * kMaxJoints, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          palette_buffers_[f])) {
+            return false;
+        }
+        auto* m = static_cast<Mat4*>(palette_buffers_[f].mapped);
+        for (u32 j = 0; j < kMaxJoints; ++j) m[j] = Mat4::Identity();
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = descriptor_pool_;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &palette_layout_;
+        VK_CHECK(api.vkAllocateDescriptorSets(device_, &dai, &palette_sets_[f]));
+        VkDescriptorBufferInfo bi{palette_buffers_[f].buffer, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = palette_sets_[f];
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &bi;
+        api.vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+    }
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = VK_FILTER_LINEAR;
     sci.minFilter = VK_FILTER_LINEAR;
@@ -838,6 +894,10 @@ bool Renderer::RenderFrame(const FrameView& view, std::span<const DrawItem> item
     Frame& f = frames_[frame_index_];
     VK_CHECK(api.vkWaitForFences(device_, 1, &f.fence, VK_TRUE, UINT64_MAX));
     ReadTimestamps(f, frame_index_);
+    if (!pending_palette_.empty()) {  // safe now: this frame's previous GPU work has finished
+        const size_t n = std::min<size_t>(pending_palette_.size(), kMaxJoints);
+        std::memcpy(palette_buffers_[frame_index_].mapped, pending_palette_.data(), n * sizeof(Mat4));
+    }
 
     u32 image = 0;
     VkResult r = api.vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, f.acquired, VK_NULL_HANDLE, &image);
@@ -901,6 +961,9 @@ bool Renderer::RenderFrame(const FrameView& view, std::span<const DrawItem> item
     api.vkCmdSetViewport(cmd, 0, 1, &vp);
     api.vkCmdSetScissor(cmd, 0, 1, &sc);
     api.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+    api.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 1, 1,
+                                &palette_sets_[frame_index_], 0, nullptr);
+    bool skinned_bound = false;
 
     const Mat4 view_proj = view.projection * view.view;
     stats_.draws = 0;
@@ -909,6 +972,10 @@ bool Renderer::RenderFrame(const FrameView& view, std::span<const DrawItem> item
     for (const DrawItem& item : items) {
         if (item.mesh >= meshes_.size()) continue;
         const GpuMesh& gm = meshes_[item.mesh];
+        if (gm.skinned != skinned_bound) {
+            api.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gm.skinned ? skinned_pipeline_ : pipeline_);
+            skinned_bound = gm.skinned;
+        }
         const TextureHandle tex = item.texture < textures_.size() ? item.texture : kWhiteTexture;
         if (tex != bound) {
             api.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1,
@@ -1058,6 +1125,11 @@ void Renderer::Shutdown() {
         DestroyBuffer(screenshot_buffer_);
         DestroySwapchain();
         if (pipeline_) api.vkDestroyPipeline(device_, pipeline_, nullptr);
+        if (skinned_pipeline_) api.vkDestroyPipeline(device_, skinned_pipeline_, nullptr);
+        for (Buffer& b : palette_buffers_) DestroyBuffer(b);
+        if (palette_layout_) api.vkDestroyDescriptorSetLayout(device_, palette_layout_, nullptr);
+        skinned_pipeline_ = VK_NULL_HANDLE;
+        palette_layout_ = VK_NULL_HANDLE;
         if (pipeline_layout_) api.vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
         if (pipeline_cache_) api.vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
         if (query_pool_) api.vkDestroyQueryPool(device_, query_pool_, nullptr);

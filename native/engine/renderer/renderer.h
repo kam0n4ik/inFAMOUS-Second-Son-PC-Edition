@@ -68,6 +68,8 @@ public:
     // Uploads all mip levels (BCn stay compressed on the GPU). `srgb` selects the sRGB view of
     // colour formats. Returns kWhiteTexture on failure.
     TextureHandle UploadTexture(const res::TextureData& texture, bool srgb);
+    // Joint palette (model space) used by every skinned mesh drawn in the next RenderFrame.
+    void SetSkinPalette(std::span<const Mat4> joints) { pending_palette_.assign(joints.begin(), joints.end()); }
     size_t TextureCount() const { return textures_.size(); }
 
     // Records, submits and presents one frame. Returns false on a fatal device error.
@@ -92,6 +94,7 @@ private:
         Buffer vertices;
         Buffer indices;
         u32 index_count = 0;
+        bool skinned = false;
     };
     struct GpuTexture {
         VkImage image = VK_NULL_HANDLE;
@@ -165,10 +168,16 @@ private:
     std::vector<GpuTexture> textures_;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipeline skinned_pipeline_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout palette_layout_ = VK_NULL_HANDLE;
+    static constexpr u32 kMaxJoints = 1024;
+    std::vector<Mat4> pending_palette_;
     VkQueryPool query_pool_ = VK_NULL_HANDLE;
 
     static constexpr u32 kFramesInFlight = 2;
     Frame frames_[kFramesInFlight];
+    Buffer palette_buffers_[kFramesInFlight];
+    VkDescriptorSet palette_sets_[kFramesInFlight] = {};
     u32 frame_index_ = 0;
     std::vector<GpuMesh> meshes_;
 

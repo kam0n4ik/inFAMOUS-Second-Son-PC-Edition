@@ -16,13 +16,14 @@
 namespace sspc::res {
 
 inline constexpr char kSpcMeshMagic[4] = {'S', 'P', 'C', 'M'};
-inline constexpr u16 kSpcMeshVersion = 2;  // 2: positions in metres (dequantised)
+inline constexpr u16 kSpcMeshVersion = 3;  // 2: positions in metres; 3: optional skin data
 inline constexpr u16 kSpcMeshByteOrder = 0xFEFF;
 
 enum SpcVertexFlags : u32 {
     kVertexPosition = 1,
     kVertexNormal = 2,
     kVertexUv0 = 4,
+    kVertexSkin = 8,  // u16x4 joint indices + u8x4 weights (sum 255)
 };
 
 #pragma pack(push, 1)

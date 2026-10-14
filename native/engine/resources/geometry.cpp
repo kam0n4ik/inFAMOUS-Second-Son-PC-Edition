@@ -157,6 +157,40 @@ bool DecodeGeometry(const KcapPackage& pkg, const GeometryRecord& rec, MeshData&
         }
     }
 
+    // Skin: sint16x4 joint indices, followed (+8, same stride) by unorm8x4 weights of joints 1..3.
+    for (size_t s = 1; s < rec.streams.size() && out.joints.empty(); ++s) {
+        const VSharp& j = rec.streams[s].vsharp;
+        if (j.num_records != vertex_count || j.dfmt != DataFormat::D16_16_16_16 || j.nfmt != NumFormat::Sint) continue;
+        const VSharp* w = nullptr;
+        for (const auto& c : rec.streams) {
+            if (c.vsharp.base == j.base + 8 && c.vsharp.stride == j.stride && c.vsharp.dfmt == DataFormat::D8_8_8_8 &&
+                c.vsharp.nfmt == NumFormat::Unorm && c.vsharp.num_records == vertex_count) {
+                w = &c.vsharp;
+            }
+        }
+        if (!w) continue;
+        out.joints.resize(vertex_count);
+        out.weights.resize(vertex_count);
+        bool consistent = true;
+        for (u32 i = 0; i < vertex_count && consistent; ++i) {
+            s16 ji[4];
+            u8 wb[4];
+            std::memcpy(ji, data + j.base + static_cast<u64>(i) * j.stride, 8);
+            std::memcpy(wb, data + w->base + static_cast<u64>(i) * w->stride, 4);
+            const int rest = 255 - (wb[0] + wb[1] + wb[2]);
+            consistent = rest >= 0 && ji[0] >= 0 && ji[1] >= 0 && ji[2] >= 0 && ji[3] >= 0;
+            out.joints[i] = {static_cast<u16>(ji[0]), static_cast<u16>(ji[1]), static_cast<u16>(ji[2]), static_cast<u16>(ji[3])};
+            out.weights[i] = {static_cast<u8>(std::max(rest, 0)), wb[0], wb[1], wb[2]};
+        }
+        if (!consistent) {
+            // Another skin encoding (seen on one head part of hero.xpps: third byte ~always 255):
+            // not decoded yet, the part stays rigid instead of being rejected.
+            out.joints.clear();
+            out.weights.clear();
+            break;
+        }
+    }
+
     out.indices.resize(rec.index_count);
     for (u32 i = 0; i < rec.index_count; ++i) {
         u16 idx;

@@ -49,6 +49,7 @@ function(sspc_shader src symbol header_name)
 endfunction()
 sspc_shader(mesh.vert kMeshVertSpv mesh_vert_spv.h)
 sspc_shader(mesh.frag kMeshFragSpv mesh_frag_spv.h)
+sspc_shader(skinned.vert kSkinnedVertSpv skinned_vert_spv.h)
 add_custom_target(sspc_shaders DEPENDS ${SSPC_SHADER_HEADERS})
 
 # --- Common compile settings ------------------------------------------------------------------
@@ -88,6 +89,8 @@ add_library(sspc_engine STATIC
     engine/resources/world_chunk.cpp
     engine/resources/texture.cpp
     engine/resources/texture_library.cpp
+    engine/resources/skeleton.cpp
+    engine/scene/test_pose.cpp
     engine/gameplay/terrain.cpp
 )
 add_dependencies(sspc_engine sspc_shaders)
@@ -120,6 +123,7 @@ add_executable(sspc_tests
     tests/test_real_assets.cpp
     tests/test_world.cpp
     tests/test_texture.cpp
+    tests/test_skeleton.cpp
 )
 target_link_libraries(sspc_tests PRIVATE sspc_engine)
 target_include_directories(sspc_tests PRIVATE tests)

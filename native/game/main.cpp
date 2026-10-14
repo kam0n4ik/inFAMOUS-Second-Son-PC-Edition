@@ -40,6 +40,7 @@
 #include "scene/camera.h"
 #include "scene/character_model.h"
 #include "scene/primitives.h"
+#include "scene/test_pose.h"
 #include "scene/world_scene.h"
 
 using namespace sspc;
@@ -250,6 +251,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     FreeCamera free_cam;
     bool free_mode = false;
     FixedStepClock sim(1.0 / static_cast<double>(cfg.GetInt("Game", "SimulationHz", 60)));
+    // Procedural TEST pose (arms down + walk cycle) exercising skinning; not the game's animation.
+    TestPose test_pose;
+    if (have_model && model.skeleton && cfg.GetBool("Character", "TestAnimation", true)) {
+        test_pose.Init(*model.skeleton, TestPoseJoints{});
+    }
+    float walk_phase = 0;
     size_t selected_part = 0;
     bool pending_jump = false;
     window.SetMouseCaptured(args.frames < 0 && cfg.GetBool("Input", "CaptureMouse", true));
@@ -328,6 +335,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             }
         }
         const float alpha = static_cast<float>(sim.Alpha());
+        if (test_pose.Valid()) {
+            const float hspeed = std::sqrt(player.velocity.x * player.velocity.x + player.velocity.y * player.velocity.y);
+            walk_phase += hspeed * static_cast<float>(dt) * (2.0f * kPi / 1.6f);  // ~1.6 m per stride cycle
+            renderer.SetSkinPalette(test_pose.Evaluate(walk_phase, std::min(1.0f, hspeed / 3.0f)));
+        }
         const Vec3 render_pos = Lerp(prev_player.position, player.position, alpha);
         orbit.target = render_pos + Vec3{0, 0, 1.45f};
 

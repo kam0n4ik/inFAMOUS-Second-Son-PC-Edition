@@ -69,6 +69,27 @@ void LoadPartTextures(const res::KcapPackage& pkg, const std::vector<std::wstrin
               missing, 1 + texture_packages.size());
 }
 
+// Skeleton of the package; skin data that refers to joints outside it is dropped (rigid fallback).
+void AttachSkeleton(const res::KcapPackage& pkg, LoadedModel& m) {
+    m.skeleton = res::FindSkeleton(pkg);
+    const size_t n = m.skeleton ? m.skeleton->JointCount() : 0;
+    u32 skinned = 0, dropped = 0;
+    for (auto& md : m.meshes) {
+        if (md.joints.empty()) continue;
+        bool ok = n > 0;
+        for (const auto& j : md.joints) ok = ok && j[0] < n && j[1] < n && j[2] < n && j[3] < n;
+        if (ok) {
+            ++skinned;
+        } else {
+            md.joints.clear();
+            md.weights.clear();
+            ++dropped;
+        }
+    }
+    log::Info("model", "skeleton: {} joints; {} skinned parts{}", n, skinned,
+              dropped ? std::format(", {} parts left rigid (joint out of range)", dropped) : std::string{});
+}
+
 }  // namespace
 
 void ChooseDefaultParts(LoadedModel& m) {
@@ -117,6 +138,7 @@ bool LoadCharacterModel(const std::wstring& package_path, const std::wstring& ca
                 out.from_cache = true;
                 FillParts(out);
                 LoadPartTextures(pkg, texture_packages, jobs, out);
+    AttachSkeleton(pkg, out);
                 out.load_seconds = clock.Now();
                 log::Info("model", "{} meshes from cache {} in {:.1f} ms", out.meshes.size(),
                           log::Narrow(cache_path), out.load_seconds * 1000);
@@ -163,6 +185,7 @@ bool LoadCharacterModel(const std::wstring& package_path, const std::wstring& ca
     }
     FillParts(out);
     LoadPartTextures(pkg, texture_packages, jobs, out);
+    AttachSkeleton(pkg, out);
     if (!cache_path.empty()) {
         const auto bytes = res::WriteSpcMesh(out.meshes, out.source_hash);
         const size_t slash = cache_path.find_last_of(L"\\/");

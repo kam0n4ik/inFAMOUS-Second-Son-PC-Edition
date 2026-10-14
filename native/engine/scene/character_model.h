@@ -14,6 +14,7 @@
 #include "core/jobs.h"
 #include "core/math.h"
 #include "resources/geometry.h"
+#include "resources/skeleton.h"
 #include "resources/texture.h"
 
 namespace sspc {
@@ -32,6 +33,7 @@ struct LoadedModel {
     std::vector<ModelPartInfo> parts;
     std::vector<u64> part_albedo;            // colour-map texture id per part (0 = none)
     std::vector<res::TextureData> textures;  // decoded colour maps referenced by the parts
+    std::optional<res::Skeleton> skeleton;   // joints referenced by the skinned parts
     std::array<u8, 16> source_hash{};
     Vec3 bounds_min, bounds_max;  // of the default-visible parts
     bool from_cache = false;

@@ -19,7 +19,7 @@ void Align(std::vector<u8>& buf, size_t a) {
 }
 
 u32 StrideFor(u32 flags) {
-    return 12 + ((flags & kVertexNormal) ? 12 : 0) + ((flags & kVertexUv0) ? 8 : 0);
+    return 12 + ((flags & kVertexNormal) ? 12 : 0) + ((flags & kVertexUv0) ? 8 : 0) + ((flags & kVertexSkin) ? 12 : 0);
 }
 
 }  // namespace
@@ -36,7 +36,11 @@ std::vector<u8> WriteSpcMesh(std::span<const MeshData> meshes, const std::array<
         e.vertex_count = static_cast<u32>(md.positions.size());
         e.index_count = static_cast<u32>(md.indices.size());
         e.vertex_flags = kVertexPosition | (md.normals.size() == md.positions.size() && !md.normals.empty() ? kVertexNormal : 0) |
-                         (md.uv0.size() == md.positions.size() && !md.uv0.empty() ? kVertexUv0 : 0);
+                         (md.uv0.size() == md.positions.size() && !md.uv0.empty() ? kVertexUv0 : 0) |
+                         (md.joints.size() == md.positions.size() && md.weights.size() == md.positions.size() &&
+                                  !md.joints.empty()
+                              ? kVertexSkin
+                              : 0);
         e.vertex_stride = StrideFor(e.vertex_flags);
         e.bounds_min[0] = md.bounds_min.x; e.bounds_min[1] = md.bounds_min.y; e.bounds_min[2] = md.bounds_min.z;
         e.bounds_max[0] = md.bounds_max.x; e.bounds_max[1] = md.bounds_max.y; e.bounds_max[2] = md.bounds_max.z;
@@ -47,6 +51,10 @@ std::vector<u8> WriteSpcMesh(std::span<const MeshData> meshes, const std::array<
             Append(buf, &md.positions[i], 12);
             if (e.vertex_flags & kVertexNormal) Append(buf, &md.normals[i], 12);
             if (e.vertex_flags & kVertexUv0) Append(buf, &md.uv0[i], 8);
+            if (e.vertex_flags & kVertexSkin) {
+                Append(buf, md.joints[i].data(), 8);
+                Append(buf, md.weights[i].data(), 4);
+            }
         }
         Align(buf, 16);
         e.index_offset = buf.size();
@@ -92,7 +100,7 @@ bool ReadSpcMesh(std::span<const u8> file, std::vector<MeshData>& out, std::stri
     for (u32 m = 0; m < h.mesh_count; ++m) {
         SpcMeshEntry e;
         std::memcpy(&e, file.data() + h.table_offset + static_cast<u64>(m) * h.entry_size, sizeof(e));
-        if ((e.vertex_flags & kVertexPosition) == 0 || (e.vertex_flags & ~7u) != 0) {
+        if ((e.vertex_flags & kVertexPosition) == 0 || (e.vertex_flags & ~15u) != 0) {
             return fail(std::format("mesh {}: bad vertex flags", m));
         }
         if (e.vertex_stride != StrideFor(e.vertex_flags)) return fail(std::format("mesh {}: bad stride", m));
@@ -114,6 +122,10 @@ bool ReadSpcMesh(std::span<const u8> file, std::vector<MeshData>& out, std::stri
         md.positions.resize(e.vertex_count);
         if (e.vertex_flags & kVertexNormal) md.normals.resize(e.vertex_count);
         if (e.vertex_flags & kVertexUv0) md.uv0.resize(e.vertex_count);
+        if (e.vertex_flags & kVertexSkin) {
+            md.joints.resize(e.vertex_count);
+            md.weights.resize(e.vertex_count);
+        }
         const u8* v = file.data() + e.vertex_offset;
         for (u32 i = 0; i < e.vertex_count; ++i) {
             const u8* p = v + static_cast<u64>(i) * e.vertex_stride;
@@ -123,7 +135,17 @@ bool ReadSpcMesh(std::span<const u8> file, std::vector<MeshData>& out, std::stri
                 std::memcpy(&md.normals[i], p, 12);
                 p += 12;
             }
-            if (e.vertex_flags & kVertexUv0) std::memcpy(&md.uv0[i], p, 8);
+            if (e.vertex_flags & kVertexUv0) {
+                std::memcpy(&md.uv0[i], p, 8);
+                p += 8;
+            }
+            if (e.vertex_flags & kVertexSkin) {
+                std::memcpy(md.joints[i].data(), p, 8);
+                std::memcpy(md.weights[i].data(), p + 8, 4);
+                if (md.weights[i][0] + md.weights[i][1] + md.weights[i][2] + md.weights[i][3] != 255) {
+                    return fail(std::format("mesh {}: skin weights do not sum to 255", m));
+                }
+            }
             const Vec3& q = md.positions[i];
             if (!std::isfinite(q.x) || !std::isfinite(q.y) || !std::isfinite(q.z)) {
                 return fail(std::format("mesh {}: non-finite position", m));
