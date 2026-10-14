@@ -31,6 +31,7 @@ struct ChunkScene {
     std::vector<std::array<float, 12>> matrices;  // as stored
     std::vector<ChunkInstance> instances;
     std::vector<std::optional<u32>> geometry;      // geometry record offset per slot
+    u32 geometry_array = 0;                        // offset of the slot pointers (KNLX targets null slots)
 };
 
 // Every structurally valid scene object in the package (all indices in range, arrays inside the

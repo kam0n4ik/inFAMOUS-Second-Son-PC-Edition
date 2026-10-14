@@ -106,6 +106,14 @@ struct KcapLink {
     bool target_virtual = false;  // target lies in a load-time (type 9) block: no file data
 };
 
+// KNLX entry (eboot 0x30a700): the field at `location` receives the address of the object another
+// package exports under `key` (+ addend).
+struct KcapExternalLink {
+    std::array<u8, 16> key{};
+    u32 location = 0;
+    s32 addend = 0;
+};
+
 class KcapPackage {
 public:
     // Parses and validates. The bytes must outlive the package (it keeps a view).
@@ -117,6 +125,7 @@ public:
     const std::vector<KcapBlock>& Blocks() const { return blocks_; }
     const std::vector<KcapChunk>& Chunks() const { return chunks_; }
     const std::vector<KcapLink>& Links() const { return links_; }  // sorted by location
+    const std::vector<KcapExternalLink>& ExternalLinks() const { return external_links_; }
     // Links whose location or target fell outside the data region (the game skips/nulls them).
     u32 InvalidLinkCount() const { return invalid_links_; }
 
@@ -146,6 +155,7 @@ private:
     std::vector<KcapBlock> blocks_;
     std::vector<KcapChunk> chunks_;
     std::vector<KcapLink> links_;
+    std::vector<KcapExternalLink> external_links_;
     u32 invalid_links_ = 0;
     u64 virtual_end_ = 0;
 };

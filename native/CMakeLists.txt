@@ -90,6 +90,7 @@ add_library(sspc_engine STATIC
     engine/resources/texture.cpp
     engine/resources/texture_library.cpp
     engine/resources/skeleton.cpp
+    engine/resources/exports.cpp
     engine/scene/test_pose.cpp
     engine/gameplay/terrain.cpp
 )

@@ -10,6 +10,7 @@
 #include "resources/geometry.h"
 #include "resources/kcap.h"
 #include "resources/texture.h"
+#include "resources/exports.h"
 #include "resources/texture_library.h"
 #include "resources/world_chunk.h"
 
@@ -41,29 +42,48 @@ bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wst
         return false;
     }
 
+    // Null geometry slots are filled through KNLX by objects other packages export (shared packages).
+    res::ExportIndex exports;
+    for (const auto& p : texture_packages) exports.AddPackage(p);
+    std::unordered_map<u32, std::array<u8, 16>> external_key;  // slot location -> export key
+    for (const auto& x : pkg.ExternalLinks()) {
+        if (x.addend == 0) external_key[x.location] = x.key;
+    }
+    using GeoKey = std::pair<const res::KcapPackage*, u32>;
+    auto resolve = [&](const res::ChunkScene& sc, u16 slot) -> std::optional<GeoKey> {
+        if (sc.geometry[slot]) return GeoKey{&pkg, *sc.geometry[slot]};
+        const auto k = external_key.find(sc.geometry_array + slot * 8u);
+        if (k == external_key.end()) return std::nullopt;
+        const auto ref = exports.Find(k->second);
+        if (!ref) return std::nullopt;
+        return GeoKey{ref->package, ref->object};
+    };
+
     // Unique geometry records referenced by drawable instances.
-    std::map<u32, size_t> slot_of;
-    std::vector<res::GeometryRecord> records;
+    std::map<GeoKey, size_t> slot_of;
+    std::vector<std::pair<const res::KcapPackage*, res::GeometryRecord>> records;
     for (const auto& sc : scenes) {
         for (const auto& inst : sc.instances) {
             ++out.instances_total;
             if (inst.kind != 0) continue;
-            const auto& g = sc.geometry[inst.geometry];
+            const auto g = resolve(sc, inst.geometry);
             if (!g) {
                 ++out.instances_external;
                 continue;
             }
+            if (!sc.geometry[inst.geometry]) ++out.instances_resolved;
             if (slot_of.contains(*g)) continue;
-            if (auto rec = res::ReadGeometry(pkg, *g)) {
+            if (auto rec = res::ReadGeometry(*g->first, g->second)) {
                 slot_of[*g] = records.size();
-                records.push_back(std::move(*rec));
+                records.emplace_back(g->first, std::move(*rec));
             }
         }
     }
     std::vector<res::MeshData> meshes(records.size());
     std::vector<char> ok(records.size(), 0);
-    jobs.ParallelFor(static_cast<u32>(records.size()),
-                     [&](u32 i) { ok[i] = res::DecodeGeometry(pkg, records[i], meshes[i], nullptr) ? 1 : 0; });
+    jobs.ParallelFor(static_cast<u32>(records.size()), [&](u32 i) {
+        ok[i] = res::DecodeGeometry(*records[i].first, records[i].second, meshes[i], nullptr) ? 1 : 0;
+    });
     std::vector<MeshHandle> handles(records.size(), kInvalidMesh);
     for (size_t i = 0; i < records.size(); ++i) {
         if (!ok[i]) continue;
@@ -81,7 +101,7 @@ bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wst
     std::vector<u64> wanted;
     std::unordered_map<u64, size_t> wanted_index;
     for (size_t i = 0; i < records.size(); ++i) {
-        const auto mt = res::ReadMaterialTextures(pkg, records[i].offset);
+        const auto mt = res::ReadMaterialTextures(*records[i].first, records[i].second.offset);
         if (!mt || !mt->slots[1] || !lib.Contains(mt->slots[1])) continue;
         albedo[i] = mt->slots[1];
         if (wanted_index.emplace(albedo[i], wanted.size()).second) wanted.push_back(albedo[i]);
@@ -102,15 +122,17 @@ bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wst
     };
     for (const auto& sc : scenes) {
         for (const auto& inst : sc.instances) {
-            if (inst.kind != 0 || !sc.geometry[inst.geometry]) continue;
-            const auto it = slot_of.find(*sc.geometry[inst.geometry]);
+            if (inst.kind != 0) continue;
+            const auto gk = resolve(sc, inst.geometry);
+            if (!gk) continue;
+            const auto it = slot_of.find(*gk);
             if (it == slot_of.end() || handles[it->second] == kInvalidMesh) continue;
             const Mat4 world = res::ChunkMatrixToWorld(sc.matrices[inst.matrix]);
             const auto th = tex_handle.find(albedo[it->second]);
             if (th != tex_handle.end()) {
                 out.draws.push_back({handles[it->second], world, {1, 1, 1, 0.5f}, th->second});  // alpha-tested
             } else {
-                out.draws.push_back({handles[it->second], world, SlotColor(*sc.geometry[inst.geometry])});
+                out.draws.push_back({handles[it->second], world, SlotColor(gk->second)});
             }
             out.terrain.AddMesh(meshes[it->second].positions, meshes[it->second].indices, world);
             ++out.instances_drawn;

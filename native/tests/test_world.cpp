@@ -7,7 +7,10 @@
 #include "kcap_builder.h"
 #include "resources/geometry.h"
 #include "resources/kcap.h"
+#include "resources/exports.h"
 #include "resources/world_chunk.h"
+
+#include <unordered_map>
 #include "test.h"
 
 using namespace sspc;
@@ -147,4 +150,21 @@ TEST(real_world_chunk_a1) {
     }
     std::printf("    a1: %u drawable instances, %u geometry slots decoded\n", drawable, decoded);
     CHECK_EQ(drawable, 1492u);  // measured with native/tools/research/kcap_chunk_scene.py
+    // The null slots are filled by KNLX links to objects exported by the shared village packages.
+    u32 external_slots = 0, resolved = 0;
+    std::unordered_map<u32, std::array<u8, 16>> by_loc;
+    for (const auto& x : f.Package().ExternalLinks()) by_loc[x.location] = x.key;
+    ExportIndex exports;
+    exports.AddPackage(L"E:\\shdps4\\CUSA00004\\art\\cache\\core_village.sprig.xpps");
+    exports.AddPackage(L"E:\\shdps4\\CUSA00004\\art\\cache\\core_common.sprig.xpps");
+    for (u32 k = 0; k < s.geometry.size(); ++k) {
+        if (s.geometry[k]) continue;
+        ++external_slots;
+        const auto it = by_loc.find(s.geometry_array + k * 8);
+        if (it == by_loc.end()) continue;
+        const auto ref = exports.Find(it->second);
+        if (ref && ReadGeometry(*ref->package, ref->object)) ++resolved;
+    }
+    std::printf("    a1: %u external geometry slots, %u resolved through exports\n", external_slots, resolved);
+    CHECK(external_slots == 33 && resolved == 33);
 }

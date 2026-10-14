@@ -17,7 +17,8 @@ struct WorldScene {
     Vec3 spawn{0, 0, 0};
     u32 instances_total = 0;
     u32 instances_drawn = 0;
-    u32 instances_external = 0;  // geometry lives in another package (KNLX), not loaded yet
+    u32 instances_external = 0;  // geometry in a package that is not loaded (unresolved KNLX)
+    u32 instances_resolved = 0;  // geometry resolved through KNLX from a shared package
     u32 geometry_uploaded = 0;
     u32 textures_uploaded = 0;
     double load_seconds = 0;

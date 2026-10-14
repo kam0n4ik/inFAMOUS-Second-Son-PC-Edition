@@ -174,6 +174,22 @@ KcapError KcapPackage::Parse(std::span<const u8> file) {
     for (const KcapChunk& c : chunks_) {
         if (c.tag == kTagKnli) {
             if (KcapError e = ParseLinks(c); e != KcapError::Ok) return e;
+        } else if (c.tag == kTagKnlx && c.size >= 0x14) {
+            // {.., +8 i32 offset of the entries relative to payload+8, +0x10 i32 count}; entries 0x18 bytes.
+            const u8* knlx = data_.data() + c.payload;
+            const s64 entries = static_cast<s64>(c.payload) + 8 + Load<s32>(knlx + 8);
+            const s32 count = Load<s32>(knlx + 0x10);
+            if (count < 0 || entries < c.payload || entries + static_cast<s64>(count) * 0x18 > c.payload + c.size) {
+                continue;  // unknown KNLX layout: external links of this chunk are not used
+            }
+            for (s32 i = 0; i < count; ++i) {
+                const u8* e = data_.data() + entries + static_cast<s64>(i) * 0x18;
+                KcapExternalLink x;
+                std::memcpy(x.key.data(), e, 16);
+                x.location = Load<u32>(e + 16);
+                x.addend = Load<s32>(e + 20);
+                if (InRange(x.location, 8)) external_links_.push_back(x);
+            }
         }
     }
     std::sort(links_.begin(), links_.end(),

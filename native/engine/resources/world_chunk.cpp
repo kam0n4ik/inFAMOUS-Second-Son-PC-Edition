@@ -58,6 +58,7 @@ std::vector<ChunkScene> FindChunkScenes(const KcapPackage& pkg) {
         // Every non-null slot must be a valid geometry record (rejects look-alike {ptr, count}
         // triples that happen to fit, e.g. the same object read 16 bytes off).
         scene.geometry.resize(geos->count);
+        scene.geometry_array = geos->offset;
         u32 resolved = 0;
         for (u32 g = 0; g < geos->count && ok; ++g) {
             scene.geometry[g] = pkg.PointerAt(geos->offset + g * 8);
