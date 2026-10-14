@@ -94,8 +94,8 @@ TEST(kcap_rejects_out_of_range_segments_and_blocks) {
     Write64(f, 0xc8 + 0x20, 50);  // segment 0 block count
     CHECK_EQ(ParseBytes(f), KcapError::SegmentBlockRange);
     f = Simple();
-    const size_t block0 = 0xc8 + 3 * 0x28 + 8;
-    Write32(f, block0 + 8, 0xfffffff0u);  // block 0 offset
+    const size_t block0 = 0xc8 + 3 * 0x28;
+    Write32(f, block0 + 4, 0xfffffff0u);  // block 0 offset
     CHECK_EQ(ParseBytes(f), KcapError::BlockOutOfRange);
 }
 
@@ -128,6 +128,31 @@ TEST(kcap_links_with_out_of_range_targets_are_counted_not_followed) {
     CHECK_EQ(p.Parse(bytes), KcapError::Ok);
     CHECK_EQ(p.InvalidLinkCount(), 1u);
     CHECK(!p.PointerAt(0x20).has_value());
+}
+
+TEST(kcap_virtual_blocks_and_empty_packages) {
+    KcapBuilder b = SimpleBuilder();
+    b.virtual_block_size = 0x10000;  // load-time memory after the GPU data, beyond the file
+    const u32 vbase = b.GpuBase() + static_cast<u32>(b.gpu.size());
+    b.Put<u32>(b.cpu, 0x48, vbase + 0x100);
+    b.links.push_back({2, 0x48});
+    KcapPackage p;
+    const auto bytes = b.Build();
+    CHECK_EQ(p.Parse(bytes), KcapError::Ok);
+    const KcapLink* l = p.LinkAt(0x48);
+    CHECK(l && l->target_virtual && p.InVirtualBlock(l->target));
+    CHECK(!p.InRange(l->target, 4));  // no file data behind a virtual target
+    CHECK_EQ(p.InvalidLinkCount(), 0u);
+
+    // The 200-byte *.hires stubs: header size 0, no segments, table region = whole file.
+    std::vector<u8> empty(0xc8, 0);
+    std::memcpy(empty.data(), "KCAP", 4);
+    empty[4] = 13;
+    Write32(empty, 0x18, 0x98);
+    Write32(empty, 0x1c, 0x30);
+    KcapPackage e;
+    CHECK_EQ(e.Parse(empty), KcapError::Ok);
+    CHECK(e.Segments().empty() && e.Data().empty());
 }
 
 TEST(kcap_link_stream_decoder_matches_eboot_semantics) {

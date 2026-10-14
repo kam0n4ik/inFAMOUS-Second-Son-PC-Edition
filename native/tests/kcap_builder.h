@@ -19,6 +19,7 @@ public:
     // Links: {kind, location}; the 32-bit value at `location` must already hold the target offset.
     std::vector<std::pair<u32, u32>> links;
     bool terminate_stream = true;
+    u32 virtual_block_size = 0;  // > 0: add a type-9 block after the GPU segment (no file data)
 
     u32 GpuBase() const { return Align(static_cast<u32>(cpu.size()), 0x100); }
 
@@ -92,13 +93,15 @@ public:
             u8 flags;
             u16 pool;
             u32 size, offset;
+            u16 block_type;
         };
-        std::vector<Seg> segs = {{0x01, 0, static_cast<u32>(cpu.size()), 0}};
-        if (!gpu.empty()) segs.push_back({0x12, 1, static_cast<u32>(gpu.size()), gpu_base});
-        segs.push_back({0x03, 2, static_cast<u32>(svc.size()), svc_base});
+        std::vector<Seg> segs = {{0x01, 0, static_cast<u32>(cpu.size()), 0, 1}};
+        if (!gpu.empty()) segs.push_back({0x12, 1, static_cast<u32>(gpu.size()), gpu_base, 18});
+        segs.push_back({0x03, 2, static_cast<u32>(svc.size()), svc_base, 2});
         const u32 seg_count = static_cast<u32>(segs.size());
-        const u32 block_count = seg_count;  // one block per segment
-        const u32 header_size = Align(0xc8 + seg_count * 0x28 + 8 + block_count * 12, 0x10);
+        // One block per segment, plus an optional load-time (virtual, type 9) block after the GPU data.
+        const u32 block_count = seg_count + (virtual_block_size ? 1 : 0);
+        const u32 header_size = 0xc8 + seg_count * 0x28 + block_count * 12;
         std::vector<u8> file(header_size, 0);
         auto w16 = [&](u32 o, u16 v) { std::memcpy(file.data() + o, &v, 2); };
         auto w32 = [&](u32 o, u32 v) { std::memcpy(file.data() + o, &v, 4); };
@@ -106,27 +109,37 @@ public:
         std::memcpy(file.data(), "KCAP", 4);
         w16(4, 13);
         w16(6, 14);
+        w32(0x18, 0x98);
+        w32(0x1c, header_size - 0x98);
         w32(0x28, header_size);
         w32(0x2c, static_cast<u32>(data.size()));
         w64(0xa0, seg_count);
         w64(0xb0, block_count);
+        u32 next_block = 0;
         for (u32 i = 0; i < seg_count; ++i) {
             const u32 o = 0xc8 + i * 0x28;
+            const bool with_virtual = virtual_block_size && segs[i].pool == 1;
             file[o] = segs[i].flags;
             file[o + 1] = 0xff;
             w16(o + 2, segs[i].pool);
             w32(o + 4, segs[i].size);
             w64(o + 8, segs[i].offset);
-            w64(o + 0x18, i);
-            w64(o + 0x20, 1);
-        }
-        w64(0xc8 + seg_count * 0x28, 0);
-        for (u32 i = 0; i < block_count; ++i) {
-            const u32 o = 0xc8 + seg_count * 0x28 + 8 + i * 12;
-            w16(o, 0x10);
-            w16(o + 2, static_cast<u16>(i == seg_count - 1 ? 7 : 1));
-            w32(o + 4, segs[i].size);
-            w32(o + 8, segs[i].offset);
+            w64(o + 0x18, next_block);
+            w64(o + 0x20, with_virtual ? 2 : 1);
+            const u32 bo = 0xc8 + seg_count * 0x28 + next_block * 12;
+            w32(bo, segs[i].size);
+            w32(bo + 4, segs[i].offset);
+            w16(bo + 8, 0x10);
+            w16(bo + 10, segs[i].block_type);
+            ++next_block;
+            if (with_virtual) {
+                const u32 vo = 0xc8 + seg_count * 0x28 + next_block * 12;
+                w32(vo, virtual_block_size);
+                w32(vo + 4, segs[i].offset + segs[i].size);
+                w16(vo + 8, 0x10);
+                w16(vo + 10, 9);
+                ++next_block;
+            }
         }
         file.insert(file.end(), data.begin(), data.end());
         return file;

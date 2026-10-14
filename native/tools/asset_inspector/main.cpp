@@ -55,7 +55,8 @@ int CmdInfo(const KcapPackage& p) {
     for (u8 b : h.hash) hash += std::format("{:02x}", b);
     Print(std::format("KCAP version {} kind {} header {:#x} data {:#x} ({:.2f} MiB) hash {}\n", h.version, h.kind,
                       h.header_size, h.data_size, h.data_size / 1048576.0, hash));
-    Print(std::format("root region {:#x} bytes; {} segments, {} blocks\n", h.root_size, h.segment_count, h.block_count));
+    Print(std::format("table region {:#x}+{:#x}; {} segments, {} blocks\n", h.table_offset, h.table_size,
+                      h.segment_count, h.block_count));
     for (size_t i = 0; i < p.Segments().size(); ++i) {
         const auto& s = p.Segments()[i];
         Print(std::format("  segment {} pool {} flags {:#04x} offset {:#10x} size {:#10x} blocks [{}..+{}]\n", i, s.pool,
@@ -82,8 +83,8 @@ int CmdInfo(const KcapPackage& p) {
 int CmdBlocks(const KcapPackage& p) {
     for (size_t i = 0; i < p.Blocks().size(); ++i) {
         const auto& b = p.Blocks()[i];
-        Print(std::format("{:5} type {:3} align {:#6x} offset {:#10x} size {:#10x} segment {}\n", i, b.type, b.align,
-                          b.offset, b.size, p.SegmentIndexOf(b.offset)));
+        Print(std::format("{:5} type {:3} align {:#6x} offset {:#10x} size {:#10x} segment {}{}\n", i, b.type, b.align,
+                          b.offset, b.size, p.SegmentIndexOf(b.offset), b.is_virtual ? " (load-time, not in file)" : ""));
     }
     return 0;
 }

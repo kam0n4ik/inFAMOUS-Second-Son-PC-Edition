@@ -8,10 +8,11 @@ namespace {
 
 constexpr u32 kMagic = 0x5041434b;  // "KCAP"
 constexpr u16 kVersion = 13;
+constexpr u32 kTableOffset = 0x98;
 constexpr u32 kSegmentTable = 0xc8;
 constexpr u32 kSegmentSize = 0x28;
 constexpr u32 kBlockSize = 12;
-constexpr u32 kMaxSegments = 64;
+constexpr u32 kMaxSegments = 4096;  // largest seen: 93 (core_common.sprig.xpps, 1 MiB segments)
 constexpr u32 kMaxBlocks = 1u << 20;
 
 template <class T>
@@ -36,6 +37,7 @@ const char* ToString(KcapError e) {
         case KcapError::SegmentOutOfRange: return "segment outside the data region";
         case KcapError::SegmentBlockRange: return "segment block range outside the block table";
         case KcapError::BlockOutOfRange: return "block outside the data region";
+        case KcapError::BlockOutsideSegment: return "block outside its segment";
         case KcapError::ChunkOutOfRange: return "service chunk outside its segment";
         case KcapError::StreamNotTerminated: return "service stream has no END chunk";
         case KcapError::LinkTableInvalid: return "KNLI link table malformed";
@@ -81,39 +83,58 @@ KcapError KcapPackage::Parse(std::span<const u8> file) {
     header_.version = Load<u16>(p + 4);
     header_.kind = Load<u16>(p + 6);
     if (header_.version != kVersion) return KcapError::UnsupportedVersion;
+    header_.table_offset = Load<u32>(p + 0x18);
+    header_.table_size = Load<u32>(p + 0x1c);
     header_.header_size = Load<u32>(p + 0x28);
     header_.data_size = Load<u32>(p + 0x2c);
     std::memcpy(header_.hash.data(), p + 0x78, 16);
-    if (header_.header_size < kSegmentTable || header_.header_size > file.size()) {
+    // The header ends where the table region [+0x18, +0x18 + +0x1C) ends. Empty packages (the 200-byte
+    // *.hires stubs) store 0 as header size and have no segments.
+    const u64 header_end = static_cast<u64>(header_.table_offset) + header_.table_size;
+    if (header_.table_offset != kTableOffset || header_end < kSegmentTable || header_end > file.size()) {
         return KcapError::BadHeaderSize;
-    }
-    if (static_cast<u64>(header_.header_size) + header_.data_size != file.size()) {
-        return KcapError::SizeMismatch;
     }
     const u64 seg_count = Load<u64>(p + 0xa0);
     const u64 block_count = Load<u64>(p + 0xb0);
-    if (seg_count > kMaxSegments ||
-        kSegmentTable + seg_count * kSegmentSize + 8 > header_.header_size) {
+    if (header_.header_size == 0 && header_.data_size == 0 && seg_count == 0 && block_count == 0 &&
+        header_end == file.size()) {
+        header_.header_size = static_cast<u32>(header_end);
+        data_ = file.subspan(file.size());
+        return KcapError::Ok;  // empty package
+    }
+    if (header_.header_size != header_end) return KcapError::BadHeaderSize;
+    if (static_cast<u64>(header_.header_size) + header_.data_size != file.size()) {
+        return KcapError::SizeMismatch;
+    }
+    if (seg_count > kMaxSegments || kSegmentTable + seg_count * kSegmentSize > header_.header_size) {
         return KcapError::BadSegmentCount;
     }
-    const u64 block_table = kSegmentTable + seg_count * kSegmentSize + 8;
+    // The block table follows the segment table directly (eboot loader 0x30fc00 reads a block's
+    // offset at +4 and its type at +10).
+    const u64 block_table = kSegmentTable + seg_count * kSegmentSize;
     if (block_count > kMaxBlocks || block_table + block_count * kBlockSize > header_.header_size) {
         return KcapError::BadBlockCount;
     }
     header_.segment_count = static_cast<u32>(seg_count);
     header_.block_count = static_cast<u32>(block_count);
-    header_.root_size = Load<u64>(p + kSegmentTable + seg_count * kSegmentSize);
     data_ = file.subspan(header_.header_size, header_.data_size);
 
     blocks_.resize(header_.block_count);
     for (u32 i = 0; i < header_.block_count; ++i) {
         const u8* b = p + block_table + static_cast<u64>(i) * kBlockSize;
         KcapBlock& blk = blocks_[i];
-        blk.align = Load<u16>(b);
-        blk.type = Load<u16>(b + 2);
-        blk.size = Load<u32>(b + 4);
-        blk.offset = Load<u32>(b + 8);
-        if (!InRange(blk.offset, blk.size)) return KcapError::BlockOutOfRange;
+        blk.size = Load<u32>(b);
+        blk.offset = Load<u32>(b + 4);
+        blk.align = Load<u16>(b + 8);
+        blk.type = Load<u16>(b + 10);
+        blk.is_virtual = blk.type == kBlockTypeVirtual;
+        if (blk.is_virtual) {
+            // Allocated at load time after the stored segment data; not present in the file.
+            if (static_cast<u64>(blk.offset) + blk.size > 0xffffffffull) return KcapError::BlockOutOfRange;
+            virtual_end_ = std::max<u64>(virtual_end_, static_cast<u64>(blk.offset) + blk.size);
+        } else if (!InRange(blk.offset, blk.size)) {
+            return KcapError::BlockOutOfRange;
+        }
     }
 
     segments_.resize(header_.segment_count);
@@ -133,11 +154,21 @@ KcapError KcapPackage::Parse(std::span<const u8> file) {
         seg.offset = static_cast<u32>(offset);
         seg.first_block = static_cast<u32>(first);
         seg.block_count = static_cast<u32>(count);
+        for (u32 b = seg.first_block; b < seg.first_block + seg.block_count; ++b) {
+            const KcapBlock& blk = blocks_[b];
+            const u64 seg_end = static_cast<u64>(seg.offset) + seg.size;
+            const bool inside = blk.offset >= seg.offset &&
+                                (blk.is_virtual ? blk.offset <= seg_end : blk.offset + static_cast<u64>(blk.size) <= seg_end);
+            if (!inside) return KcapError::BlockOutsideSegment;
+        }
     }
 
+    // Service segments: every block holds one chunk stream (eboot 0x30fc00 walks each block).
     for (const KcapSegment& seg : segments_) {
-        if (seg.pool == 2) {
-            if (KcapError e = ParseServiceStream(seg); e != KcapError::Ok) return e;
+        if (seg.pool != 2) continue;
+        for (u32 b = seg.first_block; b < seg.first_block + seg.block_count; ++b) {
+            if (blocks_[b].is_virtual || blocks_[b].size == 0) continue;
+            if (KcapError e = ParseServiceStream(blocks_[b]); e != KcapError::Ok) return e;
         }
     }
     for (const KcapChunk& c : chunks_) {
@@ -150,9 +181,9 @@ KcapError KcapPackage::Parse(std::span<const u8> file) {
     return KcapError::Ok;
 }
 
-KcapError KcapPackage::ParseServiceStream(const KcapSegment& seg) {
-    u64 o = seg.offset;
-    const u64 end = static_cast<u64>(seg.offset) + seg.size;
+KcapError KcapPackage::ParseServiceStream(const KcapBlock& block) {
+    u64 o = block.offset;
+    const u64 end = static_cast<u64>(block.offset) + block.size;
     while (o + 8 <= end) {
         KcapChunk c;
         c.tag = Load<u32>(data_.data() + o);
@@ -182,15 +213,28 @@ KcapError KcapPackage::ParseLinks(const KcapChunk& chunk) {
         const u32 field = (kind == 0 || kind == 3) ? 8 : 4;
         for (u32 loc; dec.Next(loc);) {
             u32 target = 0;
-            if (!InRange(loc, field) || !Read(loc, target) || target >= data_.size()) {
+            if (!InRange(loc, field) || !Read(loc, target)) {
                 ++invalid_links_;
                 continue;
             }
-            links_.push_back({loc, target, static_cast<LinkKind>(kind)});
+            const bool in_file = target < data_.size();
+            if (!in_file && !InVirtualBlock(target)) {
+                ++invalid_links_;
+                continue;
+            }
+            links_.push_back({loc, target, static_cast<LinkKind>(kind), !in_file});
         }
         stream += static_cast<u64>(len16) * 2;
     }
     return KcapError::Ok;
+}
+
+bool KcapPackage::InVirtualBlock(u32 offset) const {
+    if (offset >= virtual_end_) return false;
+    for (const KcapBlock& b : blocks_) {
+        if (b.is_virtual && offset >= b.offset && offset - b.offset < b.size) return true;
+    }
+    return false;
 }
 
 int KcapPackage::SegmentIndexOf(u32 offset) const {

@@ -46,12 +46,14 @@ def segments(data, h):
 
 
 def blocks(data, h):
-    base = SEG_TABLE + h['seg_count'] * SEG_SIZE + 8
+    # Layout read from the package loader (eboot 0x30fc00): the block table follows the segment
+    # table directly; entry = {u32 size, u32 offset, u16 align, u16 type}.
+    base = SEG_TABLE + h['seg_count'] * SEG_SIZE
     out = []
     for i in range(h['block_count']):
         o = base + i * BLOCK_SIZE
-        out.append({'align': u16(data, o), 'type': u16(data, o + 2),
-                    'size': u32(data, o + 4), 'offset': u32(data, o + 8)})
+        out.append({'size': u32(data, o), 'offset': u32(data, o + 4),
+                    'align': u16(data, o + 8), 'type': u16(data, o + 10)})
     return out
 
 

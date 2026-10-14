@@ -33,6 +33,7 @@ enum class KcapError : u8 {
     SegmentOutOfRange,
     SegmentBlockRange,
     BlockOutOfRange,
+    BlockOutsideSegment,
     ChunkOutOfRange,
     StreamNotTerminated,
     LinkTableInvalid,
@@ -48,6 +49,11 @@ inline constexpr u32 kTagPyto = 0x4f545950;  // 'PYTO' type-index fixups (eboot 
 inline constexpr u32 kTagPlps = 0x53504c50;  // 'PLPS' property splices (eboot 0x30b1c0)
 inline constexpr u32 kTagEnd = 0x454e4420;   // ' DNE' end of stream
 
+// Block types with a known role.
+inline constexpr u16 kBlockTypeService = 2;  // chunk stream (pool-2 segment)
+inline constexpr u16 kBlockTypeRoot = 6;     // the loader keeps its address (eboot 0x30fc00, +0x90)
+inline constexpr u16 kBlockTypeVirtual = 9;  // allocated at load time, not stored in the file
+
 struct KcapHeader {
     u16 version = 0;
     u16 kind = 0;
@@ -56,7 +62,8 @@ struct KcapHeader {
     std::array<u8, 16> hash{};
     u32 segment_count = 0;
     u32 block_count = 0;
-    u64 root_size = 0;  // u64 after the segment table; equals the size of the unblocked root region
+    u32 table_offset = 0;  // +0x18, always 0x98: start of the table region
+    u32 table_size = 0;    // +0x1C: header size = table_offset + table_size
 };
 
 struct KcapSegment {
@@ -68,11 +75,13 @@ struct KcapSegment {
     u32 block_count = 0;
 };
 
+// Block table entry as stored: {u32 size, u32 offset, u16 align, u16 type}.
 struct KcapBlock {
-    u16 align = 0;
-    u16 type = 0;
     u32 size = 0;
     u32 offset = 0;  // data-relative
+    u16 align = 0;
+    u16 type = 0;
+    bool is_virtual = false;  // type 9: memory reserved at load time beyond the stored data
 };
 
 struct KcapChunk {
@@ -94,6 +103,7 @@ struct KcapLink {
     u32 location = 0;  // data-relative offset of the patched field
     u32 target = 0;    // data-relative offset the field points to
     LinkKind kind = LinkKind::Pointer;
+    bool target_virtual = false;  // target lies in a load-time (type 9) block: no file data
 };
 
 class KcapPackage {
@@ -111,6 +121,7 @@ public:
     u32 InvalidLinkCount() const { return invalid_links_; }
 
     int SegmentIndexOf(u32 offset) const;
+    bool InVirtualBlock(u32 offset) const;
     bool InRange(u64 offset, u64 size) const { return offset <= data_.size() && size <= data_.size() - offset; }
 
     template <class T>
@@ -126,7 +137,7 @@ public:
     const KcapChunk* FindChunk(u32 tag) const;
 
 private:
-    KcapError ParseServiceStream(const KcapSegment& seg);
+    KcapError ParseServiceStream(const KcapBlock& block);
     KcapError ParseLinks(const KcapChunk& chunk);
 
     KcapHeader header_;
@@ -136,6 +147,7 @@ private:
     std::vector<KcapChunk> chunks_;
     std::vector<KcapLink> links_;
     u32 invalid_links_ = 0;
+    u64 virtual_end_ = 0;
 };
 
 // Package together with its memory-mapped file.
