@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <format>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "core/clock.h"
@@ -81,6 +82,22 @@ std::wstring Join(const std::wstring& dir, const std::wstring& rel) {
     return dir + L"\\" + rel;
 }
 
+// Comma-separated package list from the config, resolved against the data directory.
+std::vector<std::wstring> PackageList(const std::string& list, const std::wstring& data_dir) {
+    std::vector<std::wstring> out;
+    size_t pos = 0;
+    while (pos <= list.size()) {
+        size_t end = list.find(',', pos);
+        if (end == std::string::npos) end = list.size();
+        std::string item = list.substr(pos, end - pos);
+        while (!item.empty() && item.front() == ' ') item.erase(item.begin());
+        while (!item.empty() && item.back() == ' ') item.pop_back();
+        if (!item.empty()) out.push_back(Join(data_dir, log::Widen(item)));
+        pos = end + 1;
+    }
+    return out;
+}
+
 void WriteLoadedModules(const std::wstring& path) {
     HMODULE mods[1024];
     DWORD needed = 0;
@@ -97,7 +114,7 @@ void WriteLoadedModules(const std::wstring& path) {
 Vec4 PartColor(size_t i) {
     // Neutral clay with a slight per-part variation so separate parts stay distinguishable.
     const float t = static_cast<float>((i * 37) % 11) / 10.0f;
-    return {0.72f + 0.08f * t, 0.70f + 0.04f * t, 0.66f, 1.0f};
+    return {0.72f + 0.08f * t, 0.70f + 0.04f * t, 0.66f, 0.0f};
 }
 
 }  // namespace
@@ -147,8 +164,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     LoadedModel model;
     std::string load_error;
     std::vector<MeshHandle> part_handles;
+    std::vector<TextureHandle> part_textures;
     std::vector<bool> part_visible;
-    const bool have_model = LoadCharacterModel(package, cache, jobs, model, load_error);
+    const auto char_textures = PackageList(cfg.GetString("Character", "TexturePackages", ""), data_dir);
+    const bool have_model = LoadCharacterModel(package, cache, char_textures, jobs, model, load_error);
     if (have_model) {
         // Parts hidden by configuration (source offsets in the package, hex). The game picks
         // clothing/accessory variants from instance flags that are not reverse-engineered yet.
@@ -160,7 +179,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             hide.push_back(static_cast<u32>(std::strtoul(hide_list.substr(pos, end - pos).c_str(), nullptr, 16)));
             pos = end + 1;
         }
+        std::unordered_map<u64, TextureHandle> tex_by_id;
+        for (const auto& t : model.textures) tex_by_id[t.id] = renderer.UploadTexture(t, /*srgb=*/true);
         for (size_t i = 0; i < model.meshes.size(); ++i) {
+            const auto it = tex_by_id.find(model.part_albedo[i]);
+            part_textures.push_back(it != tex_by_id.end() ? it->second : kWhiteTexture);
             const std::string name = std::format("part{}@{:#x}", i, model.parts[i].source_offset);
             part_handles.push_back(renderer.UploadMesh(model.meshes[i], name.c_str()));
             const bool hidden = std::find(hide.begin(), hide.end(), model.parts[i].source_offset) != hide.end();
@@ -189,7 +212,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     const std::string chunk = args.chunk.empty() ? cfg.GetString("World", "ChunkPackage", "") : args.chunk;
     if (!chunk.empty()) {
         std::string world_error;
-        have_world = LoadWorldChunk(Join(data_dir, log::Widen(chunk)), renderer, jobs, world, world_error);
+        const auto world_textures = PackageList(cfg.GetString("World", "TexturePackages", ""), data_dir);
+        have_world = LoadWorldChunk(Join(data_dir, log::Widen(chunk)), world_textures, renderer, jobs, world, world_error);
         if (!have_world) log::Error("app", "world chunk not loaded: {} (using the test ground)", world_error);
     }
     MeshHandle h_even = kInvalidMesh, h_odd = kInvalidMesh;
@@ -311,16 +335,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         if (have_world) {
             items.insert(items.end(), world.draws.begin(), world.draws.end());
         } else {
-            items.push_back({h_even, Mat4::Identity(), {0.46f, 0.47f, 0.45f, 1}});
-            items.push_back({h_odd, Mat4::Identity(), {0.38f, 0.39f, 0.37f, 1}});
-            for (MeshHandle h : obstacle_meshes) items.push_back({h, Mat4::Identity(), {0.55f, 0.40f, 0.26f, 1}});
+            items.push_back({h_even, Mat4::Identity(), {0.46f, 0.47f, 0.45f, 0}});
+            items.push_back({h_odd, Mat4::Identity(), {0.38f, 0.39f, 0.37f, 0}});
+            for (MeshHandle h : obstacle_meshes) items.push_back({h, Mat4::Identity(), {0.55f, 0.40f, 0.26f, 0}});
         }
         const Mat4 hero_world = Mat4::Translation(render_pos) * Mat4::RotationZ(player.yaw) * Mat4::Scale(model_scale);
         for (size_t i = 0; i < part_handles.size(); ++i) {
             if (!part_visible[i] || part_handles[i] == kInvalidMesh) continue;
-            Vec4 c = PartColor(i);
-            if (i == selected_part && window.MouseCaptured() == false) c = {0.95f, 0.55f, 0.20f, 1};
-            items.push_back({part_handles[i], hero_world, c});
+            const bool textured = part_textures[i] != kWhiteTexture;
+            // Parts whose colour map is in a package not loaded yet are drawn in neutral clay.
+            Vec4 c = textured ? Vec4{1, 1, 1, 0} : Vec4{0.48f, 0.47f, 0.45f, 0};
+            if (i == selected_part && window.MouseCaptured() == false) c = {0.95f, 0.55f, 0.20f, 0};
+            items.push_back({part_handles[i], hero_world, c, part_textures[i]});
         }
         FrameView fv;
         fv.view = free_mode ? free_cam.View() : orbit.View();

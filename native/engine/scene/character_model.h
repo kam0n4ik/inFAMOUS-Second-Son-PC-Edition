@@ -14,6 +14,7 @@
 #include "core/jobs.h"
 #include "core/math.h"
 #include "resources/geometry.h"
+#include "resources/texture.h"
 
 namespace sspc {
 
@@ -29,15 +30,19 @@ struct ModelPartInfo {
 struct LoadedModel {
     std::vector<res::MeshData> meshes;
     std::vector<ModelPartInfo> parts;
+    std::vector<u64> part_albedo;            // colour-map texture id per part (0 = none)
+    std::vector<res::TextureData> textures;  // decoded colour maps referenced by the parts
     std::array<u8, 16> source_hash{};
     Vec3 bounds_min, bounds_max;  // of the default-visible parts
     bool from_cache = false;
     double load_seconds = 0;
 };
 
-// `cache_path` may be empty (no cache). Returns false with `error` set on failure.
-bool LoadCharacterModel(const std::wstring& package_path, const std::wstring& cache_path, JobSystem& jobs,
-                        LoadedModel& out, std::string& error);
+// `cache_path` may be empty (no cache). `texture_packages` are searched for colour maps the model's
+// own package does not contain. Returns false with `error` set on failure.
+bool LoadCharacterModel(const std::wstring& package_path, const std::wstring& cache_path,
+                        const std::vector<std::wstring>& texture_packages, JobSystem& jobs, LoadedModel& out,
+                        std::string& error);
 
 void ChooseDefaultParts(LoadedModel& model);
 

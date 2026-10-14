@@ -13,6 +13,7 @@
 #include "core/types.h"
 #include "renderer/vk_api.h"
 #include "resources/geometry.h"
+#include "resources/texture.h"
 
 namespace sspc {
 
@@ -27,11 +28,14 @@ struct RendererDesc {
 
 using MeshHandle = u32;
 inline constexpr MeshHandle kInvalidMesh = 0xffffffffu;
+using TextureHandle = u32;
+inline constexpr TextureHandle kWhiteTexture = 0;  // created at Init; also the fallback
 
 struct DrawItem {
     MeshHandle mesh = kInvalidMesh;
     Mat4 world = Mat4::Identity();
-    Vec4 color{0.8f, 0.8f, 0.8f, 1.0f};
+    Vec4 color{0.8f, 0.8f, 0.8f, 0.0f};  // rgb multiplies the texture; a > 0 = alpha-test cutoff
+    TextureHandle texture = kWhiteTexture;
 };
 
 struct FrameView {
@@ -61,6 +65,10 @@ public:
     // Uploads positions/normals/uv/indices to device-local buffers. Missing normals are generated.
     MeshHandle UploadMesh(const res::MeshData& mesh, const char* debug_name = nullptr);
     size_t MeshCount() const { return meshes_.size(); }
+    // Uploads all mip levels (BCn stay compressed on the GPU). `srgb` selects the sRGB view of
+    // colour formats. Returns kWhiteTexture on failure.
+    TextureHandle UploadTexture(const res::TextureData& texture, bool srgb);
+    size_t TextureCount() const { return textures_.size(); }
 
     // Records, submits and presents one frame. Returns false on a fatal device error.
     bool RenderFrame(const FrameView& view, std::span<const DrawItem> items);
@@ -85,6 +93,12 @@ private:
         Buffer indices;
         u32 index_count = 0;
     };
+    struct GpuTexture {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+    };
     struct Frame {
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -100,6 +114,9 @@ private:
     void DestroySwapchain();
     bool CreateDepth();
     bool CreatePipeline();
+    bool CreateTextureResources();
+    TextureHandle CreateTexture(VkFormat format, u32 width, u32 height, const std::vector<std::vector<u8>>& mips,
+                                const char* debug_name);
     bool CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props, Buffer& out);
     void DestroyBuffer(Buffer& b);
     u32 FindMemoryType(u32 type_bits, VkMemoryPropertyFlags props) const;
@@ -142,6 +159,10 @@ private:
     VkFormat depth_format_ = VK_FORMAT_D32_SFLOAT;
 
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+    VkSampler sampler_ = VK_NULL_HANDLE;
+    std::vector<GpuTexture> textures_;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkQueryPool query_pool_ = VK_NULL_HANDLE;

@@ -4,12 +4,15 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <unordered_map>
 
 #include "core/clock.h"
 #include "core/file.h"
 #include "core/log.h"
 #include "resources/kcap.h"
 #include "resources/spcmesh.h"
+#include "resources/texture.h"
+#include "resources/texture_library.h"
 
 namespace sspc {
 namespace {
@@ -36,6 +39,36 @@ void FillParts(LoadedModel& m) {
     ChooseDefaultParts(m);
 }
 
+// Colour maps (material category 1) of every part: looked up in the model's package first, then in
+// the shared texture packages; decoded on the job system.
+void LoadPartTextures(const res::KcapPackage& pkg, const std::vector<std::wstring>& texture_packages, JobSystem& jobs,
+                      LoadedModel& m) {
+    res::TextureLibrary lib;
+    lib.AddPackage(pkg);
+    for (const auto& p : texture_packages) {
+        if (!lib.AddPackage(p)) log::Warn("model", "texture package {} not available", log::Narrow(p));
+    }
+    std::vector<u64> wanted;
+    u32 missing = 0;
+    m.part_albedo.assign(m.meshes.size(), 0);
+    for (size_t i = 0; i < m.meshes.size(); ++i) {
+        const auto mt = res::ReadMaterialTextures(pkg, m.meshes[i].source_offset);
+        if (!mt || !mt->slots[1]) continue;
+        if (!lib.Contains(mt->slots[1])) {
+            ++missing;
+            continue;
+        }
+        m.part_albedo[i] = mt->slots[1];
+        if (std::find(wanted.begin(), wanted.end(), mt->slots[1]) == wanted.end()) wanted.push_back(mt->slots[1]);
+    }
+    m.textures.resize(wanted.size());
+    jobs.ParallelFor(static_cast<u32>(wanted.size()), [&](u32 i) { lib.Decode(wanted[i], m.textures[i], nullptr); });
+    std::erase_if(m.textures, [](const res::TextureData& t) { return t.mips.empty(); });
+    log::Info("model", "{} colour maps for {} parts; {} parts reference colour maps not found in {} packages",
+              m.textures.size(), std::count_if(m.part_albedo.begin(), m.part_albedo.end(), [](u64 v) { return v != 0; }),
+              missing, 1 + texture_packages.size());
+}
+
 }  // namespace
 
 void ChooseDefaultParts(LoadedModel& m) {
@@ -60,8 +93,9 @@ void ChooseDefaultParts(LoadedModel& m) {
     }
 }
 
-bool LoadCharacterModel(const std::wstring& package_path, const std::wstring& cache_path, JobSystem& jobs,
-                        LoadedModel& out, std::string& error) {
+bool LoadCharacterModel(const std::wstring& package_path, const std::wstring& cache_path,
+                        const std::vector<std::wstring>& texture_packages, JobSystem& jobs, LoadedModel& out,
+                        std::string& error) {
     const Clock clock;
     out = LoadedModel{};
     res::KcapFile pkg_file;
@@ -82,6 +116,7 @@ bool LoadCharacterModel(const std::wstring& package_path, const std::wstring& ca
                 res::ReadSpcMesh(cache.Bytes(), out.meshes, &cache_error)) {
                 out.from_cache = true;
                 FillParts(out);
+                LoadPartTextures(pkg, texture_packages, jobs, out);
                 out.load_seconds = clock.Now();
                 log::Info("model", "{} meshes from cache {} in {:.1f} ms", out.meshes.size(),
                           log::Narrow(cache_path), out.load_seconds * 1000);
@@ -127,6 +162,7 @@ bool LoadCharacterModel(const std::wstring& package_path, const std::wstring& ca
         return false;
     }
     FillParts(out);
+    LoadPartTextures(pkg, texture_packages, jobs, out);
     if (!cache_path.empty()) {
         const auto bytes = res::WriteSpcMesh(out.meshes, out.source_hash);
         const size_t slash = cache_path.find_last_of(L"\\/");

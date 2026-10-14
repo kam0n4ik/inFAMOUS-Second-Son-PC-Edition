@@ -107,7 +107,17 @@ namespace sspc::vk {
     X(vkDestroyQueryPool)               \
     X(vkCmdResetQueryPool)              \
     X(vkCmdWriteTimestamp2)             \
-    X(vkGetQueryPoolResults)
+    X(vkGetQueryPoolResults)            \
+    X(vkCreateSampler)                  \
+    X(vkDestroySampler)                 \
+    X(vkCreateDescriptorSetLayout)      \
+    X(vkDestroyDescriptorSetLayout)     \
+    X(vkCreateDescriptorPool)           \
+    X(vkDestroyDescriptorPool)          \
+    X(vkAllocateDescriptorSets)         \
+    X(vkUpdateDescriptorSets)           \
+    X(vkCmdBindDescriptorSets)          \
+    X(vkCmdCopyBufferToImage)
 
 struct Api {
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;

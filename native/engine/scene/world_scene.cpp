@@ -9,6 +9,8 @@
 #include "core/log.h"
 #include "resources/geometry.h"
 #include "resources/kcap.h"
+#include "resources/texture.h"
+#include "resources/texture_library.h"
 #include "resources/world_chunk.h"
 
 namespace sspc {
@@ -18,13 +20,13 @@ Vec4 SlotColor(u32 geometry_offset) {
     // Stable muted tint per geometry so separate assets stay distinguishable (no textures yet).
     u32 h = geometry_offset * 2654435761u;
     const float t0 = ((h >> 8) & 0xff) / 255.0f, t1 = ((h >> 16) & 0xff) / 255.0f;
-    return {0.50f + 0.25f * t0, 0.52f + 0.18f * t1, 0.45f + 0.15f * t0 * t1, 1.0f};
+    return {0.50f + 0.25f * t0, 0.52f + 0.18f * t1, 0.45f + 0.15f * t0 * t1, 0.0f};
 }
 
 }  // namespace
 
-bool LoadWorldChunk(const std::wstring& package_path, Renderer& renderer, JobSystem& jobs, WorldScene& out,
-                    std::string& error) {
+bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wstring>& texture_packages,
+                    Renderer& renderer, JobSystem& jobs, WorldScene& out, std::string& error) {
     const Clock clock;
     out = WorldScene{};
     res::KcapFile file;
@@ -69,6 +71,29 @@ bool LoadWorldChunk(const std::wstring& package_path, Renderer& renderer, JobSys
         if (handles[i] != kInvalidMesh) ++out.geometry_uploaded;
     }
 
+    // Colour maps (material slot 1), decoded in parallel and uploaded once per texture id.
+    res::TextureLibrary lib;
+    lib.AddPackage(pkg);
+    for (const auto& p : texture_packages) {
+        if (!lib.AddPackage(p)) log::Warn("world", "texture package {} not available", log::Narrow(p));
+    }
+    std::vector<u64> albedo(records.size(), 0);
+    std::vector<u64> wanted;
+    std::unordered_map<u64, size_t> wanted_index;
+    for (size_t i = 0; i < records.size(); ++i) {
+        const auto mt = res::ReadMaterialTextures(pkg, records[i].offset);
+        if (!mt || !mt->slots[1] || !lib.Contains(mt->slots[1])) continue;
+        albedo[i] = mt->slots[1];
+        if (wanted_index.emplace(albedo[i], wanted.size()).second) wanted.push_back(albedo[i]);
+    }
+    std::vector<res::TextureData> tex_data(wanted.size());
+    jobs.ParallelFor(static_cast<u32>(wanted.size()), [&](u32 i) { lib.Decode(wanted[i], tex_data[i], nullptr); });
+    std::unordered_map<u64, TextureHandle> tex_handle;
+    for (const auto& t : tex_data) {
+        if (!t.mips.empty()) tex_handle[t.id] = renderer.UploadTexture(t, /*srgb=*/true);
+    }
+    out.textures_uploaded = static_cast<u32>(tex_handle.size());
+
     // Instances -> draw items + walkable triangles; spawn = densest 20 m cell of instances.
     std::unordered_map<u64, u32> density;
     auto cell_key = [](const Vec3& p) {
@@ -81,7 +106,12 @@ bool LoadWorldChunk(const std::wstring& package_path, Renderer& renderer, JobSys
             const auto it = slot_of.find(*sc.geometry[inst.geometry]);
             if (it == slot_of.end() || handles[it->second] == kInvalidMesh) continue;
             const Mat4 world = res::ChunkMatrixToWorld(sc.matrices[inst.matrix]);
-            out.draws.push_back({handles[it->second], world, SlotColor(*sc.geometry[inst.geometry])});
+            const auto th = tex_handle.find(albedo[it->second]);
+            if (th != tex_handle.end()) {
+                out.draws.push_back({handles[it->second], world, {1, 1, 1, 0.5f}, th->second});  // alpha-tested
+            } else {
+                out.draws.push_back({handles[it->second], world, SlotColor(*sc.geometry[inst.geometry])});
+            }
             out.terrain.AddMesh(meshes[it->second].positions, meshes[it->second].indices, world);
             ++out.instances_drawn;
             ++density[cell_key({world.m[3][0], world.m[3][1], 0})];
@@ -101,10 +131,10 @@ bool LoadWorldChunk(const std::wstring& package_path, Renderer& renderer, JobSys
     const auto ground = out.terrain.LowestAt(sx, sy);
     out.spawn = {sx, sy, ground ? *ground + 0.05f : 0.0f};
     out.load_seconds = clock.Now();
-    log::Info("world", "{}: {} scene objects, {} instances ({} drawn, {} external), {} meshes, {} walkable tris, "
+    log::Info("world", "{}: {} scene objects, {} instances ({} drawn, {} external), {} meshes, {} textures, {} walkable tris, "
               "spawn ({:.1f}, {:.1f}, {:.1f}) in {:.0f} ms",
               log::Narrow(package_path), scenes.size(), out.instances_total, out.instances_drawn,
-              out.instances_external, out.geometry_uploaded, out.terrain.TriangleCount(), out.spawn.x, out.spawn.y,
+              out.instances_external, out.geometry_uploaded, out.textures_uploaded, out.terrain.TriangleCount(), out.spawn.x, out.spawn.y,
               out.spawn.z, out.load_seconds * 1000);
     return true;
 }

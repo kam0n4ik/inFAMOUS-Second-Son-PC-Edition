@@ -86,6 +86,8 @@ add_library(sspc_engine STATIC
     engine/scene/character_model.cpp
     engine/scene/world_scene.cpp
     engine/resources/world_chunk.cpp
+    engine/resources/texture.cpp
+    engine/resources/texture_library.cpp
     engine/gameplay/terrain.cpp
 )
 add_dependencies(sspc_engine sspc_shaders)
@@ -117,6 +119,7 @@ add_executable(sspc_tests
     tests/test_gameplay.cpp
     tests/test_real_assets.cpp
     tests/test_world.cpp
+    tests/test_texture.cpp
 )
 target_link_libraries(sspc_tests PRIVATE sspc_engine)
 target_include_directories(sspc_tests PRIVATE tests)

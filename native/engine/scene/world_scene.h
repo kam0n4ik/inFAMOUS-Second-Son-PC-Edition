@@ -19,12 +19,13 @@ struct WorldScene {
     u32 instances_drawn = 0;
     u32 instances_external = 0;  // geometry lives in another package (KNLX), not loaded yet
     u32 geometry_uploaded = 0;
+    u32 textures_uploaded = 0;
     double load_seconds = 0;
 };
 
 // Loads every scene object of a chunk package: geometry is decoded on the job system, uploaded
 // once per slot and drawn per instance (kind 0). Walkable triangles feed the terrain grid.
-bool LoadWorldChunk(const std::wstring& package_path, Renderer& renderer, JobSystem& jobs, WorldScene& out,
-                    std::string& error);
+bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wstring>& texture_packages,
+                    Renderer& renderer, JobSystem& jobs, WorldScene& out, std::string& error);
 
 }  // namespace sspc
