@@ -273,14 +273,46 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
 
     // World: a chunk of the original environment, or the test ground with crates.
+    // World: one or more chunks of the original environment (comma-separated, same world frame),
+    // or the test ground with crates. Shared geometry and textures are uploaded once.
     WorldScene world;
+    WorldCache world_cache;
+    std::vector<MeshHandle> collision_views;
     bool have_world = false;
-    const std::string chunk = args.chunk.empty() ? cfg.GetString("World", "ChunkPackage", "") : args.chunk;
-    if (!chunk.empty()) {
-        std::string world_error;
+    const std::string chunk_list = args.chunk.empty() ? cfg.GetString("World", "ChunkPackage", "") : args.chunk;
+    if (!chunk_list.empty()) {
+        const Clock world_clock;
         const auto world_textures = PackageList(cfg.GetString("World", "TexturePackages", ""), data_dir);
-        have_world = LoadWorldChunk(Join(data_dir, log::Widen(chunk)), world_textures, renderer, jobs, world, world_error);
-        if (!have_world) log::Error("app", "world chunk not loaded: {} (using the test ground)", world_error);
+        std::vector<Vec3> col_verts;
+        std::vector<u8> col_layers;
+        u32 chunks = 0;
+        for (const auto& path : PackageList(chunk_list, data_dir)) {
+            WorldScene part;
+            std::string world_error;
+            if (!LoadWorldChunk(path, world_textures, renderer, jobs, world_cache, part, world_error)) {
+                log::Error("app", "world chunk {} not loaded: {}", log::Narrow(path), world_error);
+                continue;
+            }
+            if (!have_world) {
+                world.spawn = part.spawn;
+                world.terrain = std::move(part.terrain);
+            }
+            world.draws.insert(world.draws.end(), part.draws.begin(), part.draws.end());
+            col_verts.insert(col_verts.end(), part.collision.Vertices().begin(), part.collision.Vertices().end());
+            col_layers.insert(col_layers.end(), part.collision.Layers().begin(), part.collision.Layers().end());
+            if (part.collision_mesh != kInvalidMesh) collision_views.push_back(part.collision_mesh);
+            world.collision_from_havok = world.collision_from_havok || part.collision_from_havok;
+            have_world = true;
+            ++chunks;
+        }
+        if (have_world) {
+            world.collision.Build(std::move(col_verts), std::move(col_layers));
+            log::Info("app", "world: {} chunks, {} draws, {} collision triangles, {} meshes and {} textures reused across "
+                      "chunks, {:.0f} ms", chunks, world.draws.size(), world.collision.TriangleCount(),
+                      world_cache.meshes_reused, world_cache.textures_reused, world_clock.Now() * 1000);
+        } else {
+            log::Error("app", "no world chunk loaded (using the test ground)");
+        }
     }
     MeshHandle h_even = kInvalidMesh, h_odd = kInvalidMesh;
     std::vector<Aabb> obstacles;
@@ -452,9 +484,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         orbit.target = render_pos + Vec3{0, 0, 1.45f};
 
         std::vector<DrawItem> items;
-        if (have_world && show_collision && world.collision_mesh != kInvalidMesh) {
+        if (have_world && show_collision && !collision_views.empty()) {
             const Vec4 tint = world.collision_from_havok ? Vec4{0.35f, 0.75f, 0.95f, 0} : Vec4{0.95f, 0.55f, 0.35f, 0};
-            items.push_back({world.collision_mesh, Mat4::Identity(), tint});
+            for (MeshHandle h : collision_views) items.push_back({h, Mat4::Identity(), tint});
         } else if (have_world) {
             items.insert(items.end(), world.draws.begin(), world.draws.end());
         } else {

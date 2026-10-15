@@ -42,6 +42,8 @@ public:
     void ForEachInBox(const Vec3& mn, const Vec3& mx, F&& f, u8 mask = kCollisionAll) const;
 
     const Vec3* Triangle(u32 t) const { return &verts_[static_cast<size_t>(t) * 3]; }
+    const std::vector<Vec3>& Vertices() const { return verts_; }
+    const std::vector<u8>& Layers() const { return layers_; }
     Vec3 Normal(u32 t) const;
     u8 Layer(u32 t) const { return layers_[t]; }
 

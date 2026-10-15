@@ -2,6 +2,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "core/jobs.h"
@@ -9,7 +10,9 @@
 #include "gameplay/collision.h"
 #include "gameplay/terrain.h"
 #include "renderer/renderer.h"
+#include "resources/exports.h"
 #include "resources/havok.h"
+#include "resources/texture_library.h"
 
 namespace sspc {
 
@@ -32,9 +35,20 @@ struct WorldScene {
     double load_seconds = 0;
 };
 
+// State shared by every loaded chunk: the shared packages are opened once, and geometry exported
+// by them and textures (by id) are uploaded to the GPU once however many chunks use them.
+struct WorldCache {
+    res::ExportIndex exports;
+    res::TextureLibrary textures;
+    bool shared_loaded = false;
+    std::unordered_map<std::string, MeshHandle> meshes;     // "<package>:<geometry offset>"
+    std::unordered_map<u64, TextureHandle> texture_handles;  // texture id
+    u32 meshes_reused = 0, textures_reused = 0;
+};
+
 // Loads every scene object of a chunk package: geometry is decoded on the job system, uploaded
 // once per slot and drawn per instance (kind 0). Walkable triangles feed the terrain grid.
 bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wstring>& texture_packages,
-                    Renderer& renderer, JobSystem& jobs, WorldScene& out, std::string& error);
+                    Renderer& renderer, JobSystem& jobs, WorldCache& cache, WorldScene& out, std::string& error);
 
 }  // namespace sspc

@@ -27,7 +27,7 @@ Vec4 SlotColor(u32 geometry_offset) {
 }  // namespace
 
 bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wstring>& texture_packages,
-                    Renderer& renderer, JobSystem& jobs, WorldScene& out, std::string& error) {
+                    Renderer& renderer, JobSystem& jobs, WorldCache& cache, WorldScene& out, std::string& error) {
     const Clock clock;
     out = WorldScene{};
     res::KcapFile file;
@@ -43,8 +43,14 @@ bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wst
     }
 
     // Null geometry slots are filled through KNLX by objects other packages export (shared packages).
-    res::ExportIndex exports;
-    for (const auto& p : texture_packages) exports.AddPackage(p);
+    if (!cache.shared_loaded) {
+        for (const auto& p : texture_packages) {
+            cache.exports.AddPackage(p);
+            if (!cache.textures.AddPackage(p)) log::Warn("world", "texture package {} not available", log::Narrow(p));
+        }
+        cache.shared_loaded = true;
+    }
+    const res::ExportIndex& exports = cache.exports;
     std::unordered_map<u32, std::array<u8, 16>> external_key;  // slot location -> export key
     for (const auto& x : pkg.ExternalLinks()) {
         if (x.addend == 0) external_key[x.location] = x.key;
@@ -84,35 +90,53 @@ bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wst
     jobs.ParallelFor(static_cast<u32>(records.size()), [&](u32 i) {
         ok[i] = res::DecodeGeometry(*records[i].first, records[i].second, meshes[i], nullptr) ? 1 : 0;
     });
+    // GPU meshes: geometry of a shared package is uploaded once for all chunks.
     std::vector<MeshHandle> handles(records.size(), kInvalidMesh);
     for (size_t i = 0; i < records.size(); ++i) {
         if (!ok[i]) continue;
+        const bool own = records[i].first == &pkg;
+        const std::string key = (own ? log::Narrow(package_path)
+                                     : std::format("shared@{:#x}", reinterpret_cast<uintptr_t>(records[i].first))) +
+                                std::format(":{:#x}", records[i].second.offset);
+        if (const auto it = cache.meshes.find(key); it != cache.meshes.end()) {
+            handles[i] = it->second;
+            ++cache.meshes_reused;
+            continue;
+        }
         handles[i] = renderer.UploadMesh(meshes[i], "world");
-        if (handles[i] != kInvalidMesh) ++out.geometry_uploaded;
+        if (handles[i] != kInvalidMesh) {
+            ++out.geometry_uploaded;
+            cache.meshes[key] = handles[i];
+        }
     }
 
-    // Colour maps (material slot 1), decoded in parallel and uploaded once per texture id.
-    res::TextureLibrary lib;
-    lib.AddPackage(pkg);
-    for (const auto& p : texture_packages) {
-        if (!lib.AddPackage(p)) log::Warn("world", "texture package {} not available", log::Narrow(p));
-    }
+    // Colour maps (material slot 1): the chunk's own package first, then the shared packages;
+    // decoded in parallel and uploaded once per texture id for all chunks.
+    res::TextureLibrary own_lib;
+    own_lib.AddPackage(pkg);
+    auto has_texture = [&](u64 id) { return own_lib.Contains(id) || cache.textures.Contains(id); };
     std::vector<u64> albedo(records.size(), 0);
     std::vector<u64> wanted;
     std::unordered_map<u64, size_t> wanted_index;
     for (size_t i = 0; i < records.size(); ++i) {
         const auto mt = res::ReadMaterialTextures(*records[i].first, records[i].second.offset);
-        if (!mt || !mt->slots[1] || !lib.Contains(mt->slots[1])) continue;
+        if (!mt || !mt->slots[1] || !has_texture(mt->slots[1])) continue;
         albedo[i] = mt->slots[1];
+        if (cache.texture_handles.contains(albedo[i])) continue;
         if (wanted_index.emplace(albedo[i], wanted.size()).second) wanted.push_back(albedo[i]);
     }
     std::vector<res::TextureData> tex_data(wanted.size());
-    jobs.ParallelFor(static_cast<u32>(wanted.size()), [&](u32 i) { lib.Decode(wanted[i], tex_data[i], nullptr); });
-    std::unordered_map<u64, TextureHandle> tex_handle;
+    jobs.ParallelFor(static_cast<u32>(wanted.size()), [&](u32 i) {
+        if (own_lib.Contains(wanted[i])) own_lib.Decode(wanted[i], tex_data[i], nullptr);
+        else cache.textures.Decode(wanted[i], tex_data[i], nullptr);
+    });
     for (const auto& t : tex_data) {
-        if (!t.mips.empty()) tex_handle[t.id] = renderer.UploadTexture(t, /*srgb=*/true);
+        if (!t.mips.empty()) {
+            cache.texture_handles[t.id] = renderer.UploadTexture(t, /*srgb=*/true);
+            ++out.textures_uploaded;
+        }
     }
-    out.textures_uploaded = static_cast<u32>(tex_handle.size());
+    const auto& tex_handle = cache.texture_handles;
 
     // Instances -> draw items + walkable triangles; spawn = densest 20 m cell of instances.
     std::unordered_map<u64, u32> density;
