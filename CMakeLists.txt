@@ -27,6 +27,29 @@ if(SSPC_LTO)
         message(WARNING "SecondSonPC: link-time optimization unavailable: ${_sspc_ipo_error}")
     endif()
 endif()
+# Port of uncharted_pc gpu/CMakeLists.txt (BB_PGO): profile-guided optimization. generate: an instrumented build
+# (atomic counters: the processor, frontend, recording and worker threads run the same code) writing raw profiles
+# into SSPC_PGO_DIR at the orderly exit; merge them (llvm-profdata merge -o <dir>\sspc.profdata <dir>\*.profraw);
+# use: a build optimized with <dir>\sspc.profdata (code it has no counts for is optimized as usual). clang-cl's own
+# flags in place of the GCC ones uncharted_pc passes (-fprofile-correction, -Wno-coverage-mismatch).
+set(SSPC_PGO "off" CACHE STRING "Profile-guided optimization: off, generate, use")
+set(SSPC_PGO_DIR "${CMAKE_SOURCE_DIR}/pgo" CACHE PATH "Profile directory")
+if(SSPC_PGO STREQUAL "generate")
+    file(MAKE_DIRECTORY "${SSPC_PGO_DIR}")
+    add_compile_options(-fprofile-generate=${SSPC_PGO_DIR} -fprofile-update=atomic)
+    add_link_options(/DEFAULTLIB:clang_rt.profile-x86_64.lib)
+    add_compile_definitions(SSPC_PGO_GENERATE)
+    message(STATUS "SecondSonPC: profile-guided optimization: instrumented build (profiles into ${SSPC_PGO_DIR})")
+elseif(SSPC_PGO STREQUAL "use")
+    if(NOT EXISTS "${SSPC_PGO_DIR}/sspc.profdata")
+        message(FATAL_ERROR "SSPC_PGO=use: no ${SSPC_PGO_DIR}/sspc.profdata (llvm-profdata merge the raw profiles)")
+    endif()
+    add_compile_options(-fprofile-use=${SSPC_PGO_DIR}/sspc.profdata -Wno-profile-instr-unprofiled
+                        -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+    message(STATUS "SecondSonPC: profile-guided optimization with ${SSPC_PGO_DIR}/sspc.profdata")
+elseif(NOT SSPC_PGO STREQUAL "off")
+    message(FATAL_ERROR "SSPC_PGO must be off, generate or use")
+endif()
 include(cmake/shadps4_bootstrap.cmake) # provides fmt::fmt, toml11::toml11 and the bridge target
 
 # Own code. Rule: nothing outside src/bridge/ may include shadPS4 headers.

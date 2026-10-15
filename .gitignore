@@ -17,3 +17,5 @@ __pycache__/
 /logs/crash/
 /cache/
 /build_lto/
+/pgo/
+/build_pgo*/

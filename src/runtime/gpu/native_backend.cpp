@@ -1364,7 +1364,17 @@ void Backend::OnFlip(u64 gpu_value) {
     }
 }
 
+#ifdef SSPC_PGO_GENERATE
+extern "C" int __llvm_profile_write_file(void);
+#endif
+
 void Backend::Stop() {
+#ifdef SSPC_PGO_GENERATE
+    // SSPC_PGO=generate (port of uncharted_pc BB_PGO): the counts so far, also when the process ends without atexit
+    struct WriteProfile {
+        ~WriteProfile() { __llvm_profile_write_file(); }
+    } write_profile;
+#endif
     Inspector::StopSampling(); // while the sampled thread still exists
     sampler_.Stop(); // while the sampled thread still exists
     game_sampler_.Stop();
