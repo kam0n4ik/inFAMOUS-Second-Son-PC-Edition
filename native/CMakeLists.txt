@@ -50,6 +50,9 @@ endfunction()
 sspc_shader(mesh.vert kMeshVertSpv mesh_vert_spv.h)
 sspc_shader(mesh.frag kMeshFragSpv mesh_frag_spv.h)
 sspc_shader(skinned.vert kSkinnedVertSpv skinned_vert_spv.h)
+sspc_shader(decal.frag kDecalFragSpv decal_frag_spv.h)
+sspc_shader(overlay.vert kOverlayVertSpv overlay_vert_spv.h)
+sspc_shader(overlay.frag kOverlayFragSpv overlay_frag_spv.h)
 add_custom_target(sspc_shaders DEPENDS ${SSPC_SHADER_HEADERS})
 
 # --- Common compile settings ------------------------------------------------------------------
@@ -97,10 +100,24 @@ add_library(sspc_engine STATIC
     engine/scene/animator.cpp
     engine/resources/havok.cpp
     engine/gameplay/collision.cpp
+    # N12: original mission data, native mission runtime, stencil art, HUD
+    engine/core/save_file.cpp
+    engine/resources/type_registry.cpp
+    engine/resources/game_objects.cpp
+    engine/resources/game_text.cpp
+    engine/resources/graffiti_data.cpp
+    engine/resources/mission_data.cpp
+    engine/gameplay/events.cpp
+    engine/gameplay/interaction.cpp
+    engine/gameplay/graffiti.cpp
+    engine/gameplay/mission/mission_definition.cpp
+    engine/gameplay/mission/mission_runtime.cpp
+    engine/gameplay/prologue.cpp
+    engine/renderer/text_overlay.cpp
 )
 add_dependencies(sspc_engine sspc_shaders)
 target_include_directories(sspc_engine PUBLIC engine ${SSPC_GEN_DIR} "${SSPC_VULKAN_SDK}/Include")
-target_link_libraries(sspc_engine PUBLIC sspc_options user32 shell32)
+target_link_libraries(sspc_engine PUBLIC sspc_options user32 shell32 gdi32)
 
 # --- Game -------------------------------------------------------------------------------------
 add_executable(SecondSonPC WIN32 game/main.cpp)
@@ -108,7 +125,10 @@ target_link_libraries(SecondSonPC PRIVATE sspc_engine)
 add_custom_command(TARGET SecondSonPC POST_BUILD
     COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/config/SecondSonPC.ini
             -DDST=$<TARGET_FILE_DIR:SecondSonPC>/SecondSonPC.ini
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_missing.cmake)
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_missing.cmake
+    # Native mission definitions ship with the program (always refreshed).
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/config/missions
+            $<TARGET_FILE_DIR:SecondSonPC>/missions)
 
 # --- Tools ------------------------------------------------------------------------------------
 add_executable(sspc_inspect tools/asset_inspector/main.cpp)
@@ -131,9 +151,13 @@ add_executable(sspc_tests
     tests/test_skeleton.cpp
     tests/test_animation.cpp
     tests/test_collision.cpp
+    tests/test_mission.cpp
+    tests/test_graffiti.cpp
+    tests/test_n12_assets.cpp
 )
 target_link_libraries(sspc_tests PRIVATE sspc_engine)
 target_include_directories(sspc_tests PRIVATE tests)
+target_compile_definitions(sspc_tests PRIVATE SSPC_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 
 enable_testing()
 add_test(NAME unit COMMAND sspc_tests)

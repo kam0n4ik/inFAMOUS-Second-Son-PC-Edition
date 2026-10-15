@@ -31,11 +31,30 @@ inline constexpr MeshHandle kInvalidMesh = 0xffffffffu;
 using TextureHandle = u32;
 inline constexpr TextureHandle kWhiteTexture = 0;  // created at Init; also the fallback
 
+enum class DrawPass : u8 {
+    Opaque = 0,  // depth-tested and written, alpha test by color.a
+    Decal = 1,   // after all opaque draws: alpha blended, depth tested (biased) but not written
+};
+
+// Decal layer modes (shaders/decal.frag).
+enum class DecalMode : u8 { Board = 0, TintedShape = 1, Image = 2, Solid = 3 };
+
 struct DrawItem {
     MeshHandle mesh = kInvalidMesh;
     Mat4 world = Mat4::Identity();
     Vec4 color{0.8f, 0.8f, 0.8f, 0.0f};  // rgb multiplies the texture; a > 0 = alpha-test cutoff
     TextureHandle texture = kWhiteTexture;
+    DrawPass pass = DrawPass::Opaque;
+    TextureHandle mask = kWhiteTexture;  // decals: second texture (spray mask)
+    DecalMode mode = DecalMode::Board;
+    float opacity = 1.0f;
+};
+
+// Screen overlay vertex (pixels, top-left origin). Drawn after the scene, alpha blended.
+struct OverlayVertex {
+    float x = 0, y = 0;
+    float u = 0, v = 0;
+    u32 rgba = 0xffffffffu;  // r in the low byte
 };
 
 struct FrameView {
@@ -68,6 +87,15 @@ public:
     // Uploads all mip levels (BCn stay compressed on the GPU). `srgb` selects the sRGB view of
     // colour formats. Returns kWhiteTexture on failure.
     TextureHandle UploadTexture(const res::TextureData& texture, bool srgb);
+    // RGBA8 image (one level), e.g. the overlay font atlas.
+    TextureHandle UploadRgba(u32 width, u32 height, std::span<const u8> rgba, bool srgb, const char* debug_name);
+    // Single-channel texture updated by the CPU (spray masks). Starts at zero; clamp-to-edge sampling.
+    TextureHandle CreateDynamicTexture(u32 width, u32 height, const char* debug_name);
+    // Replaces the whole texture; the copy is recorded at the start of the next RenderFrame (safe for
+    // frames still in flight). Returns false for a wrong handle or size.
+    bool UpdateDynamicTexture(TextureHandle handle, std::span<const u8> texels);
+    // Overlay drawn on top of the next frame (cleared after it).
+    void SetOverlay(TextureHandle atlas, std::span<const OverlayVertex> vertices);
     // Joint palette (model space) used by every skinned mesh drawn in the next RenderFrame.
     void SetSkinPalette(std::span<const Mat4> joints) { pending_palette_.assign(joints.begin(), joints.end()); }
     size_t TextureCount() const { return textures_.size(); }
@@ -81,6 +109,8 @@ public:
 
     const RendererStats& Stats() const { return stats_; }
     float AspectRatio() const;
+    u32 Width() const { return extent_.width; }
+    u32 Height() const { return extent_.height; }
     std::string DeviceName() const { return device_name_; }
 
 private:
@@ -117,7 +147,9 @@ private:
     void DestroySwapchain();
     bool CreateDepth();
     bool CreatePipeline();
+    bool CreateExtraPipelines();
     bool CreateTextureResources();
+    void RecordDynamicUploads(VkCommandBuffer cmd);
     TextureHandle CreateTexture(VkFormat format, u32 width, u32 height, const std::vector<std::vector<u8>>& mips,
                                 const char* debug_name);
     bool CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props, Buffer& out);
@@ -180,6 +212,25 @@ private:
     VkDescriptorSet palette_sets_[kFramesInFlight] = {};
     u32 frame_index_ = 0;
     std::vector<GpuMesh> meshes_;
+
+    // Decals and overlay.
+    VkPipelineLayout decal_layout_ = VK_NULL_HANDLE;
+    VkPipeline decal_pipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout overlay_layout_ = VK_NULL_HANDLE;
+    VkPipeline overlay_pipeline_ = VK_NULL_HANDLE;
+    VkSampler clamp_sampler_ = VK_NULL_HANDLE;
+    static constexpr u32 kMaxOverlayVertices = 6 * 16384;
+    Buffer overlay_buffers_[kFramesInFlight];
+    std::vector<OverlayVertex> pending_overlay_;
+    TextureHandle overlay_atlas_ = kWhiteTexture;
+    struct DynamicTexture {
+        TextureHandle handle = kWhiteTexture;
+        u32 width = 0, height = 0;
+        std::vector<u8> pending;
+        bool dirty = false;
+        Buffer staging[kFramesInFlight];
+    };
+    std::vector<DynamicTexture> dynamic_textures_;
 
     std::wstring screenshot_path_;
     Buffer screenshot_buffer_;

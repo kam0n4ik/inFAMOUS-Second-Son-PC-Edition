@@ -48,6 +48,7 @@ constexpr KeyName kKeyNames[] = {
     {"lshift", VK_LSHIFT}, {"rshift", VK_RSHIFT}, {"shift", VK_SHIFT}, {"lctrl", VK_LCONTROL},
     {"ctrl", VK_CONTROL}, {"alt", VK_MENU}, {"up", VK_UP}, {"down", VK_DOWN}, {"left", VK_LEFT},
     {"right", VK_RIGHT}, {"pageup", VK_PRIOR}, {"pagedown", VK_NEXT}, {"backspace", VK_BACK},
+    {"mouseleft", VK_LBUTTON}, {"mouseright", VK_RBUTTON}, {"mousemiddle", VK_MBUTTON},
 };
 
 }  // namespace
@@ -55,7 +56,9 @@ constexpr KeyName kKeyNames[] = {
 const char* ToString(Action a) {
     static const char* const kNames[] = {"MoveForward", "MoveBack", "MoveLeft", "MoveRight", "Jump", "Sprint", "Walk",
                                          "ToggleMouseCapture", "NextPart", "PrevPart", "TogglePart",
-                                         "ToggleFreeCamera", "ToggleCollisionView", "Quit"};
+                                         "ToggleFreeCamera", "ToggleCollisionView", "Quit", "Interact", "Spray",
+                                         "Cancel", "ToggleDebugView", "QuickSave", "QuickLoad"};
+    static_assert(std::size(kNames) == static_cast<size_t>(Action::Count));
     return kNames[static_cast<size_t>(a)];
 }
 
@@ -96,6 +99,12 @@ Input::Input() {
     bind(Action::ToggleFreeCamera, VK_F3, 0, XINPUT_GAMEPAD_BACK);
     bind(Action::ToggleCollisionView, VK_F5, 0, 0);
     bind(Action::Quit, VK_ESCAPE, 0, 0);
+    bind(Action::Interact, 'E', 0, XINPUT_GAMEPAD_X);
+    bind(Action::Spray, VK_LBUTTON, 'F', kPadRightTrigger);
+    bind(Action::Cancel, 'Q', VK_BACK, XINPUT_GAMEPAD_B);
+    bind(Action::ToggleDebugView, VK_F4, 0, 0);
+    bind(Action::QuickSave, VK_F6, 0, 0);
+    bind(Action::QuickLoad, VK_F9, 0, 0);
 }
 
 void Input::ApplyConfig(const Config& cfg) {
@@ -135,7 +144,12 @@ void Input::OnMouseDelta(s32 dx, s32 dy) {
 }
 
 void Input::OnMouseButton(int button, bool down) {
-    if (button >= 0 && button < 3) mouse_buttons_[static_cast<size_t>(button)] = down;
+    if (button >= 0 && button < 3) {
+        mouse_buttons_[static_cast<size_t>(button)] = down;
+        // Mouse buttons are bindable like keys ("MouseLeft" = VK_LBUTTON ...).
+        static constexpr u32 kVk[3] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON};
+        keys_[kVk[button]] = down;
+    }
 }
 
 void Input::OnFocusLost() {
@@ -167,6 +181,8 @@ void Input::PollGamepad() {
     pad_.left_trigger = st.Gamepad.bLeftTrigger / 255.0f;
     pad_.right_trigger = st.Gamepad.bRightTrigger / 255.0f;
     pad_.buttons = st.Gamepad.wButtons;
+    if (pad_.left_trigger > 0.35f) pad_.buttons |= kPadLeftTrigger;
+    if (pad_.right_trigger > 0.35f) pad_.buttons |= kPadRightTrigger;
 }
 
 bool Input::Down(Action a) const {

@@ -16,6 +16,12 @@
 //   --chunk <path.xpps>     world chunk override (relative to [Game] DataDir)
 //   --anim-clip <hex>       clip viewer: loop the clip at this data offset of [Animation] ClipPackage
 //   --anim-phase <0..1>     clip viewer: hold this phase (screenshots of one frame)
+//   --prologue / --no-prologue   force the N12 prologue fragment on/off ([Prologue] Enabled)
+//   --prologue-autoplay     automated run: interact with the stencil art and spray its markers
+//   --shot <frame>:<file.bmp>    screenshot at that frame (repeatable)
+//   --debug-view            start with the mission/event debug panel open (F4 toggles)
+//   --save-at <frame>:<file>     write a save game at that frame
+//   --load-save <file>      load a save game at start
 #include <windows.h>
 #include <psapi.h>
 #include <shellapi.h>
@@ -37,6 +43,8 @@
 #include "core/log.h"
 #include "gameplay/character.h"
 #include "gameplay/game_loop.h"
+#include "gameplay/prologue.h"
+#include "renderer/text_overlay.h"
 #include "platform/input.h"
 #include "platform/window.h"
 #include "renderer/renderer.h"
@@ -65,7 +73,23 @@ struct Args {
     float anim_phase = -1;
     float camera_yaw_deg = 1e9f;  // unset
     bool show_collision = false;
+    int prologue = -1;  // -1 = config, 0 off, 1 on
+    bool prologue_autoplay = false;
+    std::vector<std::pair<long long, std::wstring>> shots;
+    bool debug_view = false;
+    std::pair<long long, std::wstring> save_at{-1, L""};
+    std::wstring load_save;
+    std::wstring camera;  // debug: free camera at "x,y,z,yaw_deg,pitch_deg"
 };
+
+// "<frame>:<path>" or "<seconds>s:<path>" (simulation time; stored as -1 - milliseconds).
+std::pair<long long, std::wstring> FrameAndPath(const std::wstring& s) {
+    const size_t colon = s.find(L':');
+    if (colon == std::wstring::npos || colon == 0) return {-1, L""};
+    const std::wstring when = s.substr(0, colon);
+    if (when.back() == L's') return {-1 - static_cast<long long>(_wtof(when.c_str()) * 1000.0), s.substr(colon + 1)};
+    return {_wtoll(when.c_str()), s.substr(colon + 1)};
+}
 
 Args ParseArgs() {
     Args a;
@@ -86,6 +110,16 @@ Args ParseArgs() {
         else if (s == L"--anim-phase") a.anim_phase = static_cast<float>(_wtof(next().c_str()));
         else if (s == L"--camera-yaw") a.camera_yaw_deg = static_cast<float>(_wtof(next().c_str()));
         else if (s == L"--show-collision") a.show_collision = true;
+        else if (s == L"--prologue") a.prologue = 1;
+        else if (s == L"--no-prologue") a.prologue = 0;
+        else if (s == L"--prologue-autoplay") a.prologue_autoplay = true;
+        else if (s == L"--shot") {
+            auto fp = FrameAndPath(next());
+            if (!fp.second.empty()) a.shots.push_back(fp);
+        } else if (s == L"--debug-view") a.debug_view = true;
+        else if (s == L"--save-at") a.save_at = FrameAndPath(next());
+        else if (s == L"--load-save") a.load_save = next();
+        else if (s == L"--camera") a.camera = next();
     }
     LocalFree(argv);
     return a;
@@ -186,7 +220,7 @@ ClipSet LoadClips(const Config& cfg, const std::wstring& data_dir, const res::Sk
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
-    const Args args = ParseArgs();
+    Args args = ParseArgs();
     const std::wstring exe_dir = file::ExecutableDirectory();
     file::CreateDirectories(exe_dir + L"\\logs");
     log::Init(exe_dir + L"\\logs\\native.log", log::Level::Info, false);
@@ -223,6 +257,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     // --- Content -----------------------------------------------------------------------------
     JobSystem jobs;
     const std::wstring data_dir = log::Widen(cfg.GetString("Game", "DataDir", ""));
+    // N12: the prologue fragment (mission VOR) - its world is the cannery roof of chunk a8.
+    if (args.prologue == 1) cfg.Set("Prologue", "Enabled", "true");
+    PrologueSettings prologue_settings;
+    const bool prologue_enabled = args.prologue != 0 && ReadPrologueSettings(cfg, data_dir, exe_dir, prologue_settings);
     const std::wstring package = args.package.empty()
                                      ? Join(data_dir, log::Widen(cfg.GetString("Game", "CharacterPackage", "art\\cache\\hero.xpps")))
                                      : args.package;
@@ -279,7 +317,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     WorldCache world_cache;
     std::vector<MeshHandle> collision_views;
     bool have_world = false;
-    const std::string chunk_list = args.chunk.empty() ? cfg.GetString("World", "ChunkPackage", "") : args.chunk;
+    const std::string chunk_list = !args.chunk.empty() ? args.chunk
+                                   : prologue_enabled ? cfg.GetString("Prologue", "Chunks", "art\\cache\\a8.xpps, art\\cache\\a3.xpps")
+                                                      : cfg.GetString("World", "ChunkPackage", "");
     if (!chunk_list.empty()) {
         const Clock world_clock;
         const auto world_textures = PackageList(cfg.GetString("World", "TexturePackages", ""), data_dir);
@@ -377,6 +417,57 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     frame_ms_log.reserve(1 << 16);
     size_t selected_part = 0;
     bool pending_jump = false;
+
+    // --- N12 prologue fragment -----------------------------------------------------------------
+    TextOverlay overlay;
+    overlay.Init(renderer, 22);
+    PrologueSlice prologue;
+    bool debug_view = args.debug_view;
+    auto place_hero = [&](const HeroPlacement& h) {
+        player = CharacterState{};
+        player.position = h.feet;
+        player.yaw = h.yaw;
+        if (have_world && !world.collision.Empty()) {  // stand on the surface under the point
+            if (auto hit = world.collision.Raycast(h.feet + Vec3{0, 0, 1.0f}, {0, 0, -1}, 3.0f); hit && hit->normal.z > 0.6f) {
+                player.position = hit->point + Vec3{0, 0, 0.02f};
+            }
+        }
+        prev_player = player;
+        log::Info("prologue", "hero placed at ({:.2f}, {:.2f}, {:.2f}) yaw {:.1f} deg", player.position.x, player.position.y,
+                  player.position.z, player.yaw * 180.0f / kPi);
+    };
+    if (prologue_enabled) {
+        std::string perr;
+        if (prologue.Load(prologue_settings, &renderer, perr)) {
+            if (have_world) {  // add the approximated billboard catwalk to the world collision
+                std::vector<Vec3> verts = world.collision.Vertices();
+                std::vector<u8> layers = world.collision.Layers();
+                const std::vector<Vec3> extra = prologue.ApproximateCollision();
+                verts.insert(verts.end(), extra.begin(), extra.end());
+                layers.insert(layers.end(), extra.size() / 3, kCollisionFallback);
+                world.collision.Build(std::move(verts), std::move(layers));
+            }
+            prologue.StartMission();
+            if (!args.load_save.empty()) {
+                std::string lerr;
+                if (!prologue.LoadGame(args.load_save, lerr)) log::Error("prologue", "save {} not loaded: {}", log::Narrow(args.load_save), lerr);
+                else log::Info("prologue", "save {} loaded", log::Narrow(args.load_save));
+            }
+            if (auto h = prologue.TakeHeroPlacement()) place_hero(*h);
+            orbit.yaw = player.yaw + kPi;  // camera behind the hero
+        } else {
+            log::Error("prologue", "prologue fragment not loaded: {}", perr);
+        }
+    }
+    if (!args.camera.empty()) {  // debug view from a fixed pose
+        float c[5] = {};
+        if (swscanf_s(args.camera.c_str(), L"%f,%f,%f,%f,%f", &c[0], &c[1], &c[2], &c[3], &c[4]) == 5) {
+            free_mode = true;
+            free_cam.position = {c[0], c[1], c[2]};
+            free_cam.yaw = c[3] * kPi / 180.0f;
+            free_cam.pitch = c[4] * kPi / 180.0f;
+        }
+    }
     window.SetMouseCaptured(args.frames < 0 && cfg.GetBool("Input", "CaptureMouse", true));
 
     const Clock clock;
@@ -425,6 +516,44 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             sprint = t > 2.0;
             if (std::abs(t - 3.0) < 0.5 * sim.Step()) pending_jump = true;
             look_x = static_cast<float>(dt) * 120.0f;
+        }
+        PrologueFrameOut pout;
+        if (prologue.Loaded()) {
+            if (input.Pressed(Action::ToggleDebugView)) debug_view = !debug_view;
+            PrologueFrameIn pin;
+            pin.dt = static_cast<float>(dt);
+            pin.input = &input;
+            pin.look_enabled = window.MouseCaptured();
+            pin.look_dx = look_x;
+            pin.look_dy = look_y;
+            pin.player_feet = player.position;
+            pin.player_yaw = player.yaw;
+            const Vec3 eye = free_mode ? free_cam.position : orbit.Eye();
+            pin.gameplay_camera = {eye, free_mode ? free_cam.Forward() : Normalize(orbit.target - eye), 60.0f * kPi / 180.0f};
+            pin.scripted = args.prologue_autoplay;
+            pout = prologue.Update(pin);
+            if (auto h = prologue.TakeHeroPlacement()) place_hero(*h);
+            if (pout.lock_player) {  // the stencil art owns movement and aiming
+                mx = my = 0;
+                pending_jump = false;
+                look_x = look_y = 0;
+            }
+            if (pout.face_yaw) {
+                player.yaw = *pout.face_yaw;
+                prev_player.yaw = player.yaw;
+            }
+            if (input.Pressed(Action::QuickSave)) {
+                const bool ok = prologue.SaveGame(prologue_settings.save_file, player.position, player.yaw);
+                log::Info("prologue", "quick save {}: {}", log::Narrow(prologue_settings.save_file), ok ? "ok" : "FAILED");
+            }
+            if (input.Pressed(Action::QuickLoad)) {
+                std::string lerr;
+                if (prologue.LoadGame(prologue_settings.save_file, lerr)) {
+                    if (auto h = prologue.TakeHeroPlacement()) place_hero(*h);
+                } else {
+                    log::Warn("prologue", "quick load failed: {}", lerr);
+                }
+            }
         }
         if (free_mode) {
             free_cam.AddLook(look_x, look_y);
@@ -511,8 +640,33 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         FrameView fv;
         fv.view = free_mode ? free_cam.View() : orbit.View();
         fv.projection = Mat4::Perspective(60.0f * kPi / 180.0f, renderer.AspectRatio(), 0.1f, 2000.0f);
+        if (prologue.Loaded()) {
+            prologue.AppendDraws(items);
+            prologue.UploadMasks(renderer);
+            if (pout.camera_override && !free_mode) {
+                fv.view = Mat4::LookAt(pout.camera.eye, pout.camera.eye + pout.camera.forward, {0, 0, 1});
+                fv.projection = Mat4::Perspective(pout.camera.fov_y, renderer.AspectRatio(), 0.05f, 2000.0f);
+            }
+            overlay.Begin(static_cast<float>(renderer.Width()), static_cast<float>(renderer.Height()));
+            prologue.DrawHud(overlay, debug_view);
+            overlay.Submit(renderer);
+            if (args.save_at.first >= 0 && static_cast<long long>(frame) == args.save_at.first) {
+                const bool ok = prologue.SaveGame(args.save_at.second, player.position, player.yaw);
+                log::Info("prologue", "save at frame {} -> {}: {}", frame, log::Narrow(args.save_at.second), ok ? "ok" : "FAILED");
+            }
+        }
         if (args.frames >= 0 && frame + 1 == static_cast<u64>(args.frames) && !args.screenshot.empty()) {
             renderer.RequestScreenshot(args.screenshot);
+        }
+        for (auto& [shot_when, shot_path] : args.shots) {
+            if (shot_path.empty()) continue;
+            const double sim_ms = sim.TotalSteps() * sim.Step() * 1000.0;
+            const bool due = shot_when >= 0 ? static_cast<long long>(frame) == shot_when : sim_ms >= static_cast<double>(-1 - shot_when);
+            if (due) {
+                renderer.RequestScreenshot(shot_path);
+                shot_path.clear();  // once
+                break;              // one capture per frame
+            }
         }
         const double cpu_ms = (clock.Now() - now) * 1000.0;  // input, simulation, animation, draw list
         if (!renderer.RenderFrame(fv, items)) {
@@ -550,6 +704,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
               player.grounded);
     log::Info("app", "renderer: validation messages {}, swapchain recreations {}, last GPU frame {:.3f} ms",
               st.validation_messages, st.swapchain_recreations, st.gpu_ms);
+    if (prologue.Loaded()) {
+        const auto* o = prologue.Missions().Objective();
+        log::Info("prologue", "end state: mission {} objective {} xp {} | graffiti {} stage {}/{}",
+                  mission::ToString(prologue.Missions().State()), o ? o->name : std::string("-"), prologue.Missions().Xp(),
+                  ToString(prologue.Graffiti().Phase()), prologue.Graffiti().Stage(), prologue.Graffiti().StageCount());
+    }
     if (!frame_ms_log.empty()) {
         auto mean = [](const std::vector<float>& v) {
             double s = 0;

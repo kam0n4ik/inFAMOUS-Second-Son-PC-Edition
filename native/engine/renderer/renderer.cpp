@@ -9,8 +9,11 @@
 #include "core/file.h"
 #include "core/log.h"
 #include "platform/window.h"
+#include "shaders/decal_frag_spv.h"
 #include "shaders/mesh_frag_spv.h"
 #include "shaders/mesh_vert_spv.h"
+#include "shaders/overlay_frag_spv.h"
+#include "shaders/overlay_vert_spv.h"
 #include "shaders/skinned_vert_spv.h"
 
 namespace sspc {
@@ -161,7 +164,7 @@ bool Renderer::Init(Window& window, const RendererDesc& desc) {
         qci.queryCount = 2 * kFramesInFlight;
         VK_CHECK(api.vkCreateQueryPool(device_, &qci, nullptr, &query_pool_));
     }
-    if (!CreateSwapchain() || !CreateTextureResources() || !CreatePipeline()) return false;
+    if (!CreateSwapchain() || !CreateTextureResources() || !CreatePipeline() || !CreateExtraPipelines()) return false;
     initialized_ = true;
     log::Info("renderer", "ready: {} | {}x{} | format {} | vsync {} | validation {}", device_name_,
               extent_.width, extent_.height, static_cast<int>(swapchain_format_), desc.vsync,
@@ -549,6 +552,213 @@ bool Renderer::CreatePipeline() {
     return true;
 }
 
+bool Renderer::CreateExtraPipelines() {
+    VkShaderModule vs, dfs, ovs, ofs;
+    VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smci.codeSize = sizeof(kMeshVertSpv);
+    smci.pCode = kMeshVertSpv;
+    VK_CHECK(api.vkCreateShaderModule(device_, &smci, nullptr, &vs));
+    smci.codeSize = sizeof(kDecalFragSpv);
+    smci.pCode = kDecalFragSpv;
+    VK_CHECK(api.vkCreateShaderModule(device_, &smci, nullptr, &dfs));
+    smci.codeSize = sizeof(kOverlayVertSpv);
+    smci.pCode = kOverlayVertSpv;
+    VK_CHECK(api.vkCreateShaderModule(device_, &smci, nullptr, &ovs));
+    smci.codeSize = sizeof(kOverlayFragSpv);
+    smci.pCode = kOverlayFragSpv;
+    VK_CHECK(api.vkCreateShaderModule(device_, &smci, nullptr, &ofs));
+
+    VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants)};
+    const VkDescriptorSetLayout decal_sets[2] = {set_layout_, set_layout_};  // layer texture, spray mask
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 2;
+    plci.pSetLayouts = decal_sets;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &range;
+    VK_CHECK(api.vkCreatePipelineLayout(device_, &plci, nullptr, &decal_layout_));
+    plci.setLayoutCount = 1;  // font atlas
+    VK_CHECK(api.vkCreatePipelineLayout(device_, &plci, nullptr, &overlay_layout_));
+
+    VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = dfs;
+    stages[1].pName = "main";
+    VkVertexInputBindingDescription binding{0, kVertexStride, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attrs[3] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
+                                                  {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12},
+                                                  {2, 0, VK_FORMAT_R32G32_SFLOAT, 24}};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount = 1;
+    vi.pVertexBindingDescriptions = &binding;
+    vi.vertexAttributeDescriptionCount = 3;
+    vi.pVertexAttributeDescriptions = attrs;
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+    // Layers lie on (or a few millimetres in front of) the surface they decorate: pull them towards
+    // the camera so they never z-fight with it.
+    rs.depthBiasEnable = VK_TRUE;
+    rs.depthBiasConstantFactor = -2.0f;
+    rs.depthBiasSlopeFactor = -2.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_FALSE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    cba.colorWriteMask = 0xf;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo rci{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rci.colorAttachmentCount = 1;
+    rci.pColorAttachmentFormats = &swapchain_format_;
+    rci.depthAttachmentFormat = depth_format_;
+    VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gp.pNext = &rci;
+    gp.stageCount = 2;
+    gp.pStages = stages;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pDepthStencilState = &ds;
+    gp.pColorBlendState = &cb;
+    gp.pDynamicState = &dy;
+    gp.layout = decal_layout_;
+    VkResult r = api.vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &gp, nullptr, &decal_pipeline_);
+    if (r == VK_SUCCESS) {
+        // Overlay: pixels, no depth, same blending.
+        VkVertexInputBindingDescription obinding{0, sizeof(OverlayVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+        VkVertexInputAttributeDescription oattrs[3] = {{0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
+                                                       {1, 0, VK_FORMAT_R32G32_SFLOAT, 8},
+                                                       {2, 0, VK_FORMAT_R8G8B8A8_UNORM, 16}};
+        vi.pVertexBindingDescriptions = &obinding;
+        vi.pVertexAttributeDescriptions = oattrs;
+        stages[0].module = ovs;
+        stages[1].module = ofs;
+        rs.depthBiasEnable = VK_FALSE;
+        ds.depthTestEnable = VK_FALSE;
+        gp.layout = overlay_layout_;
+        r = api.vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &gp, nullptr, &overlay_pipeline_);
+    }
+    api.vkDestroyShaderModule(device_, vs, nullptr);
+    api.vkDestroyShaderModule(device_, dfs, nullptr);
+    api.vkDestroyShaderModule(device_, ovs, nullptr);
+    api.vkDestroyShaderModule(device_, ofs, nullptr);
+    if (r != VK_SUCCESS) {
+        log::Error("vulkan", "decal/overlay pipelines failed: {}", vk::ResultString(r));
+        return false;
+    }
+    SetName(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(decal_pipeline_), "decal");
+    SetName(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(overlay_pipeline_), "overlay");
+    for (Buffer& b : overlay_buffers_) {
+        if (!CreateBuffer(sizeof(OverlayVertex) * kMaxOverlayVertices, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TextureHandle Renderer::UploadRgba(u32 width, u32 height, std::span<const u8> rgba, bool srgb, const char* debug_name) {
+    if (!initialized_) return kWhiteTexture;
+    if (width == 0 || height == 0 || rgba.size() != static_cast<size_t>(width) * height * 4) return kWhiteTexture;
+    const std::vector<std::vector<u8>> mips = {std::vector<u8>(rgba.begin(), rgba.end())};
+    return CreateTexture(srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, width, height, mips, debug_name);
+}
+
+TextureHandle Renderer::CreateDynamicTexture(u32 width, u32 height, const char* debug_name) {
+    if (!initialized_ || width == 0 || height == 0 || width > 4096 || height > 4096) return kWhiteTexture;
+    const std::vector<std::vector<u8>> zero = {std::vector<u8>(static_cast<size_t>(width) * height, 0)};
+    const TextureHandle h = CreateTexture(VK_FORMAT_R8_UNORM, width, height, zero, debug_name);
+    if (h == kWhiteTexture) return kWhiteTexture;
+    // Masks are sampled with clamp-to-edge (the default sampler repeats).
+    VkDescriptorImageInfo dii{clamp_sampler_, textures_[h].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = textures_[h].set;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &dii;
+    api.vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+    DynamicTexture dt;
+    dt.handle = h;
+    dt.width = width;
+    dt.height = height;
+    for (Buffer& b : dt.staging) {
+        if (!CreateBuffer(static_cast<VkDeviceSize>(width) * height, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, b)) {
+            for (Buffer& x : dt.staging) DestroyBuffer(x);
+            return kWhiteTexture;
+        }
+    }
+    dynamic_textures_.push_back(std::move(dt));
+    return h;
+}
+
+bool Renderer::UpdateDynamicTexture(TextureHandle handle, std::span<const u8> texels) {
+    for (DynamicTexture& dt : dynamic_textures_) {
+        if (dt.handle != handle) continue;
+        if (texels.size() != static_cast<size_t>(dt.width) * dt.height) return false;
+        dt.pending.assign(texels.begin(), texels.end());
+        dt.dirty = true;
+        return true;
+    }
+    return false;
+}
+
+void Renderer::SetOverlay(TextureHandle atlas, std::span<const OverlayVertex> vertices) {
+    overlay_atlas_ = atlas;
+    const size_t n = std::min<size_t>(vertices.size(), kMaxOverlayVertices) / 6 * 6;
+    pending_overlay_.assign(vertices.begin(), vertices.begin() + static_cast<std::ptrdiff_t>(n));
+}
+
+void Renderer::RecordDynamicUploads(VkCommandBuffer cmd) {
+    for (DynamicTexture& dt : dynamic_textures_) {
+        if (!dt.dirty) continue;
+        // This frame slot's previous submission has completed (fence waited): its staging is free.
+        Buffer& staging = dt.staging[frame_index_];
+        std::memcpy(staging.mapped, dt.pending.data(), dt.pending.size());
+        const VkImage image = textures_[dt.handle].image;
+        // The barrier also orders the copy after sampling by frames submitted earlier.
+        ImageBarrier(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {dt.width, dt.height, 1};
+        api.vkCmdCopyBufferToImage(cmd, staging.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        ImageBarrier(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        dt.dirty = false;
+    }
+}
+
 u32 Renderer::FindMemoryType(u32 type_bits, VkMemoryPropertyFlags props) const {
     for (u32 i = 0; i < mem_props_.memoryTypeCount; ++i) {
         if ((type_bits & (1u << i)) && (mem_props_.memoryTypes[i].propertyFlags & props) == props) return i;
@@ -738,6 +948,8 @@ bool Renderer::CreateTextureResources() {
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     sci.maxLod = VK_LOD_CLAMP_NONE;
     VK_CHECK(api.vkCreateSampler(device_, &sci, nullptr, &sampler_));
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VK_CHECK(api.vkCreateSampler(device_, &sci, nullptr, &clamp_sampler_));
     // Handle 0: 1x1 white, used by untextured draws and as the fallback.
     const std::vector<std::vector<u8>> white = {{255, 255, 255, 255}};
     return CreateTexture(VK_FORMAT_R8G8B8A8_UNORM, 1, 1, white, "white") == kWhiteTexture;
@@ -916,6 +1128,7 @@ bool Renderer::RenderFrame(const FrameView& view, std::span<const DrawItem> item
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(api.vkBeginCommandBuffer(cmd, &bi));
+    RecordDynamicUploads(cmd);
     if (query_pool_) {
         api.vkCmdResetQueryPool(cmd, query_pool_, frame_index_ * 2, 2);
         api.vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, query_pool_, frame_index_ * 2);
@@ -970,7 +1183,7 @@ bool Renderer::RenderFrame(const FrameView& view, std::span<const DrawItem> item
     stats_.triangles = 0;
     TextureHandle bound = 0xffffffffu;
     for (const DrawItem& item : items) {
-        if (item.mesh >= meshes_.size()) continue;
+        if (item.mesh >= meshes_.size() || item.pass != DrawPass::Opaque) continue;
         const GpuMesh& gm = meshes_[item.mesh];
         if (gm.skinned != skinned_bound) {
             api.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gm.skinned ? skinned_pipeline_ : pipeline_);
@@ -1004,6 +1217,69 @@ bool Renderer::RenderFrame(const FrameView& view, std::span<const DrawItem> item
         api.vkCmdDrawIndexed(cmd, gm.index_count, 1, 0, 0, 0);
         ++stats_.draws;
         stats_.triangles += gm.index_count / 3;
+    }
+
+    // Decals after every opaque surface, in submission order (the caller sorts layers back to front).
+    bool decal_bound = false;
+    for (const DrawItem& item : items) {
+        if (item.mesh >= meshes_.size() || item.pass != DrawPass::Decal || meshes_[item.mesh].skinned) continue;
+        const GpuMesh& gm = meshes_[item.mesh];
+        if (!decal_bound) {
+            api.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, decal_pipeline_);
+            decal_bound = true;
+        }
+        const TextureHandle tex = item.texture < textures_.size() ? item.texture : kWhiteTexture;
+        const TextureHandle mask = item.mask < textures_.size() ? item.mask : kWhiteTexture;
+        const VkDescriptorSet sets[2] = {textures_[tex].set, textures_[mask].set};
+        api.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, decal_layout_, 0, 2, sets, 0, nullptr);
+        PushConstants pc;
+        const Mat4 mvp = view_proj * item.world;
+        std::memcpy(pc.mvp, mvp.m, sizeof(pc.mvp));
+        for (int r3 = 0; r3 < 3; ++r3) {
+            float* row = r3 == 0 ? pc.world_row0 : r3 == 1 ? pc.world_row1 : pc.world_row2;
+            row[0] = item.world.m[0][r3];
+            row[1] = item.world.m[1][r3];
+            row[2] = item.world.m[2][r3];
+            row[3] = 0;
+        }
+        pc.world_row0[3] = static_cast<float>(item.mode);
+        pc.world_row1[3] = item.opacity;
+        pc.color[0] = item.color.x;
+        pc.color[1] = item.color.y;
+        pc.color[2] = item.color.z;
+        pc.color[3] = item.color.w;
+        api.vkCmdPushConstants(cmd, decal_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(pc), &pc);
+        const VkDeviceSize zero = 0;
+        api.vkCmdBindVertexBuffers(cmd, 0, 1, &gm.vertices.buffer, &zero);
+        api.vkCmdBindIndexBuffer(cmd, gm.indices.buffer, 0, VK_INDEX_TYPE_UINT32);
+        api.vkCmdDrawIndexed(cmd, gm.index_count, 1, 0, 0, 0);
+        ++stats_.draws;
+        stats_.triangles += gm.index_count / 3;
+    }
+
+    // Screen overlay (HUD), pixels -> clip space.
+    if (!pending_overlay_.empty() && overlay_pipeline_) {
+        Buffer& vb = overlay_buffers_[frame_index_];
+        std::memcpy(vb.mapped, pending_overlay_.data(), pending_overlay_.size() * sizeof(OverlayVertex));
+        api.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, overlay_pipeline_);
+        const TextureHandle atlas = overlay_atlas_ < textures_.size() ? overlay_atlas_ : kWhiteTexture;
+        api.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, overlay_layout_, 0, 1, &textures_[atlas].set, 0,
+                                    nullptr);
+        PushConstants pc{};
+        Mat4 ortho = Mat4::Identity();
+        ortho.m[0][0] = 2.0f / static_cast<float>(extent_.width);
+        ortho.m[1][1] = 2.0f / static_cast<float>(extent_.height);
+        ortho.m[3][0] = -1.0f;
+        ortho.m[3][1] = -1.0f;
+        std::memcpy(pc.mvp, ortho.m, sizeof(pc.mvp));
+        api.vkCmdPushConstants(cmd, overlay_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(pc), &pc);
+        const VkDeviceSize zero = 0;
+        api.vkCmdBindVertexBuffers(cmd, 0, 1, &vb.buffer, &zero);
+        api.vkCmdDraw(cmd, static_cast<u32>(pending_overlay_.size()), 1, 0, 0);
+        ++stats_.draws;
+        pending_overlay_.clear();
     }
     api.vkCmdEndRendering(cmd);
 
@@ -1110,6 +1386,19 @@ void Renderer::Shutdown() {
             DestroyBuffer(m.indices);
         }
         meshes_.clear();
+        for (DynamicTexture& dt : dynamic_textures_) {
+            for (Buffer& b : dt.staging) DestroyBuffer(b);
+        }
+        dynamic_textures_.clear();
+        for (Buffer& b : overlay_buffers_) DestroyBuffer(b);
+        if (decal_pipeline_) api.vkDestroyPipeline(device_, decal_pipeline_, nullptr);
+        if (overlay_pipeline_) api.vkDestroyPipeline(device_, overlay_pipeline_, nullptr);
+        if (decal_layout_) api.vkDestroyPipelineLayout(device_, decal_layout_, nullptr);
+        if (overlay_layout_) api.vkDestroyPipelineLayout(device_, overlay_layout_, nullptr);
+        if (clamp_sampler_) api.vkDestroySampler(device_, clamp_sampler_, nullptr);
+        decal_pipeline_ = overlay_pipeline_ = VK_NULL_HANDLE;
+        decal_layout_ = overlay_layout_ = VK_NULL_HANDLE;
+        clamp_sampler_ = VK_NULL_HANDLE;
         for (GpuTexture& t : textures_) {
             if (t.view) api.vkDestroyImageView(device_, t.view, nullptr);
             if (t.image) api.vkDestroyImage(device_, t.image, nullptr);

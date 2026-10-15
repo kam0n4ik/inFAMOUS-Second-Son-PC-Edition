@@ -30,8 +30,18 @@ enum class Action : u8 {
     ToggleFreeCamera,
     ToggleCollisionView,
     Quit,
+    Interact,         // use the focused object (e.g. start stencil art)
+    Spray,            // hold: spray paint (graffiti)
+    Cancel,           // leave the current interaction
+    ToggleDebugView,  // mission / event debug panel
+    QuickSave,
+    QuickLoad,
     Count,
 };
+
+// Gamepad triggers as pseudo-buttons (XInput leaves bits 0x0400/0x0800 unused).
+inline constexpr u16 kPadLeftTrigger = 0x0400;
+inline constexpr u16 kPadRightTrigger = 0x0800;
 const char* ToString(Action a);
 
 struct GamepadState {

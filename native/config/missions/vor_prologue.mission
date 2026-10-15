@@ -1,0 +1,57 @@
+sspc-mission 1
+# N12 - first playable fragment of the original prologue (mission VOR, art\cache\msn_vor.sprig.xpps).
+#
+# NATIVE RECONSTRUCTION, NOT THE GAME'S SCRIPT. The original mission logic is compiled splice code
+# whose virtual machine is not decoded. What comes from the original data:
+#   * the mission and its order: VOR is the opening mission (it references u_vor_intro_narrative,
+#     u_title_screen_logo, the cutscenes vor_taggin / vor_spotlight / vor_meetbet / vor_brothers);
+#   * every text key below (localized texts of the game, referenced by msn_vor / a8);
+#   * the objects by OID: HERO_MATCH_POINT 0x21278fb67dc6d9a0 (Delsin on the cannery billboard catwalk),
+#     the graffiti minigame 0x4a399b4da8529383 (graffiti_a8_family, placed by a PROXY_SITE in chunk a8),
+#     VOLUME_BUTTON 0xdf15efbc896f3779 (at HERO_MATCH_POINT 0x782c4e8388d34f2d, below the roof);
+#   * the step order follows the texts: graffiti, "ohnocop" lines, escape the roof, the cannery, the beach.
+# What is native: the exact transitions, timings and the volume chosen for "got off the roof".
+# See docs/native/missions/N12_CAMPAIGN_RECONSTRUCTION.md.
+
+mission vor_prologue
+  source art\cache\msn_vor.sprig.xpps
+  provenance texts/objects/positions from msn_vor, a8 and graffiti_a8_family; transitions native (splice VM not decoded)
+
+objective intro
+  on_start place_hero 0x21278fb67dc6d9a0 ; subtitle u_vor_intro_narrative 7 ; wait 7 ; subtitle u_vor_intro_stinger 2.5 ; wait 2.5 ; log cutscene vor_taggin_a10 is not reconstructed (skipped) ; complete_objective
+
+objective tag_billboard
+  brief u_brief_vor_graffiti_prompt
+  on_start enable graffiti_a8_family ; hint u_hint_move 6
+  complete_when event GraffitiCompleted 0x4a399b4da8529383
+  on_complete disable graffiti_a8_family ; award_xp 100 ; subtitle m_vor_tagreg_02_hro 3 ; wait 3 ; log cutscene vor_spotlight_a10 is not reconstructed (skipped) ; subtitle m_vor_ohnocop_01_hro 1.5 ; wait 1.5 ; subtitle m_vor_ohnocop_02_hro 2.5 ; wait 2.5 ; subtitle m_vor_ohnocop_03_hro 5
+
+objective escape_roof
+  brief u_brief_vor_escape_roof
+  note u_mininote_vor_escape_roof
+  on_start hint u_hint_basic_parkour_drop 6
+  complete_when event PlayerEnteredArea 0xdf15efbc896f3779
+  on_complete award_xp 50
+
+objective escape_cannery
+  brief u_brief_vor_escape_cannery
+  note u_mininote_vor_escape_cannery
+  on_start hint u_hint_vor_door 6 ; log the fragment ends here: the cannery interior and the beach are not reconstructed
+
+# Native helpers (original texts): remind the player after leaving the stencil unfinished.
+trigger graffiti_left repeat
+  scope tag_billboard
+  when event GraffitiAborted 0x4a399b4da8529383
+  do hint u_interact_begin_graffiti 4
+
+# NATIVE FALLBACK (approximation): the original volume lies on the cannery floor, part of the building
+# model that is not decoded yet; reaching the ground below the roof also counts as "got off the roof".
+trigger roof_exit_fallback once
+  scope escape_roof
+  when event PlayerEnteredArea vor_roof_exit_fallback
+  do log reached the ground below the roof (native fallback volume) ; complete_objective
+
+trigger graffiti_stage once
+  scope tag_billboard
+  when event GraffitiStageCompleted 0x4a399b4da8529383
+  do log stencil stage 1 revealed

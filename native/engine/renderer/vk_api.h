@@ -101,6 +101,7 @@ namespace sspc::vk {
     X(vkCmdBindIndexBuffer)             \
     X(vkCmdPushConstants)               \
     X(vkCmdDrawIndexed)                 \
+    X(vkCmdDraw)                        \
     X(vkCmdCopyBuffer)                  \
     X(vkCmdCopyImageToBuffer)           \
     X(vkCreateQueryPool)                \

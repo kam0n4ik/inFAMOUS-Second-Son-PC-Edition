@@ -7,6 +7,7 @@
 //   sspc_inspect dump <pkg> <off> <len>    hex dump of the data region with link annotations
 //   sspc_inspect obj <pkg> <outdir>        decode all geometry and write Wavefront OBJ files
 //   sspc_inspect scan <dir>                parse every .xpps in a directory, summarise results
+//   sspc_inspect near <pkg> x y z r dz     chunk instances within r metres (XY) of a world point
 //
 // Never crashes on damaged input: every read goes through the validated package.
 #include <windows.h>
@@ -16,10 +17,14 @@
 #include <map>
 #include <string>
 
+#include <algorithm>
+#include <cmath>
+
 #include "core/file.h"
 #include "core/log.h"
 #include "resources/geometry.h"
 #include "resources/kcap.h"
+#include "resources/world_chunk.h"
 
 using namespace sspc;
 using namespace sspc::res;
@@ -194,6 +199,28 @@ int CmdScan(const std::wstring& dir) {
     return 0;
 }
 
+// Chunk scene instances whose matrix origin lies within `r` metres (XY) of (x, y): count, height range
+// and how many sit within `dz` metres of z.
+int CmdNear(const KcapPackage& p, float x, float y, float z, float r, float dz) {
+    u32 n = 0, near_z = 0, kinds[8] = {};
+    float zmin = 1e30f, zmax = -1e30f;
+    for (const ChunkScene& sc : FindChunkScenes(p)) {
+        for (const ChunkInstance& inst : sc.instances) {
+            const Mat4 w = ChunkMatrixToWorld(sc.matrices[inst.matrix]);
+            const float dx = w.m[3][0] - x, dy = w.m[3][1] - y;
+            if (dx * dx + dy * dy > r * r) continue;
+            ++n;
+            ++kinds[inst.kind & 7];
+            zmin = std::min(zmin, w.m[3][2]);
+            zmax = std::max(zmax, w.m[3][2]);
+            if (std::abs(w.m[3][2] - z) < dz) ++near_z;
+        }
+    }
+    Print(std::format("{} instances within {} m (kinds 0:{} 2:{} 4:{} 6:{}), z {:.1f}..{:.1f}, {} within {} m of z={}\n", n, r,
+                      kinds[0], kinds[2], kinds[4], kinds[6], n ? zmin : 0.0f, n ? zmax : 0.0f, near_z, dz, z));
+    return 0;
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -212,6 +239,10 @@ int wmain(int argc, wchar_t** argv) {
     if (cmd == L"geometry") return CmdGeometry(p);
     if (cmd == L"dump" && argc > 4) return CmdDump(p, wcstoull(argv[3], nullptr, 0), wcstoull(argv[4], nullptr, 0));
     if (cmd == L"obj" && argc > 3) return CmdObj(p, argv[3]);
+    if (cmd == L"near" && argc > 7) {
+        return CmdNear(p, static_cast<float>(_wtof(argv[3])), static_cast<float>(_wtof(argv[4])), static_cast<float>(_wtof(argv[5])),
+                       static_cast<float>(_wtof(argv[6])), static_cast<float>(_wtof(argv[7])));
+    }
     Print("unknown command\n");
     return 1;
 }
