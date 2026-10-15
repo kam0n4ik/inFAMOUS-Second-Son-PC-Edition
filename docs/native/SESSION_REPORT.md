@@ -77,7 +77,7 @@ CTest: `unit` + `dependency_audit_static` — 100 %. Полный скан иг�
 
 ## 10. Демонстрация
 ```
-cd E:\SecondSonPC-rebirth\native\build\release\bin
+cd /d E:\SecondSonPC-rebirth\native\build\release\bin
 SecondSonPC.exe --config E:\SecondSonPC-rebirth\native\config\SecondSonPC.ini --chunk art\cache\a1.xpps
 ```
 WASD — движение, Shift — бег, Space — прыжок, мышь — камера (F2 — захват), F3 — свободная камера, `[` `]` —

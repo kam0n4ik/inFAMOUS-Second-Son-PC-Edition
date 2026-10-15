@@ -236,13 +236,13 @@ bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wst
         if (auto hit = ground_at(sx, sy); hit && hit->normal.z > 0.6f) {
             out.spawn = hit->point + Vec3{0, 0, 0.05f};
         } else {
-            float best = 1e30f;
+            float best_dist = 1e30f;
             for (const auto& d : out.draws) {
                 const Vec3 p{d.world.m[3][0], d.world.m[3][1], d.world.m[3][2]};
                 const float dist = (p.x - sx) * (p.x - sx) + (p.y - sy) * (p.y - sy);
-                if (dist >= best) continue;
+                if (dist >= best_dist) continue;
                 if (auto h = ground_at(p.x + 1.0f, p.y + 1.0f); h && h->normal.z > 0.6f) {
-                    best = dist;
+                    best_dist = dist;
                     out.spawn = h->point + Vec3{0, 0, 0.05f};
                 }
             }
