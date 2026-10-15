@@ -725,7 +725,6 @@ void ShaderFrontend::WorkerLoop() {
 }
 
 void ShaderFrontend::Prepare(Module& m) {
-    m.prepared = true;
     const ShaderReflection& r = m.result.reflection;
     if (!r.srt_walker.empty() && !m.srt.Compile(r.srt_walker, m.srt_error)) {
         ++stats_.srt_compile_failures;
@@ -739,11 +738,13 @@ void ShaderFrontend::Prepare(Module& m) {
         BuildSpecializationKey(m.runtime, m.start, r, fetch, plan, m.key);
         m.keyed = true;
     }
+    m.prepared.store(true, std::memory_order_release); // (SSPC_PORT_DRAW_PREP: the workers read srt/key after it)
 }
 
 StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u64 addr,
                                          std::span<const u32, 16> user_data, const BindingStart& start,
-                                         GuestReader& memory, bool may_queue, const Cp::EngineTable* engine) {
+                                         GuestReader& memory, bool may_queue, const Cp::EngineTable* engine,
+                                         const SpecStage* spec) {
     const size_t si = static_cast<size_t>(hw);
     shared_[si].reset();
     // P4.7: the stage's last ready preparation again (its StageView holds it) when nothing it was built from changed
@@ -825,6 +826,9 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         return StageStatus::NoProgram;
     }
     Program& program = *s.program;
+    if (tables_ != nullptr) {
+        PublishProgram((addr << 3) | static_cast<u64>(hw), &program);
+    }
     (void)sw;
 
     // the layout: the first module for these runtime parameters
@@ -861,6 +865,9 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     if (!first.prepared) {
         Prepare(first);
     }
+    if (tables_ != nullptr) {
+        PublishLayout(&program, s.runtime, &first);
+    }
     const ShaderReflection& r = first.result.reflection;
 
     // the draw's fetch shader
@@ -870,6 +877,9 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         const u32 b = r.fetch.sgpr_base;
         const u64 faddr = b + 1 < 16 ? ((user_data[b] | (u64{user_data[b + 1]} << 32)) & 0xFFFFFFFFFFFFull) : 0;
         fe = &fetches_.Get(memory, faddr, b, programs_.Epoch(), options_.validation);
+        if (tables_ != nullptr) {
+            PublishFetch((faddr << 8) ^ b, *fe);
+        }
         if (!fe->ok) {
             return StageStatus::FetchError;
         }
@@ -913,43 +923,86 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     NativeRecorder recorder(memory, nbase, nbase + u64{nkey.dwords} * 4);
     GuestReader& rmem = nmiss ? static_cast<GuestReader&>(recorder) : memory;
 
-    // resources and the key
-    const u64 tr = FineTicks();
-    if (!ResolveResources(r, first.srt, start, fetch, user_data, addr, rmem, s.plan)) {
-        ++stats_.srt_walk_failures;
+    // SSPC_PORT_DRAW_PREP: a draw-preparation worker's stage (draw_prep.h) - its plan, key and module, when its
+    // inputs are this stage's and the SRT walk run again here and its decoding's reads give the same bytes
+    Module* m = nullptr;
+    bool adopted = spec != nullptr && (engine == nullptr || !native_on_) && first.srt_error.empty() &&
+                   AdoptSpeculation(*spec, s, program, first, fe, addr, user_data, start, r, memory, m);
+    // verify: the worker's stage is prepared in full anyway and the two compared (the full one is used)
+    u64 adopted_print = 0;
+    Module* adopted_module = nullptr;
+    SpecializationKey adopted_key;
+    if (adopted && spec_verify_) {
+        s.module = m;
+        adopted_print = StageFingerprint(s);
+        adopted_module = m;
+        adopted_key = s.key;
+        adopted = false;
+        m = nullptr;
     }
-    if (!first.srt_error.empty()) {
-        ++stats_.srt_walk_failures; // a walker SecondSonPC cannot interpret: nothing past the registers resolved
-        s.plan.flat.resize(16);
-        DecodeResources(r, start, fetch, user_data, addr, VertexSource{&rmem, {}}, s.plan);
-    }
-    stats_.srt_reads += s.plan.srt.reads;
-    stats_.srt_faults += s.plan.srt.faults;
-    for (size_t i = 0; i < s.plan.status_counts.size(); ++i) {
-        stats_.resources[i] += s.plan.status_counts[i];
-    }
-    u32 nused = nmiss ? UserDataUsed(r, s.plan, fetch) : 0; // (the key and the module depend on this plan too)
-    const u64 tk = FineTicks();
-    if (g_fine_timing || g_fine_now) {
-        times_.resources.Add(TicksToNs(tk - tr));
-    }
-    BuildSpecializationKey(s.runtime, start, r, fetch, s.plan, s.key);
-    if (g_fine_timing || g_fine_now) {
-        times_.key.Add(TicksToNs(Ticks() - tk));
-    }
-    s.end = EndOf(start, s.plan);
+    u32 nused = 0;
+    if (adopted) {
+        stats_.srt_reads += s.plan.srt.reads;
+        stats_.srt_faults += s.plan.srt.faults;
+        for (size_t i = 0; i < s.plan.status_counts.size(); ++i) {
+            stats_.resources[i] += s.plan.status_counts[i];
+        }
+        if (m->state.load(std::memory_order_acquire) == ModuleState::Ready) {
+            ++stats_.module_hits;
+        }
+    } else {
+        // resources and the key
+        const u64 tr = FineTicks();
+        if (!ResolveResources(r, first.srt, start, fetch, user_data, addr, rmem, s.plan)) {
+            ++stats_.srt_walk_failures;
+        }
+        if (!first.srt_error.empty()) {
+            ++stats_.srt_walk_failures; // a walker SecondSonPC cannot interpret: nothing past the registers resolved
+            s.plan.flat.resize(16);
+            DecodeResources(r, start, fetch, user_data, addr, VertexSource{&rmem, {}}, s.plan);
+        }
+        stats_.srt_reads += s.plan.srt.reads;
+        stats_.srt_faults += s.plan.srt.faults;
+        for (size_t i = 0; i < s.plan.status_counts.size(); ++i) {
+            stats_.resources[i] += s.plan.status_counts[i];
+        }
+        nused = nmiss ? UserDataUsed(r, s.plan, fetch) : 0; // (the key and the module depend on this plan too)
+        const u64 tk = FineTicks();
+        if (g_fine_timing || g_fine_now) {
+            times_.resources.Add(TicksToNs(tk - tr));
+        }
+        BuildSpecializationKey(s.runtime, start, r, fetch, s.plan, s.key);
+        if (g_fine_timing || g_fine_now) {
+            times_.key.Add(TicksToNs(Ticks() - tk));
+        }
+        s.end = EndOf(start, s.plan);
 
-    // the module
-    Module* m = program.FindModule(s.key, stats_.module_collisions);
-    if (m == nullptr) {
-        ++stats_.module_misses;
-        m = NewModule(program, s.runtime, start, user_data);
-        m->key = s.key;
-        m->keyed = true;
-    } else if (m->state.load(std::memory_order_acquire) == ModuleState::Ready) {
-        ++stats_.module_hits;
+        // the module
+        m = program.FindModule(s.key, stats_.module_collisions);
+        if (m == nullptr) {
+            ++stats_.module_misses;
+            m = NewModule(program, s.runtime, start, user_data);
+            m->key = s.key;
+            m->keyed = true;
+        } else if (m->state.load(std::memory_order_acquire) == ModuleState::Ready) {
+            ++stats_.module_hits;
+        }
+        if (tables_ != nullptr) {
+            PublishModule(&program, m);
+        }
     }
     s.module = m;
+    if (adopted_print != 0) {
+        ++stats_.spec_stage_verified;
+        if (StageFingerprint(s) != adopted_print || m != adopted_module || !(s.key == adopted_key)) {
+            ++stats_.spec_stage_mismatches;
+            if (stats_.spec_stage_mismatches <= 8) {
+                SSPC_LOG(GPU, Warning, "draw preparation (verify): a worker's {} stage (program {:#x}) differs from "
+                                       "its full preparation",
+                         hw == HwStage::Ps ? "PS" : "VS", addr);
+            }
+        }
+    }
     if (!m->queued && may_queue && m->state.load(std::memory_order_acquire) == ModuleState::Pending) {
         if (m->disk_record != 0) {
             std::copy(user_data.begin(), user_data.end(), m->user_data.begin()); // (the record replaces them)
@@ -1226,8 +1279,10 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
         const auto cpst = static_cast<size_t>(hw); // Cp::Stage has the graphics stages in HwStage's order
         const std::span<const u32, 16> ud(d.user_data[cpst]);
         const Cp::EngineTable* engine = !native ? nullptr : hw == HwStage::Ps ? &d.engine_ps : &d.engine_vs;
+        // SSPC_PORT_DRAW_PREP: the worker's preparation of this stage (PS first, as here)
+        const SpecStage* sp = spec_ != nullptr && spec_->ok ? &spec_->stages[hw == HwStage::Ps ? 0 : 1] : nullptr;
         s.status = runtime_valid_[si]
-                       ? PrepareStage(s, hw, sw, d.shaders[cpst].address, ud, start, memory, ready, engine)
+                       ? PrepareStage(s, hw, sw, d.shaders[cpst].address, ud, start, memory, ready, engine, sp)
                        : StageStatus::Unsupported;
         ++stats_.stage_status[static_cast<size_t>(s.status)];
         ready &= s.status == StageStatus::Ready;
@@ -1243,11 +1298,28 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
             ++stats_.pipeline_reuse;
             prep_.pipeline = last_pipeline_;
             prep_.pipeline_reused = true;
+        } else if (spec_ != nullptr && spec_->ok && spec_->pipeline != 0 && spec_->vs_module == vs_id &&
+                   spec_->ps_module == ps_id && !spec_verify_) {
+            // SSPC_PORT_DRAW_PREP: the worker built the state from the registers at this draw (its replica of the
+            // journal) for these modules and found the published pipeline
+            ++stats_.spec_pipelines;
+            prep_.pipeline = spec_->pipeline;
+            last_pipeline_ = prep_.pipeline;
+            last_ps_ = ps_id;
+            last_vs_ = vs_id;
         } else {
             GraphicsPipelineState state;
             BuildGraphicsPipelineState(regs, vs_id, ps_id, ps.module->result.reflection.mrt_mask, state);
             bool created = false;
             prep_.pipeline = pipelines_.GetGraphics(state, created);
+            if (tables_ != nullptr) {
+                PublishPipeline(state, prep_.pipeline);
+                if (spec_verify_ && spec_ != nullptr && spec_->ok && spec_->pipeline != 0 &&
+                    spec_->vs_module == vs_id && spec_->ps_module == ps_id) {
+                    ++stats_.spec_pipeline_verified;
+                    stats_.spec_pipeline_mismatches += spec_->pipeline != prep_.pipeline ? 1 : 0;
+                }
+            }
             last_pipeline_ = prep_.pipeline;
             last_ps_ = ps_id;
             last_vs_ = vs_id;
@@ -1260,6 +1332,10 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
     } else {
         ++stats_.waiting;
         last_pipeline_ = 0;
+    }
+    if (spec_ != nullptr) {
+        ++stats_.spec_draws;
+        spec_ = nullptr; // (one draw's)
     }
     if (g_fine_timing || g_fine_now) {
         times_.draw.Add(TicksToNs(Ticks() - t0));
@@ -1374,6 +1450,323 @@ std::string ShaderFrontend::Report() const {
     t += fmt::format("translation (worker, request to result): {}\n", times_.translate.Text());
     t += fmt::format("wait from queueing to first use: {}\n", times_.wait.Text());
     return t;
+}
+
+// ---- SSPC_PORT_DRAW_PREP: speculative draw preparation (draw_prep.h; port of uncharted_pc/bbport DrawPreparation)
+
+u64 PrepTables::LayoutHash(const Program* p, const RuntimeParams& r) {
+    return XXH3_64bits(&r, sizeof(r)) ^ Mix(reinterpret_cast<u64>(p));
+}
+
+u64 PrepTables::StateHash(const GraphicsPipelineState& s) {
+    return XXH3_64bits(&s, sizeof(s));
+}
+
+namespace {
+
+/// The guest reads of a worker's resource decoding, kept for the frontend thread to read again.
+class PrepRecorder final : public GuestReader {
+public:
+    PrepRecorder(GuestReader& inner, SpecStage& st) : inner_(inner), st_(st) {}
+    bool Read(u64 addr, void* dst, u64 bytes) override {
+        const bool ok = inner_.Read(addr, dst, bytes);
+        if (!ok || bytes > 0x10000) {
+            failed_ = true; // (what a failed read leaves in dst is unspecified: no preparation from it)
+            return ok;
+        }
+        st_.reads.push_back({addr, static_cast<u32>(bytes), static_cast<u32>(st_.read_bytes.size())});
+        const u8* p = static_cast<const u8*>(dst);
+        st_.read_bytes.insert(st_.read_bytes.end(), p, p + bytes);
+        return true;
+    }
+    bool Failed() const { return failed_; }
+
+private:
+    GuestReader& inner_;
+    SpecStage& st_;
+    bool failed_ = false;
+};
+
+} // namespace
+
+void ShaderFrontend::EnableSpeculation(bool verify) {
+    if (tables_ == nullptr) {
+        tables_ = std::make_unique<PrepTables>();
+    }
+    spec_verify_ = verify;
+}
+
+void ShaderFrontend::PublishProgram(u64 key, Program* program) {
+    auto& slot = tables_->programs[PrepTables::Mix(key) & (PrepTables::kPrograms - 1)];
+    PrepTables::ProgramPub cur;
+    if (!slot.Load(cur) || cur.key != key || cur.program != program) {
+        slot.Store({key, program});
+    }
+}
+
+void ShaderFrontend::PublishLayout(Program* program, const RuntimeParams& runtime, Module* first) {
+    auto& slot = tables_->layouts[PrepTables::LayoutHash(program, runtime) & (PrepTables::kLayouts - 1)];
+    PrepTables::LayoutPub cur;
+    if (!slot.Load(cur) || cur.program != program || cur.first != first ||
+        std::memcmp(&cur.runtime, &runtime, sizeof(RuntimeParams)) != 0) {
+        PrepTables::LayoutPub v;
+        v.program = program;
+        v.first = first;
+        v.runtime = runtime;
+        slot.Store(v);
+    }
+}
+
+void ShaderFrontend::PublishFetch(u64 key, const FetchCache::Entry& e) {
+    PrepTables::FetchPub& slot = tables_->fetches[PrepTables::Mix(key) & (PrepTables::kFetches - 1)];
+    // (this thread is the only writer: its own fields read without the lock; the readers take it shared)
+    if (slot.key == key && slot.entry == &e && slot.version == e.version && slot.ok == e.ok) {
+        return;
+    }
+    std::shared_ptr<const FetchShader> snapshot = e.ok ? std::make_shared<const FetchShader>(e.fetch) : nullptr;
+    std::unique_lock lock{slot.lock};
+    slot.key = key;
+    slot.entry = &e;
+    slot.version = e.version;
+    slot.ok = e.ok;
+    slot.fetch = std::move(snapshot);
+}
+
+void ShaderFrontend::PublishModule(Program* program, Module* module) {
+    if (!module->keyed) {
+        return;
+    }
+    const u64 h = module->key.hash;
+    auto& slot = tables_->modules[PrepTables::Mix(h ^ reinterpret_cast<u64>(program)) & (PrepTables::kModules - 1)];
+    PrepTables::ModulePub cur;
+    if (!slot.Load(cur) || cur.program != program || cur.hash != h || cur.module != module) {
+        slot.Store({program, h, module});
+    }
+}
+
+void ShaderFrontend::PublishPipeline(const GraphicsPipelineState& state, u32 id) {
+    const u64 h = PrepTables::StateHash(state);
+    auto& slot = tables_->pipelines[h & (PrepTables::kPipelines - 1)];
+    PrepTables::PipelinePub cur;
+    if (!slot.Load(cur) || cur.hash != h || cur.id != id) {
+        PrepTables::PipelinePub v;
+        v.hash = h;
+        v.id = id;
+        v.state = state;
+        slot.Store(v);
+    }
+}
+
+bool ShaderFrontend::SpeculateDraw(const Cp::DrawDescriptor& d, const Cp::RegisterFile& regs, GuestReader& memory,
+                                   SpecDraw& out, SpecReject& why) const {
+    out.ok = false;
+    out.pipeline = 0;
+    why = SpecReject::None;
+    if (tables_ == nullptr) {
+        return false;
+    }
+    // (the Native Render Frontend's passes have their own cache of preparations)
+    if (native_on_ && d.engine_pass != Cp::kNoEnginePass &&
+        ((options_.native_passes >> Engine::Render::PassSlot(d.engine_pass)) & 1) != 0) {
+        why = SpecReject::Native;
+        return false;
+    }
+    if (DecodeStages(regs.Get(Reg::VgtShaderStagesEn)) != StageConfig::Vs) {
+        why = SpecReject::Stages;
+        return false;
+    }
+    static constexpr std::pair<HwStage, SwStage> kStages[] = {{HwStage::Ps, SwStage::Fragment},
+                                                              {HwStage::Vs, SwStage::Vertex}};
+    BindingStart start{};
+    for (size_t i = 0; i < 2; ++i) {
+        const auto [hw, sw] = kStages[i];
+        SpecStage& st = out.stages[i];
+        st.ok = false;
+        st.reads.clear();
+        st.read_bytes.clear();
+        const u32 vtx = d.indirect ? d.base_vtx_loc : 0, inst = d.indirect ? d.start_inst_loc : 0;
+        if (!BuildGraphicsRuntime(regs, hw, sw, vtx, inst, st.runtime)) {
+            why = SpecReject::Runtime;
+            return false;
+        }
+        const auto cpst = static_cast<size_t>(hw);
+        st.addr = d.shaders[cpst].address;
+        std::copy(d.user_data[cpst].begin(), d.user_data[cpst].end(), st.user_data.begin());
+        const std::span<const u32, 16> ud(st.user_data);
+        st.start = start;
+        // the program, published at this address
+        const u64 pkey = (st.addr << 3) | static_cast<u64>(hw);
+        PrepTables::ProgramPub pp;
+        if (!tables_->programs[PrepTables::Mix(pkey) & (PrepTables::kPrograms - 1)].Load(pp) || pp.key != pkey ||
+            pp.program == nullptr) {
+            why = SpecReject::Program;
+            return false;
+        }
+        // its first module for these runtime parameters, ready and prepared (its SRT walker compiled)
+        PrepTables::LayoutPub lp;
+        if (!tables_->layouts[PrepTables::LayoutHash(pp.program, st.runtime) & (PrepTables::kLayouts - 1)].Load(lp) ||
+            lp.program != pp.program || lp.first == nullptr ||
+            std::memcmp(&lp.runtime, &st.runtime, sizeof(RuntimeParams)) != 0) {
+            why = SpecReject::Layout;
+            return false;
+        }
+        const Module& first = *lp.first;
+        if (first.state.load(std::memory_order_acquire) != ModuleState::Ready ||
+            !first.prepared.load(std::memory_order_acquire) || !first.srt_error.empty()) {
+            why = SpecReject::Layout;
+            return false;
+        }
+        const ShaderReflection& r = first.result.reflection;
+        // the fetch shader: the published copy of its cache entry's current version
+        std::shared_ptr<const FetchShader> fetch;
+        st.fetch_entry = nullptr;
+        st.fetch_version = 0;
+        if (r.fetch.present) {
+            const u32 b = r.fetch.sgpr_base;
+            const u64 faddr = b + 1 < 16 ? ((ud[b] | (u64{ud[b + 1]} << 32)) & 0xFFFFFFFFFFFFull) : 0;
+            const u64 fkey = (faddr << 8) ^ b;
+            const PrepTables::FetchPub& slot = tables_->fetches[PrepTables::Mix(fkey) & (PrepTables::kFetches - 1)];
+            {
+                std::shared_lock lock{slot.lock};
+                if (slot.key == fkey && slot.entry != nullptr && slot.ok) {
+                    fetch = slot.fetch;
+                    st.fetch_entry = slot.entry;
+                    st.fetch_version = slot.version;
+                }
+            }
+            if (fetch == nullptr) {
+                why = SpecReject::Fetch;
+                return false;
+            }
+        }
+        // the SRT walk (the frontend thread runs it again and compares), then the decoding with its reads recorded
+        ResourceBindingPlan& plan = st.plan;
+        plan.Clear();
+        plan.flat.resize(std::max<u32>(r.flatbuf_dwords, 16));
+        std::copy(ud.begin(), ud.end(), plan.flat.begin());
+        SrtProgram::RunStats rs;
+        std::string error;
+        if (!first.srt.Empty() && !first.srt.Run(ud, plan.flat, memory, rs, error)) {
+            why = SpecReject::Walk;
+            return false;
+        }
+        PrepRecorder recorder(memory, st);
+        DecodeResources(r, start, fetch.get(), ud, st.addr, VertexSource{&recorder, {}}, plan);
+        plan.srt = rs;
+        if (recorder.Failed()) {
+            why = SpecReject::Walk;
+            return false;
+        }
+        BuildSpecializationKey(st.runtime, start, r, fetch.get(), plan, st.key);
+        // the module for the key, published and ready, with the layout's resources
+        PrepTables::ModulePub mp;
+        if (!tables_->modules[PrepTables::Mix(st.key.hash ^ reinterpret_cast<u64>(pp.program)) &
+                              (PrepTables::kModules - 1)]
+                 .Load(mp) ||
+            mp.program != pp.program || mp.hash != st.key.hash || mp.module == nullptr ||
+            mp.module->state.load(std::memory_order_acquire) != ModuleState::Ready ||
+            mp.module->key.words != st.key.words) {
+            why = SpecReject::Module;
+            return false;
+        }
+        const ShaderReflection& mr = mp.module->result.reflection;
+        if (mr.buffers.size() != r.buffers.size() || mr.images.size() != r.images.size() ||
+            mr.samplers.size() != r.samplers.size() || mr.flatbuf_dwords != r.flatbuf_dwords) {
+            why = SpecReject::Reflection;
+            return false;
+        }
+        st.program = pp.program;
+        st.first = lp.first;
+        st.module = mp.module;
+        st.end = EndOf(start, plan);
+        st.ok = true;
+        start = st.end;
+    }
+    // the pipeline: its state from the registers at the draw, looked up among the published ones
+    const Module& ps = *out.stages[0].module;
+    const Module& vs = *out.stages[1].module;
+    out.ps_module = ps.id;
+    out.vs_module = vs.id;
+    GraphicsPipelineState state;
+    BuildGraphicsPipelineState(regs, vs.id, ps.id, ps.result.reflection.mrt_mask, state);
+    const u64 h = PrepTables::StateHash(state);
+    PrepTables::PipelinePub pl;
+    if (tables_->pipelines[h & (PrepTables::kPipelines - 1)].Load(pl) && pl.hash == h &&
+        std::memcmp(&pl.state, &state, sizeof(state)) == 0) {
+        out.pipeline = pl.id;
+    }
+    out.ok = true;
+    return true;
+}
+
+bool ShaderFrontend::AdoptSpeculation(const SpecStage& sp, StageView& s, const Program& program, const Module& first,
+                                      const FetchCache::Entry* fe, u64 addr, std::span<const u32, 16> user_data,
+                                      const BindingStart& start, const ShaderReflection& r, GuestReader& memory,
+                                      Module*& m) {
+    ++stats_.spec_stages;
+    const bool inputs = sp.ok && sp.addr == addr && sp.program == &program && sp.first == &first && sp.start == start &&
+                        std::memcmp(&sp.runtime, &s.runtime, sizeof(RuntimeParams)) == 0 &&
+                        std::memcmp(sp.user_data.data(), user_data.data(), sizeof(sp.user_data)) == 0 &&
+                        sp.fetch_entry == fe && (fe == nullptr || sp.fetch_version == fe->version) &&
+                        sp.module != nullptr && sp.module->state.load(std::memory_order_acquire) == ModuleState::Ready;
+    if (!inputs) {
+        ++stats_.spec_inputs;
+        return false;
+    }
+    // the SRT walk again, through this thread's reader (its reads wait for pending GPU writes as they always do)
+    ResourceBindingPlan& plan = s.plan;
+    plan.Clear();
+    plan.flat.resize(std::max<u32>(r.flatbuf_dwords, 16));
+    std::copy(user_data.begin(), user_data.end(), plan.flat.begin());
+    SrtProgram::RunStats rs;
+    std::string error;
+    if (!first.srt.Empty() && !first.srt.Run(user_data, plan.flat, memory, rs, error)) {
+        ++stats_.spec_walk;
+        return false; // (the caller prepares the stage as before: ResolveResources reports the failure)
+    }
+    if (plan.flat != sp.plan.flat) {
+        ++stats_.spec_flat;
+        return false;
+    }
+    // every read of the worker's decoding, again
+    for (const PrepRead& rd : sp.reads) {
+        spec_scratch_.resize(rd.bytes);
+        if (!memory.Read(rd.addr, spec_scratch_.data(), rd.bytes) ||
+            std::memcmp(spec_scratch_.data(), sp.read_bytes.data() + rd.offset, rd.bytes) != 0) {
+            ++stats_.spec_reads;
+            return false;
+        }
+    }
+    plan.stage = sp.plan.stage;
+    plan.buffers = sp.plan.buffers;
+    plan.images = sp.plan.images;
+    plan.samplers = sp.plan.samplers;
+    plan.vertices = sp.plan.vertices;
+    plan.status_counts = sp.plan.status_counts;
+    plan.srt = rs;
+    plan.error.clear();
+    s.key = sp.key;
+    s.end = sp.end;
+    m = sp.module;
+    ++stats_.spec_used;
+    return true;
+}
+
+std::string ShaderFrontend::SpeculationReport() const {
+    if (tables_ == nullptr) {
+        return {};
+    }
+    const FrontendStats& st = stats_;
+    return fmt::format("draw preparation (SSPC_PORT_DRAW_PREP): draws offered a worker's preparation {}; stages offered "
+                       "{}, taken {}, refused: inputs {}, SRT walk failed {}, flattened data {}, decoding reads {}; "
+                       "pipelines taken {}{}\n",
+                       st.spec_draws, st.spec_stages, st.spec_used, st.spec_inputs, st.spec_walk, st.spec_flat,
+                       st.spec_reads, st.spec_pipelines,
+                       spec_verify_ ? fmt::format(" (verify: stages prepared in full anyway {}, differed {}; pipelines "
+                                                  "built anyway {}, differed {})",
+                                                  st.spec_stage_verified, st.spec_stage_mismatches,
+                                                  st.spec_pipeline_verified, st.spec_pipeline_mismatches)
+                                    : std::string{});
 }
 
 } // namespace SecondSon::Gpu::Shader

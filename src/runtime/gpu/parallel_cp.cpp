@@ -109,6 +109,9 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
         rec_value_ = std::make_unique<std::atomic<u64>[]>(kRecRing);
     }
     fthread_mode_ = options.frontend_thread && frontend_ != nullptr;
+    // SSPC_PORT_DRAW_PREP: the workers work on the frontend thread's records (the records ahead of it)
+    prep_workers_ = fthread_mode_ ? std::min<u32>(options.draw_prep_workers, 8) : 0;
+    prep_verify_ = options.draw_prep_verify;
     // (port of uncharted_pc PendingFenceWaits: also with the frontend thread - the acquire hook's frontend
     // invalidations reach it as front events, in stream order; GuestSync's memo change with the next record)
     async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr;
@@ -140,16 +143,37 @@ void ParallelCp::Start() {
     if (StallTrace::Deep()) {
         push_tsc_ = std::make_unique<u64[]>(kRecRing);
     }
+    if (prep_workers_ != 0) {
+        // (before the frontend thread starts: the frontend's tables exist before its first draw)
+        frontend_->EnableSpeculation(prep_verify_);
+        prep_ = std::make_unique<PrepSlot[]>(kSlots);
+        slot_seq_ = std::make_unique<std::atomic<u64>[]>(kSlots);
+        prep_stop_.store(false, std::memory_order_relaxed);
+        for (u32 i = 0; i < prep_workers_; ++i) {
+            prep_threads_.emplace_back([this, i] { PrepLoop(i); });
+        }
+    }
     if (fthread_mode_) {
         fthread_ = std::thread([this] { FrontLoop(); });
     }
     thread_ = std::thread([this] { Loop(); });
 }
 
+void ParallelCp::PrepStop() {
+    prep_stop_.store(true, std::memory_order_release);
+    for (std::thread& t : prep_threads_) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    prep_threads_.clear();
+}
+
 void ParallelCp::Stop() {
     if (!started_) {
         return;
     }
+    PrepStop(); // (the workers first: they read the frontend's tables and the records)
     Drain(DrainReason::Stop);
     BeginRecord(Kind::Stop);
     PushRecord();
@@ -174,6 +198,10 @@ ParallelCp::Record& ParallelCp::BeginRecord(Kind kind) {
         WaitHead(next_ - kSlots + 1, true, kWhyFull); // backpressure: the oldest slot executed
     }
     Record& r = slots_[next_ & (kSlots - 1)];
+    if (slot_seq_ != nullptr) { // (SSPC_PORT_DRAW_PREP: a worker copying the slot sees it being rewritten)
+        slot_seq_[next_ & (kSlots - 1)].store(next_ * 2 + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+    }
     r.kind = kind;
     r.front_memo = pending_front_memo_; // (frontend thread: told before it prepares this record)
     pending_front_memo_ = false;
@@ -194,6 +222,9 @@ void ParallelCp::PushRecord() {
     ++t1_.records;
     if (push_tsc_ != nullptr) {
         push_tsc_[next_ & (kRecRing - 1)] = __rdtsc(); // (published with tail_ below)
+    }
+    if (slot_seq_ != nullptr) {
+        slot_seq_[next_ & (kSlots - 1)].store(next_ * 2 + 2, std::memory_order_release);
     }
     ++next_;
     tail_.store(next_, std::memory_order_seq_cst);
@@ -524,6 +555,7 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
     const u64 t0 = __rdtsc();
     {
         const GS::FineSample fine(front_fine_counter_);
+        frontend_->SetSpeculation(front_spec_); // (SSPC_PORT_DRAW_PREP: the frontend thread's offer, else none)
         const GS::DrawPreparation& prep = frontend_->PrepareDraw(r.draw, regs, reader_);
         r.prep = prep;
         // P5.3: a preparation the native cache shares is kept by reference (immutable), not copied
@@ -764,14 +796,32 @@ void ParallelCp::ApplyFrontEvents(u64 upto) {
 
 void ParallelCp::FrontStep(Record& r, u64 index) {
     f_current_ = index;
+    if (prep_workers_ != 0) {
+        f_pos_.store(index, std::memory_order_release); // (the workers skip records up to here)
+    }
     ApplyFrontEvents(index); // what thread 1 told the frontend before this record
     if (r.front_memo) {
         frontend_->GuestMemoryChanged(); // (a change thread 1 met before this record: stream order)
     }
     FrontApplyJournal(r.journal_end); // the registers as they were at the record's packet
+    if (prep_workers_ != 0 && prep_sync_wanted_.load(std::memory_order_acquire) != 0) {
+        PrepSyncPublish();
+    }
     switch (r.kind) {
     case Kind::Draw:
+        front_spec_ = nullptr;
+        if (prep_workers_ != 0) {
+            // SSPC_PORT_DRAW_PREP: the worker's preparation of exactly this record (complete: its tag)
+            const PrepSlot& ps = prep_[index & (kSlots - 1)];
+            if (ps.tag.load(std::memory_order_acquire) == index + 1) {
+                front_spec_ = &ps.draw;
+                Bump(pc_.offered);
+            } else {
+                Bump(pc_.missing);
+            }
+        }
         PrepareDraw(r, index, freplica_);
+        front_spec_ = nullptr;
         break;
     case Kind::Dispatch:
         PrepareDispatch(r, index);
@@ -1308,6 +1358,21 @@ std::string ParallelCp::Report() const {
                            "(SSPC_P411_ASYNC_ACQUIRE=1) {}; queued copies neither recorded nor copied {}\n",
                            t.async_acquires, t.copy_failures);
     }
+    if (prep_workers_ != 0) {
+        static constexpr const char* kWhy[] = {"none", "native pass", "stages", "runtime", "program", "layout",
+                                               "fetch shader", "SRT walk/read", "module", "reflection"};
+        std::string why;
+        for (size_t i = 1; i < pc_.rejected.size(); ++i) {
+            why += fmt::format(" {} {};", kWhy[i], pc_.rejected[i].load(std::memory_order_relaxed));
+        }
+        out += fmt::format("  draw preparation workers (SSPC_PORT_DRAW_PREP, {}{}): records looked at {}, draws "
+                           "prepared {}, skipped as passed {}, not draws {}, executed meanwhile {}, register copies {}, "
+                           "busy {:.0f} ms; not prepared:{} offered to the frontend {}, without one {}\n  {}",
+                           prep_workers_, prep_verify_ ? ", verify" : "", pc_.claimed.load(), pc_.prepared.load(),
+                           pc_.stale.load(), pc_.not_draws.load(), pc_.reused.load(), pc_.resyncs.load(),
+                           ms(pc_.ticks.load()), why, pc_.offered.load(), pc_.missing.load(),
+                           frontend_ != nullptr ? frontend_->SpeculationReport() : std::string{});
+    }
     out += "  drains that waited, by reason:";
     for (size_t i = 0; i < t.drains_by.size(); ++i) {
         if (t.drains_by[i] != 0) {
@@ -1319,6 +1384,200 @@ std::string ParallelCp::Report() const {
         out += "  FAILED: " + failure_ + "\n";
     }
     return out;
+}
+
+// ---- SSPC_PORT_DRAW_PREP: draw-preparation workers (shader/draw_prep.h; port of uncharted_pc/bbport DrawPreparation)
+
+namespace {
+
+/// A worker's guest memory: the backing's host view, as the frontend's readers (TimelineReader, FrontReader) read it,
+/// without waiting for anything - what it reads early or stale is caught by the frontend thread's own reads.
+class PrepReader final : public GS::GuestReader {
+public:
+    explicit PrepReader(const std::atomic<u64>* map_gen) : map_gen_(map_gen) {}
+    bool Read(u64 addr, void* dst, u64 bytes) override {
+        if (map_gen_ != nullptr && GuestMemory::IsValidGpuMapping(addr, bytes)) {
+            const u64 gen = map_gen_->load(std::memory_order_acquire);
+            for (const Run& r : runs_) {
+                if (r.gen == gen && r.host != nullptr && addr >= r.begin && addr + bytes <= r.end) {
+                    std::memcpy(dst, r.host + (addr - r.begin), bytes);
+                    return true;
+                }
+            }
+            if (GuestMemory* gm = GetGuestMemory(); gm != nullptr) {
+                u8* host = nullptr;
+                u64 rb = 0, rs = 0;
+                if (gm->BackingRun(addr, &host, &rb, &rs) && host != nullptr && addr >= rb && addr + bytes <= rb + rs) {
+                    runs_[next_++ % runs_.size()] = {rb, rb + rs, host, gen};
+                    std::memcpy(dst, host + (addr - rb), bytes);
+                    return true;
+                }
+            }
+        }
+        return GS::GameMemory().Read(addr, dst, bytes);
+    }
+
+private:
+    struct Run {
+        u64 begin = 0, end = 0;
+        const u8* host = nullptr;
+        u64 gen = 0;
+    };
+    const std::atomic<u64>* map_gen_;
+    std::array<Run, 4> runs_{};
+    u32 next_ = 0;
+};
+
+} // namespace
+
+void ParallelCp::PrepSyncPublish() {
+    std::scoped_lock lock{prep_sync_mutex_};
+    prep_sync_regs_ = freplica_;
+    prep_sync_regs_.SetSink(nullptr);
+    prep_sync_regs_.SetMirror(nullptr);
+    prep_sync_pos_ = fjhead_.load(std::memory_order_relaxed);
+    ++prep_sync_seq_;
+    prep_sync_wanted_.store(0, std::memory_order_release);
+}
+
+void ParallelCp::PrepLoop(u32 index) {
+    SetThreadDescription(GetCurrentThread(), (L"SecondSonPC:DrawPrep" + std::to_wstring(index)).c_str());
+    // (bbport: the helpers only take idle cores - SCHED_IDLE there, THREAD_PRIORITY_IDLE here;
+    // SSPC_PORT_DRAW_PREP_PRIORITY=low|normal: below normal / normal)
+    static const int priority = [] {
+        char v[16] = {};
+        const DWORD n = GetEnvironmentVariableA("SSPC_PORT_DRAW_PREP_PRIORITY", v, sizeof(v));
+        const std::string_view s(v, n);
+        return s == "normal" ? THREAD_PRIORITY_NORMAL : s == "low" ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_IDLE;
+    }();
+    SetThreadPriority(GetCurrentThread(), priority);
+    // records the frontend thread reaches before a worker could prepare them are not claimed: a worker that fell behind
+    // starts this far ahead of it
+    const u64 lead = 2 + 2 * u64{prep_workers_};
+    auto regs = std::make_unique<Cp::RegisterFile>();
+    u64 jpos = 0;
+    u64 synced_seq = 0;
+    bool synced = false;
+    PrepReader reader(map_gen_);
+    u32 idle = 0;
+    const auto rest = [&] {
+        if (++idle < 64) {
+            for (int i = 0; i < 64; ++i) {
+                _mm_pause();
+            }
+        } else if (idle < 512) {
+            SwitchToThread();
+        } else {
+            Sleep(1);
+        }
+    };
+    while (!prep_stop_.load(std::memory_order_acquire)) {
+        if (!synced) {
+            // a copy of the frontend thread's register file, at its journal position
+            {
+                std::scoped_lock lock{prep_sync_mutex_};
+                if (prep_sync_seq_ != synced_seq && prep_sync_pos_ >= jhead_.load(std::memory_order_acquire)) {
+                    *regs = prep_sync_regs_;
+                    jpos = prep_sync_pos_;
+                    synced_seq = prep_sync_seq_;
+                    synced = true;
+                }
+            }
+            if (!synced) {
+                prep_sync_wanted_.store(1, std::memory_order_release);
+                rest();
+                continue;
+            }
+            Bump(pc_.resyncs);
+        }
+        const u64 f = f_pos_.load(std::memory_order_acquire);
+        u64 k = prep_next_.load(std::memory_order_acquire);
+        if (k <= f) {
+            // the frontend thread passed these records: cancelled (stale), the next ones far enough ahead of it
+            if (prep_next_.compare_exchange_weak(k, f + lead, std::memory_order_acq_rel)) {
+                pc_.stale.fetch_add(f + lead - k, std::memory_order_relaxed);
+            }
+            continue;
+        }
+        if (k >= tail_.load(std::memory_order_acquire) || k > f + kPrepWindow) {
+            rest(); // (nothing pushed ahead yet, or far enough ahead)
+            continue;
+        }
+        if (!prep_next_.compare_exchange_weak(k, k + 1, std::memory_order_acq_rel)) {
+            continue;
+        }
+        idle = 0;
+        const u64 t0 = __rdtsc();
+        pc_.claimed.fetch_add(1, std::memory_order_relaxed);
+        // the record's slot copied between two reads of its sequence (thread 1 refills it only after thread 2 ran it)
+        const Record& r = slots_[k & (kSlots - 1)];
+        const u64 s1 = slot_seq_[k & (kSlots - 1)].load(std::memory_order_acquire);
+        if (s1 != k * 2 + 2) {
+            pc_.reused.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        const Kind kind = r.kind;
+        const u64 jend = r.journal_end;
+        const Cp::DrawDescriptor d = kind == Kind::Draw ? r.draw : Cp::DrawDescriptor{};
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (slot_seq_[k & (kSlots - 1)].load(std::memory_order_relaxed) != s1) {
+            pc_.reused.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (kind != Kind::Draw) {
+            pc_.not_draws.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (head_.load(std::memory_order_acquire) > k || jend < jpos) {
+            // thread 2 already executed it (its slot may be reused), or before this worker's journal position
+            pc_.reused.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        // the journal up to the record (thread 1 writes over words only once both replicas passed them)
+        const u64 from = jpos;
+        bool broken = false;
+        while (jpos < jend) {
+            const u32* w = JournalAt(jpos);
+            const u32 op = w[0] >> 28;
+            if (op == kOpPad) {
+                jpos = (jpos + kJournalWords) & ~u64{kJournalWords - 1};
+                continue;
+            }
+            if (op == kOpWrite) {
+                const u32 count = w[0] & 0xFFFFFF;
+                if (count > kJournalWords) {
+                    broken = true;
+                    break;
+                }
+                regs->Write(static_cast<Cp::Space>((w[0] >> 24) & 0xF), w[1], w + 2, count);
+                jpos += 2 + count;
+            } else if (op == kOpReset) {
+                regs->Reset();
+                jpos += 1;
+            } else if (op == kOpLoad && (w[0] & 0xFFFFFF) == Cp::kNumRegs) {
+                regs->Load(std::span<const u32, Cp::kNumRegs>(w + 1, Cp::kNumRegs));
+                jpos += 1 + Cp::kNumRegs;
+            } else {
+                broken = true;
+                break;
+            }
+        }
+        if (broken || std::min(jhead_.load(std::memory_order_acquire), fjhead_.load(std::memory_order_acquire)) > from) {
+            synced = false; // (words it read may have been written over meanwhile: a fresh copy)
+            continue;
+        }
+        // the preparation into the record's slot (the frontend thread reads it only with its tag, far behind this)
+        PrepSlot& ps = prep_[k & (kSlots - 1)];
+        ps.tag.store(0, std::memory_order_release);
+        GS::SpecReject why = GS::SpecReject::None;
+        if (frontend_->SpeculateDraw(d, *regs, reader, ps.draw, why)) {
+            ps.tag.store(k + 1, std::memory_order_release);
+            pc_.prepared.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            pc_.rejected[static_cast<size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+        }
+        pc_.ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+    }
 }
 
 } // namespace SecondSon::Gpu::Native

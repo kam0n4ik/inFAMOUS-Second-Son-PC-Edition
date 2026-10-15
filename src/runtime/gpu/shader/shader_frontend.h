@@ -35,6 +35,7 @@
 
 #include "base/abi.h"
 #include "runtime/gpu/command_processor.h"
+#include "runtime/gpu/shader/draw_prep.h"
 #include "runtime/gpu/shader/pipeline_state.h"
 #include "runtime/gpu/shader/runtime_params.h"
 #include "runtime/gpu/shader/shader_cache.h"
@@ -209,6 +210,12 @@ struct FrontendStats {
     /// shapes whose preparation read a register their mask left out (the mask grew: cached under the new one), the keyed
     /// registers summed over the preparations cached (their mean: how much of the user data a key holds)
     u64 native_mask_grew = 0, native_keyed_registers = 0;
+    /// SSPC_PORT_DRAW_PREP (draw_prep.h): draws offered a worker's preparation; its stages taken / refused by their
+    /// inputs, by the SRT walk failing again here, by the flattened data, by the decoding's reads; its pipeline taken;
+    /// verify: pipelines also built here / those that differed
+    u64 spec_draws = 0, spec_stages = 0, spec_used = 0, spec_inputs = 0, spec_walk = 0, spec_flat = 0, spec_reads = 0;
+    u64 spec_pipelines = 0, spec_pipeline_verified = 0, spec_pipeline_mismatches = 0;
+    u64 spec_stage_verified = 0, spec_stage_mismatches = 0;
 };
 
 class ShaderFrontend {
@@ -258,6 +265,20 @@ public:
     /// Any thread (the process's exit step).
     void Stop();
 
+    /// SSPC_PORT_DRAW_PREP (draw_prep.h): the tables this frontend publishes for draw-preparation workers. Before the
+    /// first draw, on the thread that prepares draws. `verify`: a worker's pipeline is checked against the state built
+    /// here anyway (counted).
+    void EnableSpeculation(bool verify);
+    bool SpeculationOn() const { return tables_ != nullptr; }
+    /// A worker's preparation of a draw, from the published tables, objects the frontend never frees and `memory`
+    /// (any thread; nothing of the frontend is changed). false with `why`.
+    bool SpeculateDraw(const Cp::DrawDescriptor& draw, const Cp::RegisterFile& regs, GuestReader& memory,
+                       SpecDraw& out, SpecReject& why) const;
+    /// The worker's preparation of the next PrepareDraw's draw (nullptr: none). The thread that prepares draws.
+    void SetSpeculation(const SpecDraw* spec) { spec_ = spec; }
+    /// The draw-preparation counts (empty when it is off).
+    std::string SpeculationReport() const;
+
     /// The stage of the last draw/dispatch: its own view, or (P5.3) the shared preparation the native cache gave it.
     const StageView& Stage(HwStage stage) const;
     /// P5.3: the shared preparation the last draw's stage took from (or put into) the native cache; null otherwise. The
@@ -301,7 +322,18 @@ private:
     /// `engine`: P5.3, the engine's description of the stage's resource table (nullptr: none, or not a native pass).
     StageStatus PrepareStage(StageView& s, HwStage hw, SwStage sw, u64 addr, std::span<const u32, 16> user_data,
                              const BindingStart& start, GuestReader& memory, bool may_queue,
-                             const Cp::EngineTable* engine = nullptr);
+                             const Cp::EngineTable* engine = nullptr, const SpecStage* spec = nullptr);
+    /// SSPC_PORT_DRAW_PREP: a worker's stage taken (its plan, key, module into `s`, `m`) when its inputs are these and
+    /// the SRT walk run again here and the decoding's reads give the worker's bytes.
+    bool AdoptSpeculation(const SpecStage& sp, StageView& s, const Program& program, const Module& first,
+                          const FetchCache::Entry* fe, u64 addr, std::span<const u32, 16> user_data,
+                          const BindingStart& start, const ShaderReflection& r, GuestReader& memory, Module*& m);
+    // what the thread that prepares draws publishes for the workers (only with tables_; slots written when they differ)
+    void PublishProgram(u64 key, Program* program);
+    void PublishLayout(Program* program, const RuntimeParams& runtime, Module* first);
+    void PublishFetch(u64 key, const FetchCache::Entry& e);
+    void PublishModule(Program* program, Module* module);
+    void PublishPipeline(const GraphicsPipelineState& state, u32 id);
     Module* NewModule(Program& program, const RuntimeParams& runtime, const BindingStart& start,
                       std::span<const u32, 16> user_data);
     bool Enqueue(Job job);
@@ -410,6 +442,12 @@ private:
     std::array<std::shared_ptr<const StageView>, static_cast<size_t>(HwStage::Count)> shared_{};
     u64 native_frame_ = 1;
     bool native_on_ = false;
+
+    // SSPC_PORT_DRAW_PREP
+    std::unique_ptr<PrepTables> tables_;
+    const SpecDraw* spec_ = nullptr;
+    bool spec_verify_ = false;
+    std::vector<u8> spec_scratch_;
 
     DrawPreparation prep_;
     u32 last_vs_ = 0, last_ps_ = 0, last_pipeline_ = 0;

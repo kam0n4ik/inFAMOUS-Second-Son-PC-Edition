@@ -16,3 +16,4 @@ __pycache__/
 /logs/*.tmp
 /logs/crash/
 /cache/
+/build_lto/

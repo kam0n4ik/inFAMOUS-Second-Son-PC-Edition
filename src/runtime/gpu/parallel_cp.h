@@ -148,6 +148,11 @@ public:
         /// as flags of the next record (stream order); a read of memory a GPU write may still be pending for waits
         /// until thread 2 executed every earlier record (not a drain of thread 1). async_acquire is off with it.
         bool frontend_thread = false;
+        /// SSPC_PORT_DRAW_PREP=1 (shader/draw_prep.h; with frontend_thread): workers preparing draws ahead of the
+        /// frontend thread (port of uncharted_pc/bbport DrawPreparation); 0: none. `draw_prep_verify`: a worker's
+        /// pipeline is checked against the state the frontend builds anyway.
+        u32 draw_prep_workers = 0;
+        bool draw_prep_verify = false;
     };
     /// `buffers`: the executor's buffer cache (the processor's writes invalidate it on thread 2).
     ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const Options& options);
@@ -402,6 +407,40 @@ private:
     alignas(64) std::atomic<u64> f_wait_target_{0};  ///< ... until head_ reaches it (0: not sleeping on it)
     alignas(64) std::atomic<u64> fjhead_{0};         ///< its journal position (thread 1's reservation reads it)
     u64 f_current_ = 0;              ///< the frontend thread: the record being prepared
+    // SSPC_PORT_DRAW_PREP (shader/draw_prep.h): workers preparing draws ahead of the frontend thread. A worker claims
+    // a draw record between the frontend thread's position and tail_ (at most kPrepWindow ahead), replays the journal
+    // into its own register file up to the record, and leaves the draw's preparation in prep_[index] (tag = index + 1
+    // once complete). The frontend thread offers it to the frontend at that record, which takes what checks out.
+    // Records the frontend thread passed are skipped (stale); a worker whose journal position fell out of the ring
+    // takes a copy of the frontend thread's register file again (prep_sync_*).
+    struct PrepSlot {
+        std::atomic<u64> tag{0};
+        GS::SpecDraw draw;
+    };
+    static constexpr u32 kPrepWindow = 256; ///< (< kSlots: a slot is never written while the frontend reads it)
+    void PrepLoop(u32 index);
+    void PrepStop();
+    void PrepSyncPublish(); ///< the frontend thread: its register file for workers that asked
+    std::unique_ptr<PrepSlot[]> prep_;
+    std::unique_ptr<std::atomic<u64>[]> slot_seq_; ///< per record slot: index * 2 + 1 while filled, + 2 once pushed
+    std::vector<std::thread> prep_threads_;
+    u32 prep_workers_ = 0;
+    bool prep_verify_ = false;
+    std::atomic<bool> prep_stop_{false};
+    alignas(64) std::atomic<u64> prep_next_{0}; ///< the next record a worker looks at
+    alignas(64) std::atomic<u64> f_pos_{0};     ///< f_current_ for the workers
+    std::mutex prep_sync_mutex_;
+    std::atomic<u32> prep_sync_wanted_{0};
+    Cp::RegisterFile prep_sync_regs_;           ///< (under prep_sync_mutex_) the frontend thread's, at prep_sync_pos_
+    u64 prep_sync_pos_ = 0;
+    u64 prep_sync_seq_ = 0;
+    const GS::SpecDraw* front_spec_ = nullptr;  ///< the frontend thread: the worker's preparation of the record
+    struct PrepCounters {
+        std::atomic<u64> claimed{0}, prepared{0}, stale{0}, not_draws{0}, reused{0}, resyncs{0}, ticks{0};
+        std::array<std::atomic<u64>, static_cast<size_t>(GS::SpecReject::Count)> rejected{};
+        std::atomic<u64> offered{0}, missing{0}; ///< the frontend thread: draws with a preparation / without
+    };
+    PrepCounters pc_;
     bool pending_front_memo_ = false; ///< thread 1: a memo change for the frontend thread, with the next record
     struct FrontEventEntry {
         u64 before = 0; ///< applied before the frontend thread prepares this record

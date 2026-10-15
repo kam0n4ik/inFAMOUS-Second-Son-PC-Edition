@@ -53,7 +53,8 @@ struct Module {
     bool queued = false;        ///< handed to the translator (a full queue leaves it for a later draw)
     // the owner's, once it has seen the module ready
     SrtProgram srt;             ///< the reflection's SRT walker, compiled
-    bool prepared = false;
+    /// set (release) once srt, srt_error and the key are final: SSPC_PORT_DRAW_PREP's workers read them after it
+    std::atomic<bool> prepared{false};
     std::string srt_error;
     u64 uses = 0;
     u64 queued_tick = 0;        ///< when it was queued (TSC), the wait until ready is counted

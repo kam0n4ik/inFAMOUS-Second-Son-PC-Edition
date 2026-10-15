@@ -613,6 +613,25 @@ bool Backend::Start(const Options& o, std::string& error) {
             char ft[4] = {};
             po.frontend_thread = GetEnvironmentVariableA("SSPC_P53_FRONTEND_THREAD", ft, sizeof(ft)) == 1 && ft[0] == '1';
         }
+        // SSPC_PORT_DRAW_PREP=1|verify (+ SSPC_PORT_DRAW_PREP_WORKERS=<n>, 2): draw-preparation workers ahead of the
+        // frontend thread (port of uncharted_pc/bbport DrawPreparation; parallel_cp.h, Options::draw_prep_workers)
+        if (char dp[16] = {}; GetEnvironmentVariableA("SSPC_PORT_DRAW_PREP", dp, sizeof(dp)) > 0 &&
+                              (std::string_view(dp) == "1" || std::string_view(dp) == "verify")) {
+            char nw[8] = {};
+            const u32 workers = GetEnvironmentVariableA("SSPC_PORT_DRAW_PREP_WORKERS", nw, sizeof(nw)) > 0
+                                    ? static_cast<u32>(std::strtoul(nw, nullptr, 10))
+                                    : 2u;
+            if (po.frontend_thread) {
+                po.draw_prep_workers = std::max<u32>(workers, 1);
+                po.draw_prep_verify = std::string_view(dp) == "verify";
+                SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_PORT_DRAW_PREP={} - {} draw-preparation workers ahead of the "
+                                       "frontend thread (port of uncharted_pc DrawPreparation)",
+                         dp, po.draw_prep_workers);
+            } else {
+                SSPC_LOG(GPU, Warning, "SSPC_PORT_DRAW_PREP needs the frontend thread (SSPC_P53_FRONTEND_THREAD=1): "
+                                       "not used");
+            }
+        }
         parallel_ = std::make_unique<ParallelCp>(*executor_, buffers_.get(), po);
         parallel_->SetCopyFallback(
             [](void* self, u64 src, u64 dst, u64 bytes) { return static_cast<Backend*>(self)->CpuCopy(src, dst, bytes); },
