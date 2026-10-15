@@ -336,6 +336,14 @@ bool GraffitiMinigame::Deserialize(std::span<const u8> data, std::string* error)
     stage_ = stage;
     SetCursor(cursor);
     finishing_ = false;
+    if (!done && stage_ == StageCount()) {
+        // Saved in the final exit transition, before GraffitiCompleted was posted: finish on the next update
+        // (the exit timer has run out, so the camera is already at the gameplay pose).
+        finishing_ = true;
+        SetPhase(GraffitiPhase::Exiting);
+        timer_ = tuning_.exit_seconds;
+        return true;
+    }
     SetPhase(done ? GraffitiPhase::Done : GraffitiPhase::Idle);
     return true;
 }

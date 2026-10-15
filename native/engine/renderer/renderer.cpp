@@ -694,9 +694,23 @@ TextureHandle Renderer::UploadRgba(u32 width, u32 height, std::span<const u8> rg
 
 TextureHandle Renderer::CreateDynamicTexture(u32 width, u32 height, const char* debug_name) {
     if (!initialized_ || width == 0 || height == 0 || width > 4096 || height > 4096) return kWhiteTexture;
+    DynamicTexture dt;
+    dt.width = width;
+    dt.height = height;
+    // Staging first: the texture slot cannot be released, so it is only taken once everything else exists.
+    for (Buffer& b : dt.staging) {
+        if (!CreateBuffer(static_cast<VkDeviceSize>(width) * height, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, b)) {
+            for (Buffer& x : dt.staging) DestroyBuffer(x);
+            return kWhiteTexture;
+        }
+    }
     const std::vector<std::vector<u8>> zero = {std::vector<u8>(static_cast<size_t>(width) * height, 0)};
     const TextureHandle h = CreateTexture(VK_FORMAT_R8_UNORM, width, height, zero, debug_name);
-    if (h == kWhiteTexture) return kWhiteTexture;
+    if (h == kWhiteTexture) {
+        for (Buffer& x : dt.staging) DestroyBuffer(x);
+        return kWhiteTexture;
+    }
     // Masks are sampled with clamp-to-edge (the default sampler repeats).
     VkDescriptorImageInfo dii{clamp_sampler_, textures_[h].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -705,17 +719,7 @@ TextureHandle Renderer::CreateDynamicTexture(u32 width, u32 height, const char* 
     w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     w.pImageInfo = &dii;
     api.vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
-    DynamicTexture dt;
     dt.handle = h;
-    dt.width = width;
-    dt.height = height;
-    for (Buffer& b : dt.staging) {
-        if (!CreateBuffer(static_cast<VkDeviceSize>(width) * height, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, b)) {
-            for (Buffer& x : dt.staging) DestroyBuffer(x);
-            return kWhiteTexture;
-        }
-    }
     dynamic_textures_.push_back(std::move(dt));
     return h;
 }

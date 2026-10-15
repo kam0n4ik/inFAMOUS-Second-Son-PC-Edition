@@ -230,3 +230,28 @@ TEST(graffiti_state_round_trip_and_corruption) {
     CHECK(!f.g.Deserialize(zero_run, &err));
     CHECK(f.g.Phase() == GraffitiPhase::Idle && f.g.Stage() == 0);  // unchanged
 }
+
+TEST(graffiti_save_during_final_exit_completes_after_load) {
+    // Saved in the last exit transition, before the completion event was posted.
+    Run a;
+    a.g.Begin(Gameplay());
+    a.Tick({}, 1.0f / 60, 70);
+    a.PaintStage();
+    a.Tick({}, 1.0f / 60, 60);  // stage 1 revealed
+    a.PaintStage();
+    a.Tick({}, 1.0f / 60, 60);  // stage 2 revealed
+    CHECK(a.g.Phase() == GraffitiPhase::Exiting);
+    CHECK_EQ(a.Count(EventType::GraffitiCompleted), 0);
+    const std::vector<u8> saved = a.g.Serialize();
+
+    Run b;
+    std::string err;
+    CHECK(b.g.Deserialize(saved, &err));
+    CHECK(b.g.CameraBlend() == 0.0f);  // already at the gameplay camera
+    b.Tick({});
+    CHECK(b.g.Completed());
+    CHECK_EQ(b.Count(EventType::GraffitiCompleted), 1);
+    b.Tick({}, 1.0f / 60, 60);
+    CHECK_EQ(b.Count(EventType::GraffitiCompleted), 1);
+    CHECK(!b.g.Begin(Gameplay()));
+}
