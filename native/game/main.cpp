@@ -64,6 +64,7 @@ struct Args {
     long long anim_clip = -1;
     float anim_phase = -1;
     float camera_yaw_deg = 1e9f;  // unset
+    bool show_collision = false;
 };
 
 Args ParseArgs() {
@@ -84,6 +85,7 @@ Args ParseArgs() {
         else if (s == L"--anim-clip") a.anim_clip = std::wcstoll(next().c_str(), nullptr, 16);
         else if (s == L"--anim-phase") a.anim_phase = static_cast<float>(_wtof(next().c_str()));
         else if (s == L"--camera-yaw") a.camera_yaw_deg = static_cast<float>(_wtof(next().c_str()));
+        else if (s == L"--show-collision") a.show_collision = true;
     }
     LocalFree(argv);
     return a;
@@ -308,7 +310,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     CharacterState player;
     if (have_world) player.position = world.spawn;
     CharacterState prev_player = player;
-    const float kill_z = have_world ? world.terrain.BoundsMin().z - 30.0f : -100.0f;
+    const float kill_z = have_world ? (world.collision.Empty() ? world.terrain.BoundsMin().z : world.collision.BoundsMin().z) - 30.0f
+                                    : -100.0f;
+    bool show_collision = args.show_collision;
     OrbitCamera orbit;
     orbit.sensitivity = static_cast<float>(cfg.GetFloat("Input", "MouseSensitivity", orbit.sensitivity));
     if (args.camera_yaw_deg < 1e8f) orbit.yaw = args.camera_yaw_deg * kPi / 180.0f;
@@ -337,7 +341,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
     float walk_phase = 0;
     // Performance record (after a short warm-up).
-    std::vector<float> frame_ms_log, cpu_ms_log, gpu_ms_log, anim_ms_log;
+    std::vector<float> frame_ms_log, cpu_ms_log, gpu_ms_log, anim_ms_log, physics_ms_log;
     frame_ms_log.reserve(1 << 16);
     size_t selected_part = 0;
     bool pending_jump = false;
@@ -399,6 +403,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
         const u32 steps = sim.Advance(dt);
         bool jumped = false, landed = false;
+        double physics_ms = 0;
+        if (input.Pressed(Action::ToggleCollisionView)) show_collision = !show_collision;
         for (u32 s = 0; s < steps; ++s) {
             prev_player = player;
             MoveInput mi;
@@ -410,8 +416,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             }
             mi.camera_yaw = orbit.ForwardYaw();
             const bool was_grounded = player.grounded;
+            const double phys_start = clock.Now();
             StepCharacter(player, params, mi, static_cast<float>(sim.Step()), obstacles,
-                          have_world ? &world.terrain : nullptr);
+                          have_world ? &world.terrain : nullptr, have_world ? &world.collision : nullptr);
+            physics_ms += (clock.Now() - phys_start) * 1000.0;
             jumped |= mi.jump && was_grounded && !player.grounded;
             landed |= player.landed_this_step;
             pending_jump = false;
@@ -444,7 +452,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         orbit.target = render_pos + Vec3{0, 0, 1.45f};
 
         std::vector<DrawItem> items;
-        if (have_world) {
+        if (have_world && show_collision && world.collision_mesh != kInvalidMesh) {
+            const Vec4 tint = world.collision_from_havok ? Vec4{0.35f, 0.75f, 0.95f, 0} : Vec4{0.95f, 0.55f, 0.35f, 0};
+            items.push_back({world.collision_mesh, Mat4::Identity(), tint});
+        } else if (have_world) {
             items.insert(items.end(), world.draws.begin(), world.draws.end());
         } else {
             items.push_back({h_even, Mat4::Identity(), {0.46f, 0.47f, 0.45f, 0}});
@@ -484,6 +495,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             cpu_ms_log.push_back(static_cast<float>(cpu_ms));
             gpu_ms_log.push_back(static_cast<float>(renderer.Stats().gpu_ms));
             anim_ms_log.push_back(static_cast<float>(animator.LastUpdateMs()));
+            physics_ms_log.push_back(static_cast<float>(physics_ms));
         }
         if (now - title_time >= 0.5) {
             const auto& st = renderer.Stats();
@@ -521,9 +533,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
         log::Info("perf",
                   "{} frames: {:.1f} FPS avg, 1% low {:.1f} FPS | frame {:.2f} ms, CPU {:.3f} ms, GPU {:.3f} ms, animation "
-                  "{:.3f} ms | {} draws, {} tris | RAM private {:.0f} MB, peak working set {:.0f} MB",
+                  "{:.3f} ms, physics {:.3f} ms | {} draws, {} tris | RAM private {:.0f} MB, peak working set {:.0f} MB",
                   frame_ms_log.size(), 1000.0 / avg_ms, 1000.0 / p99, avg_ms, mean(cpu_ms_log), mean(gpu_ms_log),
-                  mean(anim_ms_log), st.draws, st.triangles, pmc.PrivateUsage / 1048576.0, pmc.PeakWorkingSetSize / 1048576.0);
+                  mean(anim_ms_log), mean(physics_ms_log), st.draws, st.triangles, pmc.PrivateUsage / 1048576.0,
+                  pmc.PeakWorkingSetSize / 1048576.0);
     }
     if (!args.modules.empty()) WriteLoadedModules(args.modules);
     renderer.Shutdown();

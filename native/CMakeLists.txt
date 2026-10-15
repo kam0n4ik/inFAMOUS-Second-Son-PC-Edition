@@ -95,6 +95,8 @@ add_library(sspc_engine STATIC
     engine/gameplay/terrain.cpp
     engine/resources/anim_clip.cpp
     engine/scene/animator.cpp
+    engine/resources/havok.cpp
+    engine/gameplay/collision.cpp
 )
 add_dependencies(sspc_engine sspc_shaders)
 target_include_directories(sspc_engine PUBLIC engine ${SSPC_GEN_DIR} "${SSPC_VULKAN_SDK}/Include")
@@ -128,6 +130,7 @@ add_executable(sspc_tests
     tests/test_texture.cpp
     tests/test_skeleton.cpp
     tests/test_animation.cpp
+    tests/test_collision.cpp
 )
 target_link_libraries(sspc_tests PRIVATE sspc_engine)
 target_include_directories(sspc_tests PRIVATE tests)

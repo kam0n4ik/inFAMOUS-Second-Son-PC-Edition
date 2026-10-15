@@ -28,6 +28,7 @@ enum class Action : u8 {
     PrevPart,
     TogglePart,
     ToggleFreeCamera,
+    ToggleCollisionView,
     Quit,
     Count,
 };

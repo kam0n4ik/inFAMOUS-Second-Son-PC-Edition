@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "gameplay/collision.h"
 #include "gameplay/terrain.h"
 
 namespace sspc {
@@ -65,10 +66,89 @@ void ResolveHorizontal(CharacterState& s, const CharacterParams& p, std::span<co
     }
 }
 
+// Pushes the body capsule (from step_height + radius to height - radius above the feet) out of the
+// collision triangles and removes the velocity that points into them.
+void ResolveCapsule(CharacterState& s, const CharacterParams& p, const CollisionMesh& col, const Vec3& came_from) {
+    const float r = p.radius;
+    for (int iter = 0; iter < 4; ++iter) {
+        bool any = false;
+        const float z0 = p.step_height + r, z1 = std::max(z0, p.height - r);
+        Vec3 a = s.position + Vec3{0, 0, z0}, b = s.position + Vec3{0, 0, z1};
+        const Vec3 mn{std::min(a.x, b.x) - r, std::min(a.y, b.y) - r, a.z - r};
+        const Vec3 mx{std::max(a.x, b.x) + r, std::max(a.y, b.y) + r, b.z + r};
+        col.ForEachInBox(mn, mx, [&](u32 t) {
+            const Vec3* v = col.Triangle(t);
+            Vec3 on_seg, on_tri;
+            const float d = SegmentTriangleDistance(a, b, v[0], v[1], v[2], on_seg, on_tri);
+            if (d >= r) return;
+            Vec3 n;
+            if (d > 1e-5f) {
+                n = (on_seg - on_tri) * (1.0f / d);
+            } else {  // segment through the triangle: push back to the side it came from
+                n = col.Normal(t);
+                if (Dot(n, came_from + Vec3{0, 0, z0} - on_tri) < 0) n = -n;
+            }
+            Vec3 push = n * (r - d + 1e-4f);
+            if (s.grounded) push.z = 0;  // the feet are held by the ground probe
+            s.position += push;
+            a += push;
+            b += push;
+            const float vn = Dot(s.velocity, n);
+            if (vn < 0) s.velocity -= n * vn;  // slide along the surface
+            any = true;
+        });
+        if (!any) break;
+    }
+}
+
+void StepCapsule(CharacterState& s, const CharacterParams& p, float dt, const CollisionMesh& col) {
+    const Vec3 move = s.velocity * dt;
+    const float len = Length(move);
+    const int n = std::clamp(static_cast<int>(std::ceil(len / (0.5f * p.radius))), 1, 16);
+    const Vec3 step = move * (1.0f / static_cast<float>(n));
+    for (int i = 0; i < n; ++i) {
+        const Vec3 from = s.position;
+        s.position += step;
+        ResolveCapsule(s, p, col, from);
+    }
+    // Ground: highest walkable surface under the footprint, up to step_height above the feet;
+    // while grounded the probe also reaches one step down so the feet follow slopes and stairs.
+    const float top = s.position.z + p.step_height;
+    const float reach = p.step_height + (s.grounded ? p.step_height : std::max(0.05f, -s.velocity.z * dt));
+    const auto ground = FindGround(col, s.position, p.radius * 0.7f, top, reach, p.min_ground_up);
+    if (s.grounded) {
+        if (ground && s.velocity.z <= 0) {
+            s.position.z = *ground;
+            s.velocity.z = 0;
+        } else {
+            s.grounded = false;  // walked off a ledge
+        }
+    } else if (ground && s.velocity.z <= 0 && s.position.z <= *ground + 1e-3f) {
+        s.position.z = *ground;
+        s.velocity.z = 0;
+        s.grounded = true;
+        s.landed_this_step = true;
+        s.air_time = 0;
+    }
+}
+
 }  // namespace
 
+std::optional<float> FindGround(const CollisionMesh& col, const Vec3& feet, float radius, float top, float max_drop,
+                                float min_up) {
+    std::optional<float> best;
+    const Vec3 offsets[5] = {{0, 0, 0}, {radius, 0, 0}, {-radius, 0, 0}, {0, radius, 0}, {0, -radius, 0}};
+    for (const Vec3& o : offsets) {
+        const Vec3 origin{feet.x + o.x, feet.y + o.y, top};
+        const auto hit = col.Raycast(origin, {0, 0, -1}, max_drop);
+        if (!hit || hit->normal.z < min_up) continue;
+        if (!best || hit->point.z > *best) best = hit->point.z;
+    }
+    return best;
+}
+
 void StepCharacter(CharacterState& s, const CharacterParams& p, const MoveInput& in, float dt,
-                   std::span<const Aabb> obstacles, const TerrainGrid* terrain) {
+                   std::span<const Aabb> obstacles, const TerrainGrid* terrain, const CollisionMesh* collision) {
     s.landed_this_step = false;
     // Desired horizontal velocity, camera relative.
     const float cy = std::cos(in.camera_yaw), sy = std::sin(in.camera_yaw);
@@ -101,6 +181,10 @@ void StepCharacter(CharacterState& s, const CharacterParams& p, const MoveInput&
     if (!s.grounded) {
         s.velocity.z = std::max(s.velocity.z - p.gravity * dt, -p.max_fall_speed);
         s.air_time += dt;
+    }
+    if (collision && !collision->Empty()) {
+        StepCapsule(s, p, dt, *collision);
+        return;
     }
 
     s.position.x += s.velocity.x * dt;

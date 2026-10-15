@@ -140,6 +140,58 @@ bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wst
         }
     }
     out.terrain.Build(2.0f);
+
+    // Collision: the chunk's Havok packfiles (static compound shapes of compressed meshes).
+    std::vector<Vec3> col_tris;
+    for (const u64 at : res::FindHavokPackfiles(pkg.Data())) {
+        res::HavokPackfile pf;
+        std::string herr;
+        if (!pf.Parse(pkg.Data(), at, &herr) || !res::DecodeStaticCollision(pf, col_tris, out.havok, &herr)) {
+            log::Warn("world", "Havok packfile at {:#x}: {}", at, herr);
+        }
+    }
+    out.collision_from_havok = !col_tris.empty();
+    const size_t havok_tris = col_tris.size() / 3;
+    // The shipped Havok shapes of the village chunks hold rocks, trunks and buildings but no ground
+    // surface. Ground (APPROXIMATION): walkable render triangles; with no Havok data at all, every
+    // drawn render triangle collides.
+    for (const auto& sc : scenes) {
+        for (const auto& inst : sc.instances) {
+            if (inst.kind != 0) continue;
+            const auto gk = resolve(sc, inst.geometry);
+            if (!gk) continue;
+            const auto it = slot_of.find(*gk);
+            if (it == slot_of.end() || !ok[it->second]) continue;
+            const Mat4 world = res::ChunkMatrixToWorld(sc.matrices[inst.matrix]);
+            const auto& md = meshes[it->second];
+            for (size_t i = 0; i + 2 < md.indices.size(); i += 3) {
+                const Vec3 a = world.TransformPoint(md.positions[md.indices[i]]);
+                const Vec3 b = world.TransformPoint(md.positions[md.indices[i + 1]]);
+                const Vec3 c = world.TransformPoint(md.positions[md.indices[i + 2]]);
+                const Vec3 n = Cross(b - a, c - a);
+                const float len = Length(n);
+                if (out.collision_from_havok && (len < 1e-8f || std::abs(n.z) / len < 0.6f)) continue;
+                col_tris.insert(col_tris.end(), {a, b, c});
+            }
+        }
+    }
+    {
+        res::MeshData dbg;  // debug view
+        dbg.positions = col_tris;
+        dbg.indices.resize(col_tris.size());
+        for (u32 i = 0; i < dbg.indices.size(); ++i) dbg.indices[i] = i;
+        if (!dbg.positions.empty()) out.collision_mesh = renderer.UploadMesh(dbg, "collision");
+    }
+    const size_t col_count = col_tris.size() / 3;
+    std::vector<u8> layers(col_count, kCollisionFallback);
+    std::fill(layers.begin(), layers.begin() + static_cast<std::ptrdiff_t>(havok_tris), kCollisionHavok);
+    out.collision.Build(std::move(col_tris), std::move(layers));
+    log::Info("world", "collision: {} Havok triangles ({} compound shapes, {} instances, {} meshes, {} convex props not "
+              "decoded) + {} render triangles ({}), BVH {} nodes depth {}",
+              havok_tris, out.havok.compound_shapes, out.havok.instances, out.havok.mesh_shapes,
+              out.havok.convex_shapes_skipped, col_count - havok_tris,
+              out.collision_from_havok ? "walkable ground, approximation" : "all, approximation", out.collision.NodeCount(),
+              out.collision.Depth());
     u64 best_key = 0;
     u32 best = 0;
     for (const auto& [k, n] : density) {
@@ -152,6 +204,26 @@ bool LoadWorldChunk(const std::wstring& package_path, const std::vector<std::wst
     const float sy = (static_cast<s32>(best_key & 0xffffffffu) + 0.5f) * 20.0f;
     const auto ground = out.terrain.LowestAt(sx, sy);
     out.spawn = {sx, sy, ground ? *ground + 0.05f : 0.0f};
+    if (!out.collision.Empty()) {
+        // Stand on the collision surface: the top one at the spawn column, else the nearest drawn
+        // instance that has collision under it.
+        const float top = out.collision.BoundsMax().z + 1.0f, drop = top - out.collision.BoundsMin().z + 1.0f;
+        auto ground_at = [&](float x, float y) { return out.collision.Raycast({x, y, top}, {0, 0, -1}, drop); };
+        if (auto hit = ground_at(sx, sy); hit && hit->normal.z > 0.6f) {
+            out.spawn = hit->point + Vec3{0, 0, 0.05f};
+        } else {
+            float best = 1e30f;
+            for (const auto& d : out.draws) {
+                const Vec3 p{d.world.m[3][0], d.world.m[3][1], d.world.m[3][2]};
+                const float dist = (p.x - sx) * (p.x - sx) + (p.y - sy) * (p.y - sy);
+                if (dist >= best) continue;
+                if (auto h = ground_at(p.x + 1.0f, p.y + 1.0f); h && h->normal.z > 0.6f) {
+                    best = dist;
+                    out.spawn = h->point + Vec3{0, 0, 0.05f};
+                }
+            }
+        }
+    }
     out.load_seconds = clock.Now();
     log::Info("world", "{}: {} scene objects, {} instances ({} drawn, {} external), {} meshes, {} textures, {} walkable tris, "
               "spawn ({:.1f}, {:.1f}, {:.1f}) in {:.0f} ms",

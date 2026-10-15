@@ -6,14 +6,22 @@
 
 #include "core/jobs.h"
 #include "core/math.h"
+#include "gameplay/collision.h"
 #include "gameplay/terrain.h"
 #include "renderer/renderer.h"
+#include "resources/havok.h"
 
 namespace sspc {
 
 struct WorldScene {
     std::vector<DrawItem> draws;  // one per drawable instance, world in metres
     TerrainGrid terrain;
+    // Character collision: the chunk's own Havok shapes when present (collision_from_havok),
+    // otherwise every drawn render triangle as an approximation.
+    CollisionMesh collision;
+    bool collision_from_havok = false;
+    res::HavokCollisionStats havok;
+    MeshHandle collision_mesh = kInvalidMesh;  // debug view of `collision`
     Vec3 spawn{0, 0, 0};
     u32 instances_total = 0;
     u32 instances_drawn = 0;

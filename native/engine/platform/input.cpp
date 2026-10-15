@@ -55,7 +55,7 @@ constexpr KeyName kKeyNames[] = {
 const char* ToString(Action a) {
     static const char* const kNames[] = {"MoveForward", "MoveBack", "MoveLeft", "MoveRight", "Jump", "Sprint", "Walk",
                                          "ToggleMouseCapture", "NextPart", "PrevPart", "TogglePart",
-                                         "ToggleFreeCamera", "Quit"};
+                                         "ToggleFreeCamera", "ToggleCollisionView", "Quit"};
     return kNames[static_cast<size_t>(a)];
 }
 
@@ -94,6 +94,7 @@ Input::Input() {
     bind(Action::PrevPart, VK_OEM_4, 0, XINPUT_GAMEPAD_DPAD_LEFT);    // [
     bind(Action::TogglePart, 'H', 0, XINPUT_GAMEPAD_DPAD_UP);
     bind(Action::ToggleFreeCamera, VK_F3, 0, XINPUT_GAMEPAD_BACK);
+    bind(Action::ToggleCollisionView, VK_F5, 0, 0);
     bind(Action::Quit, VK_ESCAPE, 0, 0);
 }
 
