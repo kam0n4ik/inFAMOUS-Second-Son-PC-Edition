@@ -90,6 +90,88 @@ void AttachSkeleton(const res::KcapPackage& pkg, LoadedModel& m) {
               dropped ? std::format(", {} parts left rigid (joint out of range)", dropped) : std::string{});
 }
 
+// Helper-joint drivers and rigid-part attachments (see LoadedModel). Needs the CPU meshes.
+void ComputeAttachments(LoadedModel& m) {
+    m.joint_driver.clear();
+    m.part_attach.assign(m.meshes.size(), -1);
+    if (!m.skeleton) return;
+    const res::Skeleton& sk = *m.skeleton;
+    const size_t n = sk.JointCount();
+    auto bind_pos = [&](size_t j) { return Vec3{sk.bind[j].m[3][0], sk.bind[j].m[3][1], sk.bind[j].m[3][2]}; };
+    std::vector<char> helper(n, 0);
+    for (size_t j = 2; j < n; ++j) helper[j] = Length(bind_pos(j)) < 1e-5f && sk.parents[j] <= 0;
+    // Co-weight of every helper joint with every body joint.
+    std::vector<std::unordered_map<u16, float>> score(n);
+    std::vector<Vec3> centroid(n);
+    std::vector<float> centroid_w(n, 0);
+    for (const auto& md : m.meshes) {
+        for (size_t v = 0; v < md.joints.size(); ++v) {
+            const auto& jj = md.joints[v];
+            const auto& ww = md.weights[v];
+            for (int a = 0; a < 4; ++a) {
+                if (!ww[a] || jj[a] >= n || !helper[jj[a]]) continue;
+                centroid[jj[a]] += md.positions[v] * static_cast<float>(ww[a]);
+                centroid_w[jj[a]] += ww[a];
+                for (int b = 0; b < 4; ++b) {
+                    if (ww[b] && jj[b] < n && !helper[jj[b]]) score[jj[a]][jj[b]] += static_cast<float>(ww[a]) * ww[b];
+                }
+            }
+        }
+    }
+    auto nearest_body = [&](const Vec3& p) {
+        s16 best = -1;
+        float bd = 1e30f;
+        for (size_t j = 0; j < n; ++j) {
+            if (helper[j]) continue;
+            const float d = Length(bind_pos(j) - p);
+            if (d < bd) {
+                bd = d;
+                best = static_cast<s16>(j);
+            }
+        }
+        return best;
+    };
+    m.joint_driver.assign(n, -1);
+    u32 drivers = 0;
+    for (size_t h = 0; h < n; ++h) {
+        if (!helper[h]) continue;
+        if (!score[h].empty()) {
+            const auto best = std::max_element(score[h].begin(), score[h].end(),
+                                               [](const auto& x, const auto& y) { return x.second < y.second; });
+            m.joint_driver[h] = static_cast<s16>(best->first);
+        } else if (centroid_w[h] > 0) {
+            m.joint_driver[h] = nearest_body(centroid[h] * (1.0f / centroid_w[h]));
+        }
+        drivers += m.joint_driver[h] >= 0;
+    }
+    // Rigid parts: lowest common ancestor of the joints nearest to a sample of their vertices.
+    auto ancestors = [&](s16 j) {
+        std::vector<s16> chain;
+        for (; j >= 0; j = sk.parents[static_cast<size_t>(j)]) chain.push_back(j);
+        return chain;
+    };
+    u32 attached = 0;
+    for (size_t i = 0; i < m.meshes.size(); ++i) {
+        const auto& md = m.meshes[i];
+        if (!md.joints.empty() || md.positions.empty() || !m.parts[i].default_visible) continue;
+        std::vector<s16> common;
+        const size_t step = std::max<size_t>(1, md.positions.size() / 48);
+        for (size_t v = 0; v < md.positions.size(); v += step) {
+            const auto chain = ancestors(nearest_body(md.positions[v]));
+            if (common.empty()) {
+                common = chain;
+            } else {
+                std::erase_if(common, [&](s16 x) { return std::find(chain.begin(), chain.end(), x) == chain.end(); });
+            }
+        }
+        if (!common.empty()) {
+            m.part_attach[i] = common.front();  // deepest shared joint
+            ++attached;
+        }
+    }
+    log::Info("model", "approximations: {} helper joints follow body joints, {} rigid parts ride on joints", drivers, attached);
+}
+
 }  // namespace
 
 void ChooseDefaultParts(LoadedModel& m) {
@@ -138,7 +220,8 @@ bool LoadCharacterModel(const std::wstring& package_path, const std::wstring& ca
                 out.from_cache = true;
                 FillParts(out);
                 LoadPartTextures(pkg, texture_packages, jobs, out);
-    AttachSkeleton(pkg, out);
+                AttachSkeleton(pkg, out);
+                ComputeAttachments(out);
                 out.load_seconds = clock.Now();
                 log::Info("model", "{} meshes from cache {} in {:.1f} ms", out.meshes.size(),
                           log::Narrow(cache_path), out.load_seconds * 1000);
@@ -186,6 +269,7 @@ bool LoadCharacterModel(const std::wstring& package_path, const std::wstring& ca
     FillParts(out);
     LoadPartTextures(pkg, texture_packages, jobs, out);
     AttachSkeleton(pkg, out);
+    ComputeAttachments(out);
     if (!cache_path.empty()) {
         const auto bytes = res::WriteSpcMesh(out.meshes, out.source_hash);
         const size_t slash = cache_path.find_last_of(L"\\/");

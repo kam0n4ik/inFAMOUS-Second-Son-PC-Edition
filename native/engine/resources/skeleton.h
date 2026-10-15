@@ -13,6 +13,7 @@
 
 #include "core/math.h"
 #include "core/types.h"
+#include "resources/anim_clip.h"
 #include "resources/kcap.h"
 
 namespace sspc::res {
@@ -22,8 +23,16 @@ struct Skeleton {
     std::vector<s16> parents;
     std::vector<Mat4> bind;          // model space, metres, column-vector convention
     std::vector<Mat4> inverse_bind;  // as stored (also metres); inverse_bind[i] * bind[i] == I
+    // Local rest pose of the '60SE' skeleton object (centimetres), empty if not found. Composed with
+    // `parents` it reproduces `bind`; animation clips overwrite the joints they have tracks for.
+    std::vector<JointPose> rest;
+    u32 rest_offset = 0;
     size_t JointCount() const { return parents.size(); }
 };
+
+// '60SE' skeleton object with `joints` joints: {magic, u32 size, u32, u32, u16 joints, ..., +0x18
+// self-relative offset of the local pose: joints x {quat xyzw, translation xyz 1, scale xyz 1}}.
+std::optional<std::vector<JointPose>> FindRestPose(const KcapPackage& pkg, u32 joints, u32* offset = nullptr);
 
 // The largest skeleton found in the package (characters have one), if any.
 std::optional<Skeleton> FindSkeleton(const KcapPackage& pkg);

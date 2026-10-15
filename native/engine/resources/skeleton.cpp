@@ -85,7 +85,43 @@ std::optional<Skeleton> FindSkeleton(const KcapPackage& pkg) {
         }
         best = std::move(s);
     }
+    if (best) {
+        if (auto rest = FindRestPose(pkg, static_cast<u32>(best->JointCount()), &best->rest_offset)) best->rest = std::move(*rest);
+    }
     return best;
+}
+
+std::optional<std::vector<JointPose>> FindRestPose(const KcapPackage& pkg, u32 joints, u32* offset) {
+    constexpr u32 kMagic = 0x45533036;  // '60SE'
+    const auto data = pkg.Data();
+    for (u64 o = 0; o + 0x40 <= data.size(); o += 16) {
+        u32 magic = 0, size = 0, pose_rel = 0;
+        u16 n = 0;
+        std::memcpy(&magic, data.data() + o, 4);
+        if (magic != kMagic) continue;
+        std::memcpy(&size, data.data() + o + 4, 4);
+        std::memcpy(&n, data.data() + o + 0x10, 2);
+        std::memcpy(&pose_rel, data.data() + o + 0x18, 4);
+        if (n != joints || !pkg.InRange(o, size)) continue;
+        const u64 pose = o + 0x18 + pose_rel;
+        if (pose + static_cast<u64>(n) * 0x30 > o + size) continue;
+        std::vector<JointPose> rest(n);
+        bool ok = true;
+        for (u32 j = 0; j < n && ok; ++j) {
+            float v[12];
+            std::memcpy(v, data.data() + pose + j * 0x30ull, sizeof(v));
+            rest[j].rotation = {v[0], v[1], v[2], v[3]};
+            rest[j].translation = {v[4], v[5], v[6]};
+            rest[j].scale = {v[8], v[9], v[10]};
+            const float len2 = Dot(rest[j].rotation, rest[j].rotation);
+            ok = std::isfinite(len2) && std::abs(len2 - 1.0f) < 1e-3f && std::isfinite(v[4]) && std::isfinite(v[5]) &&
+                 std::isfinite(v[6]);
+        }
+        if (!ok) continue;
+        if (offset) *offset = static_cast<u32>(o);
+        return rest;
+    }
+    return std::nullopt;
 }
 
 std::vector<Mat4> BindLocals(const Skeleton& s) {

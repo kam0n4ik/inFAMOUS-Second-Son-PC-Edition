@@ -34,6 +34,15 @@ struct LoadedModel {
     std::vector<u64> part_albedo;            // colour-map texture id per part (0 = none)
     std::vector<res::TextureData> textures;  // decoded colour maps referenced by the parts
     std::optional<res::Skeleton> skeleton;   // joints referenced by the skinned parts
+    // APPROXIMATIONS until the game's systems are reconstructed:
+    //  * joint_driver: helper joints (bind at the model origin, e.g. Delsin's 240 cloth joints
+    //    413..652 driven in the game by its secondary-motion system) copy the transform of the body
+    //    joint they share most skin weight with; -1 = own transform.
+    //  * part_attach: parts without usable skin data (rigid eyes, the face part whose 141-joint local
+    //    palette is not decoded) ride on one joint: the common ancestor of the joints nearest to
+    //    their vertices; -1 = model root.
+    std::vector<s16> joint_driver;
+    std::vector<s16> part_attach;
     std::array<u8, 16> source_hash{};
     Vec3 bounds_min, bounds_max;  // of the default-visible parts
     bool from_cache = false;

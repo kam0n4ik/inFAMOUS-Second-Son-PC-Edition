@@ -22,6 +22,7 @@ enum class Action : u8 {
     MoveRight,
     Jump,
     Sprint,
+    Walk,
     ToggleMouseCapture,
     NextPart,
     PrevPart,

@@ -115,4 +115,62 @@ struct Mat4 {
 
 constexpr float kPi = 3.14159265358979323846f;
 
+// Unit quaternion (x, y, z, w), Hamilton product; rotates column vectors: v' = q v q*.
+struct Quat {
+    float x = 0, y = 0, z = 0, w = 1;
+};
+
+inline Quat operator*(const Quat& a, const Quat& b) {
+    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+inline float Dot(const Quat& a, const Quat& b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+inline Quat Normalize(const Quat& q) {
+    const float l = std::sqrt(Dot(q, q));
+    return l > 1e-20f ? Quat{q.x / l, q.y / l, q.z / l, q.w / l} : Quat{};
+}
+inline Vec3 Rotate(const Quat& q, const Vec3& v) {
+    const Vec3 u{q.x, q.y, q.z};
+    const Vec3 t = Cross(u, v) * 2.0f;
+    return v + t * q.w + Cross(u, t);
+}
+// Shortest-arc spherical interpolation (falls back to normalised lerp for nearly equal inputs).
+inline Quat Slerp(const Quat& a, Quat b, float t) {
+    float d = Dot(a, b);
+    if (d < 0) {
+        b = {-b.x, -b.y, -b.z, -b.w};
+        d = -d;
+    }
+    float wa = 1 - t, wb = t;
+    if (d < 0.9995f) {
+        const float th = std::acos(d);
+        const float s = std::sin(th);
+        wa = std::sin((1 - t) * th) / s;
+        wb = std::sin(t * th) / s;
+    }
+    return Normalize({a.x * wa + b.x * wb, a.y * wa + b.y * wb, a.z * wa + b.z * wb, a.w * wa + b.w * wb});
+}
+// Columns of the basis scaled: M * diag(s).
+inline Mat4 ScaledBasis(Mat4 m, const Vec3& s) {
+    for (int r = 0; r < 3; ++r) {
+        m.m[0][r] *= s.x;
+        m.m[1][r] *= s.y;
+        m.m[2][r] *= s.z;
+    }
+    return m;
+}
+// Rotation then translation: M = T * R.
+inline Mat4 RotationTranslation(const Quat& q, const Vec3& t) {
+    const float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
+    const float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z, wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
+    Mat4 r = Mat4::Identity();
+    r.m[0][0] = 1 - 2 * (yy + zz); r.m[0][1] = 2 * (xy + wz);     r.m[0][2] = 2 * (xz - wy);
+    r.m[1][0] = 2 * (xy - wz);     r.m[1][1] = 1 - 2 * (xx + zz); r.m[1][2] = 2 * (yz + wx);
+    r.m[2][0] = 2 * (xz + wy);     r.m[2][1] = 2 * (yz - wx);     r.m[2][2] = 1 - 2 * (xx + yy);
+    r.m[3][0] = t.x;
+    r.m[3][1] = t.y;
+    r.m[3][2] = t.z;
+    return r;
+}
+
 }  // namespace sspc
