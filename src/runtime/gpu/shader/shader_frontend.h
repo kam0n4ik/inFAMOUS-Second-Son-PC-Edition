@@ -114,6 +114,17 @@ struct StageView {
     ResourceBindingPlan plan;
     SpecializationKey key;
     ProgramError program_error = ProgramError::None;
+    /// P5.3: an immutable preparation of the Native Render Frontend's cache, shared by every draw with the same inputs.
+    /// plan.flat's first 16 dwords are the user data of the draw that made it: the executor writes the current draw's
+    /// user data there when it uploads the flattened user data (they differ only in the snapshot pointers).
+    bool native_shared = false;
+};
+
+/// P5.3 Native Render Frontend (SSPC_P53_NATIVE_FRONTEND): stages of draws the engine described.
+enum class NativeStages : u8 {
+    Off,
+    On,     ///< a stage with the inputs of a cached preparation takes it (no SRT walk, decoding, key, module search)
+    Verify, ///< every hit is prepared in full anyway and compared; the full preparation is what the draw uses
 };
 
 struct DrawPreparation {
@@ -142,6 +153,17 @@ struct FrontendOptions {
     /// P5.2 (SSPC_P52_CODE_TRUST): programs and fetch shaders whose code pages are write-tracked are not read again
     /// every frame while those pages stay unwritten (needs SetCodeTracker; Off: the per-frame validation alone).
     CodeTrust code_trust = CodeTrust::Off;
+    /// P5.3 Native Render Frontend: for a draw the engine described (DrawDescriptor::engine_*) in one of
+    /// `native_passes` (bit = Engine::Render::PassSlot: 0..40 the passes, 41 pre, 42 post, 43 deformation), each VS/PS
+    /// stage is looked up by its program, layout, fetch shader, binding start, user data (the snapshot pointers as
+    /// offsets from its start) and the exact bytes of its resource snapshot in guest memory. A preparation is cached
+    /// only when everything it read on the way was inside the snapshot and none of its resources lies in it.
+    NativeStages native_stages = NativeStages::Off;
+    u64 native_passes = 0;
+    u32 native_max_entries = 32768; ///< cached stage preparations at most (both stages); older ones go first
+    /// Cached at the n-th sighting of exactly these inputs (1: at once). Most of a frame's described stages read a
+    /// snapshot whose bytes never come again (P5.3.1, beach: ~3500 of ~4700 a frame) - caching them only churns.
+    u32 native_admit = 2;
 };
 
 struct FrontendStats {
@@ -166,6 +188,27 @@ struct FrontendStats {
     /// P4.14 (the persistent shader cache): modules found on disk for programs met (stubs), read instead of translated,
     /// records that could not be used (translated instead), the translation time those reads saved (as recorded)
     u64 disk_stubs = 0, disk_loads = 0, disk_load_failures = 0, disk_saved_us = 0;
+    /// P5.3 Native Render Frontend: engine-described stages looked up / taken from the cache / prepared and cached /
+    /// prepared, not cacheable (a read outside the snapshot, a resource in it, a failed read) / known not cacheable /
+    /// not looked up (the snapshot pointers disagree, the snapshot unreadable, too large) / hash collisions / evicted;
+    /// verify: hits compared with their full preparation, those that differed
+    u64 native_lookups = 0, native_hits = 0, native_learned = 0, native_uncacheable = 0, native_known_uncacheable = 0;
+    u64 native_unkeyed = 0, native_collisions = 0, native_evicted = 0, native_verified = 0, native_mismatches = 0;
+    std::array<u64, 4> native_uncacheable_by{}; ///< a read outside the snapshot, a resource in it, an SRT fault, not ready
+    u64 native_entries = 0, native_bytes = 0;
+    u64 native_first_seen = 0; ///< misses prepared, not cached: the first sighting of these inputs (native_admit)
+    /// verify: the misses by why - inputs never seen (program, layout, fetch shader, start, user data) / the same inputs
+    /// and bytes as last time (evicted, not yet admitted) / the same inputs with other snapshot bytes; those by how many
+    /// dwords differ (1, 2, 3-4, 5-8, more) and those where only the first dword of 4-dword groups differs (a
+    /// descriptor's base address, presumably: the engine's per-frame allocations)
+    u64 native_miss_new = 0, native_miss_same = 0, native_miss_bytes = 0, native_miss_word0 = 0;
+    std::array<u64, 5> native_miss_dwords{};
+    /// verify: of the inputs never seen, a shape never seen; else per register, how often a keyed one differed
+    u64 native_miss_new_shape = 0;
+    std::array<u64, 16> native_miss_ud{};
+    /// shapes whose preparation read a register their mask left out (the mask grew: cached under the new one), the keyed
+    /// registers summed over the preparations cached (their mean: how much of the user data a key holds)
+    u64 native_mask_grew = 0, native_keyed_registers = 0;
 };
 
 class ShaderFrontend {
@@ -201,6 +244,8 @@ public:
     /// SSPC_DIAG_MEMO_STATS=1: the stage memo's misses by cause (the user data dwords that differ, the input that
     /// changed); empty without it.
     std::string MemoReport() const;
+    /// P5.3: the Native Render Frontend's counts (empty when it is off).
+    std::string NativeReport() const;
     /// P4.14: the persistent shader cache (nullptr: none). A program met for the first time gets the modules the cache
     /// has for it (read when first needed instead of translated); new translations are added to it. Before the first
     /// draw.
@@ -213,7 +258,13 @@ public:
     /// Any thread (the process's exit step).
     void Stop();
 
+    /// The stage of the last draw/dispatch: its own view, or (P5.3) the shared preparation the native cache gave it.
     const StageView& Stage(HwStage stage) const;
+    /// P5.3: the shared preparation the last draw's stage took from (or put into) the native cache; null otherwise. The
+    /// caller may keep it as long as it wants (immutable; the cache only drops its own reference).
+    const std::shared_ptr<const StageView>& SharedStage(HwStage stage) const {
+        return shared_[static_cast<size_t>(stage)];
+    }
     /// Translations run so far and their time (any thread: the frame log samples it at each flip).
     struct TranslationTotals {
         u64 count = 0, ns = 0, max_ns = 0;
@@ -247,8 +298,10 @@ private:
         std::vector<std::array<u32, 4>> vertex_sharps;
     };
 
+    /// `engine`: P5.3, the engine's description of the stage's resource table (nullptr: none, or not a native pass).
     StageStatus PrepareStage(StageView& s, HwStage hw, SwStage sw, u64 addr, std::span<const u32, 16> user_data,
-                             const BindingStart& start, GuestReader& memory, bool may_queue);
+                             const BindingStart& start, GuestReader& memory, bool may_queue,
+                             const Cp::EngineTable* engine = nullptr);
     Module* NewModule(Program& program, const RuntimeParams& runtime, const BindingStart& start,
                       std::span<const u32, 16> user_data);
     bool Enqueue(Job job);
@@ -297,6 +350,67 @@ private:
     std::array<std::array<std::pair<u64, u64>, 8>, static_cast<size_t>(HwStage::Count)> memo_hist_{}; ///< (inputs, gen)
     std::array<u32, static_cast<size_t>(HwStage::Count)> memo_hist_next_{};
     std::array<u64, static_cast<size_t>(HwStage::Count)> memo_would_hit_{}; ///< misses an 8-entry memo would have had
+    // P5.3 Native Render Frontend: stage preparations by their exact inputs (see FrontendOptions::native_stages)
+    struct NativeKey {
+        u64 address = 0;                ///< the program's (inline constant buffers are relative to it)
+        const Program* program = nullptr;
+        const Module* first = nullptr;  ///< the layout: the program's first module for these runtime parameters
+        const void* fetch = nullptr;    ///< the fetch shader's cache entry and its content version
+        u64 fetch_version = 0;
+        BindingStart start;
+        u32 stage = 0;
+        u32 dwords = 0;                 ///< the snapshot's extent
+        /// the snapshot pointers as byte offsets from its start (high word's top kept); of the other registers only
+        /// those in ud_mask (the rest reach the shader through the flattened user data's first 16 dwords, which the
+        /// executor writes from the draw itself)
+        std::array<u32, 16> user_data{};
+        u32 ud_mask = 0;  ///< the registers the preparations of this shape read (UserDataUsed), 0xFFFF until known
+        u32 reserved = 0; ///< (no padding: the key is hashed as bytes)
+        bool operator==(const NativeKey&) const = default;
+    };
+    struct NativeEntry {
+        NativeKey key;
+        std::vector<u32> snapshot;               ///< the bytes it was prepared from
+        std::shared_ptr<const StageView> view;   ///< null: known not cacheable (a read outside the snapshot, ...)
+        u64 last_frame = 0;
+    };
+    /// The stage's shape (its key without user data values: `shape` its hash, `pointers` the snapshot pointers'
+    /// registers) and its snapshot's bytes (into native_snap_[stage], `snap_hash` theirs); false: not looked up.
+    bool NativeKeyOf(HwStage hw, const Cp::EngineTable& t, std::span<const u32, 16> user_data, GuestReader& memory,
+                     const StageView& s, const Module& first, const void* fetch, u64 fetch_version,
+                     const BindingStart& start, NativeKey& key, u64& base, u64& shape, u32& pointers, u64& snap_hash);
+    /// The key with the user data registers in `mask` (the others 0), its hash (`inputs`) and with the snapshot's.
+    static void NativeMask(NativeKey& key, std::span<const u32, 16> user_data, u32 pointers, u32 mask, u64 snap_hash,
+                           u64& inputs, u64& hash);
+    /// verify: why a lookup missed (FrontendStats::native_miss_*), from the last snapshot seen with these inputs and
+    /// the last user data seen with this shape.
+    void NativeMissWhy(u64 shape, u64 inputs, const NativeKey& key, const std::vector<u32>& snapshot);
+    /// The guest memory reads of a preparation, checked against the snapshot it is keyed on.
+    class NativeRecorder final : public GuestReader {
+    public:
+        NativeRecorder(GuestReader& inner, u64 begin, u64 end) : inner_(inner), begin_(begin), end_(end) {}
+        bool Read(u64 addr, void* dst, u64 bytes) override {
+            outside_ |= addr < begin_ || addr + bytes > end_;
+            return inner_.Read(addr, dst, bytes);
+        }
+        bool Outside() const { return outside_; }
+
+    private:
+        GuestReader& inner_;
+        u64 begin_, end_;
+        bool outside_ = false;
+    };
+    void NativeEvict();
+    std::unordered_map<u64, NativeEntry> native_;
+    std::unordered_map<u64, u32> native_seen_;                       ///< not yet cached: sightings (native_admit)
+    std::unordered_map<u64, u32> native_masks_;                      ///< shape -> the user data registers it reads
+    std::unordered_map<u64, std::vector<u32>> native_last_snap_;     ///< verify: inputs -> the last snapshot's bytes
+    std::unordered_map<u64, std::array<u32, 16>> native_last_ud_;    ///< verify: shape -> the last keyed user data
+    std::array<std::vector<u32>, static_cast<size_t>(HwStage::Count)> native_snap_{};
+    std::array<std::shared_ptr<const StageView>, static_cast<size_t>(HwStage::Count)> shared_{};
+    u64 native_frame_ = 1;
+    bool native_on_ = false;
+
     DrawPreparation prep_;
     u32 last_vs_ = 0, last_ps_ = 0, last_pipeline_ = 0;
     u32 next_module_ = 1;

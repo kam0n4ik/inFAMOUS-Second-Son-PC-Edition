@@ -145,6 +145,8 @@ struct Presenter::Impl {
         VkCommandBuffer cb = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         VkSemaphore acquired = VK_NULL_HANDLE;
+        VkFence acquire_fence = VK_NULL_HANDLE, present_fence = VK_NULL_HANDLE;
+        bool submitted = false, acquire_pending = false, present_pending = false;
         s32 frame = -1; ///< the frame its commands read
         OwnedBuffer overlay; ///< the FPS counter's pixels (free once the slot's fence signalled)
     };
@@ -156,6 +158,8 @@ struct Presenter::Impl {
     VkCommandPool pool = VK_NULL_HANDLE;
     std::array<Slot, 2> slots{};
     u32 slot = 0;
+    struct PendingCapture { OwnedBuffer buffer; VkCommandBuffer cb; VkFence fence; };
+    std::vector<PendingCapture> pending_captures;
 
     struct Frame {
         VkImage image = VK_NULL_HANDLE;
@@ -175,6 +179,44 @@ struct Presenter::Impl {
     Stats stats;
 
     Impl(DeviceContext& c, Timeline& t) : ctx(c), timeline(t) {}
+
+    bool WaitFence(VkFence fence, bool& pending, u64 timeout) {
+        if (!pending) {
+            return true;
+        }
+        const VkResult r = Fn().vkWaitForFences(ctx.Device(), 1, &fence, VK_TRUE, timeout);
+        if (r == VK_SUCCESS) {
+            pending = false;
+            return true;
+        }
+        {
+            std::scoped_lock lock{stats_mutex};
+            stats.last_error = fmt::format("presentation retirement wait returned {}", static_cast<int>(r));
+            stats.device_lost |= r == VK_ERROR_DEVICE_LOST;
+        }
+        if (r != VK_TIMEOUT) {
+            ctx.Fail("presentation retirement wait", r);
+        }
+        return false; // pending remains owned; never reset/destroy on timeout
+    }
+
+    bool WaitSlot(Slot& s, u64 timeout = 2'000'000'000ull) {
+        // AcquireFrame also observes these fences. Retire every reference before a slot's
+        // fence can be reset, under the same host-side lock.
+        std::scoped_lock lock{frames_mutex};
+        if (!WaitFence(s.fence, s.submitted, timeout) ||
+            !WaitFence(s.acquire_fence, s.acquire_pending, timeout) ||
+            !WaitFence(s.present_fence, s.present_pending, timeout)) {
+            return false;
+        }
+        for (auto& fr : frames) {
+            if (fr.state.load(std::memory_order_acquire) == 3 && fr.fence == s.fence) {
+                fr.fence = VK_NULL_HANDLE;
+                fr.state.store(0, std::memory_order_release);
+            }
+        }
+        return true;
+    }
 
     bool CreateSwapchain(std::string& error) {
         const auto& f = Fn();
@@ -239,6 +281,8 @@ struct Presenter::Impl {
         VkSwapchainKHR created = VK_NULL_HANDLE;
         if (const VkResult r = f.vkCreateSwapchainKHR(ctx.Device(), &sci, nullptr, &created); r != VK_SUCCESS) {
             error = fmt::format("vkCreateSwapchainKHR failed ({})", static_cast<int>(r));
+            // oldSwapchain may already be retired even when creation fails.
+            ctx.Fail("vkCreateSwapchainKHR", r);
             return false;
         }
         DestroySwapchainObjects();
@@ -255,7 +299,12 @@ struct Presenter::Impl {
         done.resize(ni);
         for (auto& s : done) {
             const VkSemaphoreCreateInfo ci{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-            f.vkCreateSemaphore(ctx.Device(), &ci, nullptr, &s);
+            const VkResult r = f.vkCreateSemaphore(ctx.Device(), &ci, nullptr, &s);
+            if (r != VK_SUCCESS) {
+                error = fmt::format("swapchain semaphore creation failed ({})", static_cast<int>(r));
+                ctx.Fail("create swapchain semaphore", r);
+                return false;
+            }
         }
         std::scoped_lock lock{stats_mutex};
         stats.window_width = ext.width;
@@ -274,9 +323,14 @@ struct Presenter::Impl {
     }
 
     bool Recreate() {
-        // every presentation's commands done before the images change
+        if (ctx.Failed()) {
+            return false;
+        }
+        // Submission completion alone does not retire presentation-engine references.
         for (auto& s : slots) {
-            Fn().vkWaitForFences(ctx.Device(), 1, &s.fence, VK_TRUE, 2'000'000'000ull);
+            if (!WaitSlot(s)) {
+                return false;
+            }
         }
         std::string error;
         if (!CreateSwapchain(error)) {
@@ -360,10 +414,24 @@ struct Presenter::Impl {
                                              .commandPool = pool,
                                              .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                                              .commandBufferCount = 1};
-        f.vkAllocateCommandBuffers(ctx.Device(), &ai, &cb);
+        VkResult result = f.vkAllocateCommandBuffers(ctx.Device(), &ai, &cb);
+        if (result != VK_SUCCESS) {
+            ctx.Fail("allocate capture commands", result);
+            DestroyBuffer(ctx, buf);
+            return;
+        }
+        const auto discard = [&] {
+            f.vkFreeCommandBuffers(ctx.Device(), pool, 1, &cb);
+            DestroyBuffer(ctx, buf);
+        };
         const VkCommandBufferBeginInfo bi{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-        f.vkBeginCommandBuffer(cb, &bi);
+        result = f.vkBeginCommandBuffer(cb, &bi);
+        if (result != VK_SUCCESS) {
+            ctx.Fail("begin capture commands", result);
+            discard();
+            return;
+        }
         const VkBufferImageCopy region{.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                        .imageExtent = {fr.width, fr.height, 1}};
         Fn().vkCmdCopyImageToBuffer(cb, fr.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf.buffer, 1, &region);
@@ -375,18 +443,43 @@ struct Presenter::Impl {
         const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
                                    .pMemoryBarriers = &mb};
         f.vkCmdPipelineBarrier2(cb, &dep);
-        f.vkEndCommandBuffer(cb);
+        result = f.vkEndCommandBuffer(cb);
+        if (result != VK_SUCCESS) {
+            ctx.Fail("end capture commands", result);
+            discard();
+            return;
+        }
         VkFence fence = VK_NULL_HANDLE;
         const VkFenceCreateInfo fci{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        f.vkCreateFence(ctx.Device(), &fci, nullptr, &fence);
+        result = f.vkCreateFence(ctx.Device(), &fci, nullptr, &fence);
+        if (result != VK_SUCCESS) {
+            ctx.Fail("create capture fence", result);
+            discard();
+            return;
+        }
         const VkCommandBufferSubmitInfo cbi{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
         const VkSubmitInfo2 si{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1,
                                .pCommandBufferInfos = &cbi};
+        VkResult submitted;
         {
             std::scoped_lock lock{ctx.QueueMutex()};
-            f.vkQueueSubmit2(ctx.Queue(), 1, &si, fence);
+            submitted = ctx.Failed() ? ctx.Failure() : f.vkQueueSubmit2(ctx.Queue(), 1, &si, fence);
         }
-        f.vkWaitForFences(ctx.Device(), 1, &fence, VK_TRUE, 5'000'000'000ull);
+        if (submitted != VK_SUCCESS) {
+            ctx.Fail("capture vkQueueSubmit2", submitted);
+            f.vkDestroyFence(ctx.Device(), fence, nullptr);
+            f.vkFreeCommandBuffers(ctx.Device(), pool, 1, &cb);
+            DestroyBuffer(ctx, buf);
+            return;
+        }
+        pending_captures.push_back({buf, cb, fence});
+        bool pending = true;
+        if (!WaitFence(fence, pending, 5'000'000'000ull)) {
+            // Buffer and command objects remain owned, and the frame cannot be recycled.
+            ctx.Fail("capture wait", VK_TIMEOUT);
+            return;
+        }
+        pending_captures.pop_back();
         f.vkDestroyFence(ctx.Device(), fence, nullptr);
         f.vkFreeCommandBuffers(ctx.Device(), pool, 1, &cb);
         std::vector<u8> rgba(u64{fr.width} * fr.height * 4);
@@ -439,6 +532,10 @@ Presenter::Presenter(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 std::unique_ptr<Presenter> Presenter::Create(DeviceContext& ctx, Timeline& timeline, void* sdl_window,
                                              std::string& error) {
     auto impl = std::make_unique<Impl>(ctx, timeline);
+    if (!ctx.Caps().swapchain_maintenance1) {
+        error = "present fences are required (swapchainMaintenance1)";
+        return nullptr;
+    }
     impl->window = static_cast<SDL_Window*>(sdl_window);
     if (impl->window == nullptr) {
         error = "no game window";
@@ -473,17 +570,44 @@ std::unique_ptr<Presenter> Presenter::Create(DeviceContext& ctx, Timeline& timel
     const VkCommandPoolCreateInfo pci{.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
                                       .queueFamilyIndex = ctx.QueueFamily()};
-    Fn().vkCreateCommandPool(ctx.Device(), &pci, nullptr, &impl->pool);
+    VkResult created = Fn().vkCreateCommandPool(ctx.Device(), &pci, nullptr, &impl->pool);
+    if (created != VK_SUCCESS) {
+        error = fmt::format("present command pool creation failed ({})", static_cast<int>(created));
+        Presenter cleanup(std::move(impl));
+        return nullptr;
+    }
     for (auto& s : impl->slots) {
         const VkCommandBufferAllocateInfo ai{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
                                              .commandPool = impl->pool,
                                              .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                                              .commandBufferCount = 1};
-        Fn().vkAllocateCommandBuffers(ctx.Device(), &ai, &s.cb);
+        created = Fn().vkAllocateCommandBuffers(ctx.Device(), &ai, &s.cb);
+        if (created != VK_SUCCESS) {
+            error = fmt::format("present command allocation failed ({})", static_cast<int>(created));
+            Presenter cleanup(std::move(impl));
+            return nullptr;
+        }
         const VkFenceCreateInfo fci{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT};
-        Fn().vkCreateFence(ctx.Device(), &fci, nullptr, &s.fence);
+        created = Fn().vkCreateFence(ctx.Device(), &fci, nullptr, &s.fence);
         const VkSemaphoreCreateInfo semi{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-        Fn().vkCreateSemaphore(ctx.Device(), &semi, nullptr, &s.acquired);
+        if (created == VK_SUCCESS) {
+            created = Fn().vkCreateSemaphore(ctx.Device(), &semi, nullptr, &s.acquired);
+        }
+        if (created != VK_SUCCESS) {
+            error = fmt::format("present slot creation failed ({})", static_cast<int>(created));
+            Presenter cleanup(std::move(impl));
+            return nullptr;
+        }
+        const VkFenceCreateInfo pending_fci{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkResult r = Fn().vkCreateFence(ctx.Device(), &pending_fci, nullptr, &s.acquire_fence);
+        if (r == VK_SUCCESS) {
+            r = Fn().vkCreateFence(ctx.Device(), &pending_fci, nullptr, &s.present_fence);
+        }
+        if (r != VK_SUCCESS) {
+            error = fmt::format("present/acquire fence creation failed ({})", static_cast<int>(r));
+            Presenter cleanup(std::move(impl));
+            return nullptr;
+        }
     }
     if (!impl->CreateSwapchain(error)) {
         Presenter tmp(std::move(impl)); // destroys what was made
@@ -503,9 +627,25 @@ Presenter::~Presenter() {
     if (m.ctx.Device() == VK_NULL_HANDLE) {
         return;
     }
-    {
-        std::scoped_lock lock{m.ctx.QueueMutex()};
-        f.vkQueueWaitIdle(m.ctx.Queue());
+    // No normal-frame WaitIdle. At teardown every actually enqueued present has its
+    // own completion fence; unsent/failed submissions never create an impossible wait.
+    for (auto& s : m.slots) {
+        if (!m.WaitSlot(s, 5'000'000'000ull) && m.ctx.Failure() != VK_ERROR_DEVICE_LOST) {
+            SSPC_LOG(GPU, Critical, "native presenter: retirement failed at shutdown; terminating without "
+                                   "destroying possibly pending Vulkan objects");
+            TerminateProcess(GetCurrentProcess(), 5);
+        }
+    }
+    for (auto& capture : m.pending_captures) {
+        bool pending = true;
+        if (!m.WaitFence(capture.fence, pending, 5'000'000'000ull) &&
+            m.ctx.Failure() != VK_ERROR_DEVICE_LOST) {
+            SSPC_LOG(GPU, Critical, "native presenter: capture did not retire; terminating safely");
+            TerminateProcess(GetCurrentProcess(), 5);
+        }
+        f.vkDestroyFence(m.ctx.Device(), capture.fence, nullptr);
+        f.vkFreeCommandBuffers(m.ctx.Device(), m.pool, 1, &capture.cb);
+        DestroyBuffer(m.ctx, capture.buffer);
     }
     for (auto& fr : m.frames) {
         m.DestroyFrame(fr);
@@ -516,6 +656,12 @@ Presenter::~Presenter() {
     }
     for (auto& s : m.slots) {
         DestroyBuffer(m.ctx, s.overlay);
+        if (s.acquire_fence != VK_NULL_HANDLE) {
+            f.vkDestroyFence(m.ctx.Device(), s.acquire_fence, nullptr);
+        }
+        if (s.present_fence != VK_NULL_HANDLE) {
+            f.vkDestroyFence(m.ctx.Device(), s.present_fence, nullptr);
+        }
         if (s.fence != VK_NULL_HANDLE) {
             f.vkDestroyFence(m.ctx.Device(), s.fence, nullptr);
         }
@@ -533,6 +679,9 @@ Presenter::~Presenter() {
 
 s32 Presenter::AcquireFrame(u32 timeout_ms) {
     Impl& m = *impl_;
+    if (m.ctx.Failed()) {
+        return -1;
+    }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     for (;;) {
         {
@@ -540,10 +689,16 @@ s32 Presenter::AcquireFrame(u32 timeout_ms) {
             for (u32 i = 0; i < kFrames; ++i) {
                 auto& fr = m.frames[i];
                 u32 st = fr.state.load(std::memory_order_acquire);
-                if (st == 3 && fr.fence != VK_NULL_HANDLE &&
-                    Fn().vkWaitForFences(m.ctx.Device(), 1, &fr.fence, VK_TRUE, 0) == VK_SUCCESS) {
-                    fr.state.store(0, std::memory_order_release);
-                    st = 0;
+                if (st == 3 && fr.fence != VK_NULL_HANDLE) {
+                    const VkResult r = Fn().vkWaitForFences(m.ctx.Device(), 1, &fr.fence, VK_TRUE, 0);
+                    if (r == VK_SUCCESS) {
+                        fr.fence = VK_NULL_HANDLE;
+                        fr.state.store(0, std::memory_order_release);
+                        st = 0;
+                    } else if (r != VK_TIMEOUT) {
+                        m.ctx.Fail("acquire frame fence", r);
+                        return -1;
+                    }
                 }
                 if (st == 0) {
                     fr.state.store(1, std::memory_order_release);
@@ -626,6 +781,9 @@ void Presenter::Present(s32 frame, u64 flip_id) {
             fr->state.store(0, std::memory_order_release);
         }
     };
+    if (m.ctx.Failed()) {
+        return;
+    }
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(m.window, &w, &h);
     if (w <= 0 || h <= 0 || (SDL_GetWindowFlags(m.window) & SDL_WINDOW_MINIMIZED)) {
@@ -645,13 +803,21 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     m.slot = (m.slot + 1) % m.slots.size();
     {
         const StallTrace::Scope trace_fence(StallTrace::Ev::PresentFence);
-        f.vkWaitForFences(m.ctx.Device(), 1, &s.fence, VK_TRUE, 2'000'000'000ull);
+        if (!m.WaitSlot(s)) {
+            release();
+            return;
+        }
     }
     u32 index = 0;
     VkResult r;
     {
         const StallTrace::Scope trace_acquire(StallTrace::Ev::PresentAcquire);
-        r = f.vkAcquireNextImageKHR(m.ctx.Device(), m.swapchain, 100'000'000ull, s.acquired, VK_NULL_HANDLE, &index);
+        r = f.vkResetFences(m.ctx.Device(), 1, &s.acquire_fence);
+        if (r != VK_SUCCESS) {
+            m.ctx.Fail("reset acquire fence", r);
+            return;
+        }
+        r = f.vkAcquireNextImageKHR(m.ctx.Device(), m.swapchain, 100'000'000ull, s.acquired, s.acquire_fence, &index);
     }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         m.Recreate();
@@ -661,18 +827,33 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         std::scoped_lock lock{m.stats_mutex};
         ++m.stats.acquire_failures;
-        if (r == VK_ERROR_DEVICE_LOST) {
-            m.stats.device_lost = true;
-            m.stats.last_error = "VK_ERROR_DEVICE_LOST at acquire";
+        if (r != VK_TIMEOUT && r != VK_NOT_READY) {
+            m.stats.device_lost |= r == VK_ERROR_DEVICE_LOST;
+            m.stats.last_error = fmt::format("acquire failed ({})", static_cast<int>(r));
+            m.ctx.Fail("vkAcquireNextImageKHR", r);
         }
         release();
         return;
     }
-    f.vkResetFences(m.ctx.Device(), 1, &s.fence);
-    f.vkResetCommandBuffer(s.cb, 0);
+    s.acquire_pending = true;
+    r = f.vkResetFences(m.ctx.Device(), 1, &s.fence);
+    if (r == VK_SUCCESS) {
+        r = f.vkResetFences(m.ctx.Device(), 1, &s.present_fence);
+    }
+    if (r == VK_SUCCESS) {
+        r = f.vkResetCommandBuffer(s.cb, 0);
+    }
+    if (r != VK_SUCCESS) {
+        m.ctx.Fail("reset presentation slot", r);
+        return;
+    }
     const VkCommandBufferBeginInfo bi{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    f.vkBeginCommandBuffer(s.cb, &bi);
+    r = f.vkBeginCommandBuffer(s.cb, &bi);
+    if (r != VK_SUCCESS) {
+        m.ctx.Fail("begin presentation commands", r);
+        return;
+    }
     const VkImage swap = m.images[index];
     VkImageMemoryBarrier2 b{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
                             .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
@@ -772,7 +953,11 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     f.vkCmdPipelineBarrier2(s.cb, &dep);
-    f.vkEndCommandBuffer(s.cb);
+    r = f.vkEndCommandBuffer(s.cb);
+    if (r != VK_SUCCESS) {
+        m.ctx.Fail("end presentation commands", r);
+        return;
+    }
 
     const VkSemaphoreSubmitInfo waits[1] = {
         {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = s.acquired,
@@ -799,28 +984,35 @@ void Presenter::Present(s32 frame, u64 flip_id) {
             }
         }
         const StallTrace::Scope trace_submit(StallTrace::Ev::PresentSubmit, flip_id);
-        r = f.vkQueueSubmit2(m.ctx.Queue(), 1, &si, s.fence);
+        r = m.ctx.Failed() ? m.ctx.Failure() : f.vkQueueSubmit2(m.ctx.Queue(), 1, &si, s.fence);
         if (r == VK_SUCCESS) {
+            s.submitted = true;
+            const VkSwapchainPresentFenceInfoEXT pf{
+                .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT,
+                .swapchainCount = 1, .pFences = &s.present_fence};
             const VkPresentInfoKHR pi{.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                                      .pNext = &pf,
                                       .waitSemaphoreCount = 1,
                                       .pWaitSemaphores = &m.done[index],
                                       .swapchainCount = 1,
                                       .pSwapchains = &m.swapchain,
                                       .pImageIndices = &index};
             pr = f.vkQueuePresentKHR(m.ctx.Queue(), &pi);
+            // WSI errors below still enqueue semaphore waits and the present fence.
+            s.present_pending = pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR ||
+                                pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_ERROR_SURFACE_LOST_KHR ||
+                                pr == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT;
         }
     }
     if (r != VK_SUCCESS) {
         std::scoped_lock lock{m.stats_mutex};
         m.stats.last_error = fmt::format("present submission failed ({})", static_cast<int>(r));
         m.stats.device_lost |= r == VK_ERROR_DEVICE_LOST;
+        m.ctx.Fail("presentation vkQueueSubmit2", r);
         release();
         return;
     }
-    if (fr != nullptr) {
-        fr->fence = s.fence;
-        fr->state.store(show ? 3 : 0, std::memory_order_release);
-    }
+    // Keep the source frame owned until a requested capture has finished too.
     {
         std::scoped_lock lock{m.stats_mutex};
         ++m.stats.presented;
@@ -828,10 +1020,11 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
         m.Recreate();
-    } else if (pr == VK_ERROR_DEVICE_LOST) {
+    } else if (pr != VK_SUCCESS) {
         std::scoped_lock lock{m.stats_mutex};
-        m.stats.device_lost = true;
-        m.stats.last_error = "VK_ERROR_DEVICE_LOST at present";
+        m.stats.device_lost |= pr == VK_ERROR_DEVICE_LOST;
+        m.stats.last_error = fmt::format("vkQueuePresentKHR failed ({})", static_cast<int>(pr));
+        m.ctx.Fail("vkQueuePresentKHR", pr);
     }
     std::filesystem::path capture;
     {
@@ -842,8 +1035,13 @@ void Presenter::Present(s32 frame, u64 flip_id) {
             m.captures.pop_front();
         }
     }
-    if (!capture.empty() && fr != nullptr) {
+    if (!capture.empty() && fr != nullptr && !m.ctx.Failed()) {
         m.Capture(*fr, capture);
+    }
+    if (fr != nullptr && !m.ctx.Failed()) {
+        std::scoped_lock lock{m.frames_mutex};
+        fr->fence = s.fence;
+        fr->state.store(show ? 3 : 0, std::memory_order_release);
     }
 }
 
@@ -851,6 +1049,8 @@ void Presenter::RequestCapture(u64 flip_id, const std::filesystem::path& png) {
     std::scoped_lock lock{impl_->capture_mutex};
     impl_->captures.emplace_back(flip_id, png);
 }
+
+bool Presenter::TestRecreate() { return impl_->Recreate(); }
 
 Presenter::Stats Presenter::GetStats() {
     std::scoped_lock lock{impl_->stats_mutex};

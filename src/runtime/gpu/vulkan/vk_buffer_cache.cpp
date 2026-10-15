@@ -51,10 +51,16 @@ BufferCache::BufferCache(DeviceContext& ctx, GuestBuffers& guest, PageTracker* t
         SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_BIND_HOST_WAIT=1 - sparse binds complete on the host, "
                                "batches do not wait for them on the queue");
     }
-    if (char bu[4] = {}; GetEnvironmentVariableA("SSPC_P49_BLOCK_UPLOAD", bu, sizeof(bu)) == 1 && bu[0] == '1') {
+    // P4.9-B block upload: on by default since 2026-10-14 (docs\SMOKE_QUALITY.md: the village's compute queue
+    // 9.2 -> 3.0 ms GPU, Validation + Sync Validation 0); SSPC_P49_BLOCK_UPLOAD=0 - one upload per binding's pages
+    if (char bu[4] = {}; GetEnvironmentVariableA("SSPC_P49_BLOCK_UPLOAD", bu, sizeof(bu)) == 1 && bu[0] == '0') {
+        block_upload_ = false;
+        SSPC_LOG(GPU, Warning, "SSPC_P49_BLOCK_UPLOAD=0 - block upload off: only a binding's own missing pages are "
+                               "uploaded (the P4.8 behaviour)");
+    } else {
         block_upload_ = true;
-        SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_P49_BLOCK_UPLOAD=1 - a block's first missing page brings its other used, "
-                               "invalid pages along (one upload a block)");
+        SSPC_LOG(GPU, Info, "native backend: block upload on - a block's first missing page brings its other used, "
+                            "invalid pages along (one upload a block; SSPC_P49_BLOCK_UPLOAD=0: off)");
     }
     if (!ctx_.Caps().sparse_buffer) {
         stats_.first_error = "no sparse buffers (sparseBinding/sparseResidencyBuffer, a sparse binding queue)";

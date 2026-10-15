@@ -37,6 +37,8 @@
 // stops its GPU thread and not from that thread (a submission may be waiting for the GPU thread inside the host).
 #include <windows.h>
 
+#include <intrin.h>
+
 #include "runtime/gpu/gnm/gnm_driver.h"
 
 #include <algorithm>
@@ -49,6 +51,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -203,6 +206,22 @@ bool g_send_init_packet = true; ///< under g_submit_mutex
 std::mutex g_idle_mutex;
 std::condition_variable g_idle_cv;
 bool g_submission_locked = false; ///< under g_idle_mutex
+
+// P5.4 early frame submission (SetEarlyFrameSource)
+constexpr u32 kMaxEarlyDcbs = 512;            ///< SubmitFrame's list (its stack arrays hold 512)
+std::atomic<EarlyFrameSource> g_early_source{nullptr};
+std::atomic<bool> g_early_installed{false};   ///< a source was ever installed (the flip call looks for its frame)
+/// The frame sceGnmSubmitDone handed on, until the game's sceGnmSubmitAndFlipCommandBuffers of it (under g_submit_mutex).
+struct EarlySubmitted {
+    bool pending = false;
+    s32 result = 0;
+    u32 count = 0;
+    u32 vo_handle = 0, buffer_index = 0, flip_mode = 0;
+    s64 flip_arg = 0;
+    std::array<const u32*, kMaxEarlyDcbs> dcbs{};
+    std::array<u32, kMaxEarlyDcbs> sizes{};
+};
+EarlySubmitted g_early; ///< under g_submit_mutex
 
 /// Compute queue slots as the bridge's slot vector hands them out: vqid = slot + 1, the most recently freed first.
 std::vector<u32> InitialFreeSlots() {
@@ -587,6 +606,87 @@ u64 LastSubmitTsc() {
 
 namespace {
 
+/// P5.4 (SetEarlyFrameSource): whether the caller of sceGnmSubmitDone is the engine's SubmitFrame with a frame to flip
+/// that passes the checks of sceGnmSubmitAndFlipCommandBuffers. Reads only (the caller's stack frame): no side effect.
+bool AcceptEarlyFrame(EarlyFrameSource source, const u64* return_slot, EarlyFrame& f) {
+    constexpr const char* kName = "sceGnmSubmitDone (early frame)";
+    if (!source(return_slot, f)) {
+        return false;
+    }
+    if (f.count == 0 || f.count > kMaxEarlyDcbs || f.dcbs == nullptr || f.dcb_sizes == nullptr) {
+        SSPC_LOG(GPU, Error, "{}: {} DCBs (1..{} expected): left to the game's own call", kName, f.count,
+                 kMaxEarlyDcbs);
+        return false;
+    }
+    return CheckSizes(kName, f.count, f.dcb_sizes, nullptr) == kOk &&
+           CheckSupported(kName, f.count, f.dcbs, nullptr) == kOk;
+}
+
+/// P5.4: the accepted frame handed on as sceGnmSubmitAndFlipCommandBuffers hands it on (under g_submit_mutex, after
+/// host.SubmitDone()) and kept for the game's own call. A refused flip request writes nothing into the DCB: then nothing
+/// is kept and the game's own call asks again.
+void SubmitEarlyFrame(Host& host, const EarlyFrame& f) {
+    if (g_early.pending) {
+        SSPC_LOG(GPU, Error, "sceGnmSubmitDone (early frame): the frame handed on before ({} DCBs, last {:#x}) got no "
+                 "sceGnmSubmitAndFlipCommandBuffers", g_early.count,
+                 reinterpret_cast<u64>(g_early.dcbs[g_early.count - 1]));
+        g_early.pending = false;
+    }
+    const StallTrace::Scope trace(StallTrace::Ev::GameEarlySubmit, f.count, f.buffer_index);
+    FrameLog::GameFlipEnter();
+    if (PatchFlipRequest(host, f.dcbs[f.count - 1], f.dcb_sizes[f.count - 1] / 4, f.vo_handle, f.buffer_index,
+                         f.flip_mode, f.flip_arg) != kOk) {
+        return;
+    }
+    if (FramePacing::Enabled()) [[unlikely]] { // (the pair the game's own call marks, past the flip request)
+        FramePacing::Mark(FramePacing::Event::SubmitEnter);
+        FramePacing::Mark(FramePacing::Event::SubmitUnblocked);
+    }
+    const s32 submitted = PerformSubmit(host, f.count, f.dcbs, f.dcb_sizes);
+    FrameLog::GameFlip();
+    Inspector::FlipThread();
+    g_last_submit_tsc.store(__rdtsc(), std::memory_order_release);
+    if (FramePacing::Enabled()) [[unlikely]] {
+        FramePacing::Mark(FramePacing::Event::Submitted);
+    }
+    g_early.pending = true;
+    g_early.result = submitted;
+    g_early.count = f.count;
+    g_early.vo_handle = f.vo_handle;
+    g_early.buffer_index = f.buffer_index;
+    g_early.flip_mode = f.flip_mode;
+    g_early.flip_arg = f.flip_arg;
+    for (u32 i = 0; i < f.count; ++i) {
+        g_early.dcbs[i] = f.dcbs[i];
+        g_early.sizes[i] = f.dcb_sizes[i];
+    }
+}
+
+/// P5.4: the result of the frame sceGnmSubmitDone handed on, for the game's sceGnmSubmitAndFlipCommandBuffers of it
+/// (the same count and last DCB - the one its flip marker was patched in). nullopt for any other call: it is handed on
+/// as before and the pending frame stays. The same frame with other arguments returns the result too (its DCBs and its
+/// flip went already; a second patch would find no marker): logged, and the early submission is turned off.
+std::optional<s32> TakeEarlyFrame(u32 count, u32* const* dcbs, const u32* dcb_sizes, u32 vo_handle, u32 buffer_index,
+                                  u32 flip_mode, s64 flip_arg) {
+    std::scoped_lock lk{g_submit_mutex};
+    if (!g_early.pending || count != g_early.count || dcbs[count - 1] != g_early.dcbs[count - 1]) {
+        return std::nullopt;
+    }
+    g_early.pending = false;
+    bool same = vo_handle == g_early.vo_handle && buffer_index == g_early.buffer_index &&
+                flip_mode == g_early.flip_mode && flip_arg == g_early.flip_arg;
+    for (u32 i = 0; same && i < count; ++i) {
+        same = dcbs[i] == g_early.dcbs[i] && dcb_sizes[i] == g_early.sizes[i];
+    }
+    if (!same) {
+        g_early_source.store(nullptr, std::memory_order_release);
+        SSPC_LOG(GPU, Error, "sceGnmSubmitAndFlipCommandBuffers: {} DCBs, buffer {} - the frame handed on at "
+                 "sceGnmSubmitDone was taken with buffer {} (or other DCBs): that submission stands; early frame "
+                 "submission off", count, buffer_index, g_early.buffer_index);
+    }
+    return g_early.result;
+}
+
 SSPC_SYSV_ABI s32 SubmitAndFlipCommandBuffersForWorkload(u32 /*workload*/, u32 count, u32* dcbs[], u32* dcb_sizes,
                                                          u32* ccbs[], u32* ccb_sizes, u32 vo_handle, u32 buffer_index,
                                                          u32 flip_mode, s64 flip_arg) {
@@ -614,6 +714,15 @@ SSPC_SYSV_ABI s32 SubmitAndFlipCommandBuffersForWorkload(u32 /*workload*/, u32 c
     }
     if (const s32 r = CheckSupported(kName, count, dcbs, ccb_sizes); r != kOk) {
         return r;
+    }
+    if (g_early_installed.load(std::memory_order_acquire)) { // (P5.4: the frame may be in already)
+        const u64 t0 = StallTrace::Now();
+        if (const std::optional<s32> early =
+                TakeEarlyFrame(count, dcbs, dcb_sizes, vo_handle, buffer_index, flip_mode, flip_arg)) {
+            StallTrace::RegisterThread(StallTrace::Role::Game);
+            StallTrace::Span(StallTrace::Ev::GameSubmitFlip, t0, StallTrace::Now());
+            return *early;
+        }
     }
     u32* const flip_dcb = dcbs[count - 1];
     const u32 flip_dcb_dwords = dcb_sizes[count - 1] / 4;
@@ -691,23 +800,35 @@ SSPC_SYSV_ABI s32 SubmitAndFlipCommandBuffers(u32 count, u32* dcbs[], u32* dcb_s
 }
 
 SSPC_SYSV_ABI s32 SubmitDone() {
+    // (P5.4 SetEarlyFrameSource: the caller's frame is read through the slot of the return address into it)
+    const u64* const return_slot = static_cast<const u64*>(_AddressOfReturnAddress());
     if (FramePacing::Enabled()) [[unlikely]] {
         FramePacing::Mark(FramePacing::Event::SubmitDone);
     }
     const u64 enter_tsc = __rdtsc();
+    StallTrace::RegisterThread(StallTrace::Role::Game);
+    const StallTrace::Scope trace_done(StallTrace::Ev::GameSubmitDone); // (P5.4: entry to return)
     std::scoped_lock lk{g_submit_mutex};
     WaitGpuIdle();
     Host* const host = CurrentHost("sceGnmSubmitDone");
     if (host == nullptr) {
         return kErrSubmitInvalidArgument;
     }
-    if (!host->IsGpuIdle()) {
+    // (P5.4: a frame handed on here takes no submission lock - the engine waits for the previous frame's label itself;
+    // any other caller, or a frame the source declines, takes it as before)
+    const EarlyFrameSource early = g_early_source.load(std::memory_order_acquire);
+    EarlyFrame frame;
+    const bool accepted = early != nullptr && AcceptEarlyFrame(early, return_slot, frame);
+    if (!accepted && !host->IsGpuIdle()) {
         std::scoped_lock il{g_idle_mutex};
         g_submission_locked = true; // until Interrupt::GpuIdle, which follows host->SubmitDone()
     }
     host->SubmitDone();
     g_send_init_packet = true;
     FrameLog::GameSubmitDone(enter_tsc, __rdtsc());
+    if (accepted) {
+        SubmitEarlyFrame(*host, frame);
+    }
     return kOk;
 }
 
@@ -715,6 +836,8 @@ SSPC_SYSV_ABI void DingDong(u32 vqid, u32 next_offset_dw) {
     if (vqid == 0) {
         return;
     }
+    StallTrace::RegisterThread(StallTrace::Role::Game);
+    StallTrace::Instant(StallTrace::Ev::GameDingDong, vqid, next_offset_dw); // (P5.4: the game's compute submission)
     std::scoped_lock lk{g_submit_mutex};
     WaitGpuIdle();
     if (Host* const host = CurrentHost("sceGnmDingDong")) {
@@ -1825,6 +1948,13 @@ void SetSdkVersion(s32 version) {
     g_sdk_version.store(version, std::memory_order_relaxed);
 }
 
+void SetEarlyFrameSource(EarlyFrameSource source) {
+    g_early_source.store(source, std::memory_order_release);
+    if (source != nullptr) {
+        g_early_installed.store(true, std::memory_order_release);
+    }
+}
+
 std::span<const Runtime::Export> GnmExports() {
     return kExports;
 }
@@ -1835,7 +1965,10 @@ void Reset() {
     {
         std::scoped_lock lk{g_submit_mutex};
         g_send_init_packet = true;
+        g_early.pending = false;
     }
+    g_early_source.store(nullptr, std::memory_order_release);
+    g_early_installed.store(false, std::memory_order_release);
     ReleaseSubmissionLock();
     {
         std::scoped_lock lk{g_queue_mutex};

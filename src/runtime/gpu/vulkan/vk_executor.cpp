@@ -208,14 +208,18 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
                                "every time (the P4.8 behaviour)");
     }
     char prof[4] = {};
-    prof_ = GetEnvironmentVariableA("SSPC_GPU_PROFILE", prof, sizeof(prof)) == 1 && prof[0] == '1' &&
+    prof_ = GetEnvironmentVariableA("SSPC_GPU_PROFILE", prof, sizeof(prof)) == 1 && (prof[0] == '1' || prof[0] == 'q') &&
             ctx_.Caps().timestamp_period > 0.0f;
+    prof_queues_ = prof_ && prof[0] == 'q';
     if (prof_) {
         const VkQueryPoolCreateInfo pi{.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
                                        .queryType = VK_QUERY_TYPE_TIMESTAMP,
                                        .queryCount = kProfBatches * kProfPerBatch};
         if (Fn().vkCreateQueryPool(ctx_.Device(), &pi, nullptr, &prof_pool_) != VK_SUCCESS) {
-            prof_ = false;
+            prof_ = prof_queues_ = false;
+        } else if (prof_queues_) {
+            SSPC_LOG(GPU, Warning, "SSPC_GPU_PROFILE=q: GPU time per guest queue (a timestamp where the commands' queue "
+                                   "changes and at a batch's end)");
         } else {
             SSPC_LOG(GPU, Warning, "SSPC_GPU_PROFILE=1: GPU time per command (a timestamp after every command; slower)");
         }
@@ -293,6 +297,9 @@ Executor::~Executor() {
     for (auto& b : free_) {
         destroy(b);
     }
+    for (auto& b : abandoned_) {
+        destroy(b);
+    }
 }
 
 void Executor::SetQueuePipe(u32 queue, u32 pipe) {
@@ -315,8 +322,10 @@ void Executor::Skipped(Skip why, const std::string& detail) {
     }
 }
 
+bool Executor::Failed() const { return ctx_.Failed(); }
+
 bool Executor::Begin() {
-    if (device_lost_) {
+    if (Failed()) {
         return false; // nothing more reaches the GPU
     }
     if (open_) {
@@ -434,6 +443,9 @@ void Executor::Note(u32 queue, u64 seq) {
         cur_.queues.push_back(queue);
     }
     cur_.work[queue] = std::max(cur_.work[queue], seq);
+    if (prof_queues_ && queue != prof_queue_) {
+        ProfQueue(queue); // (before the command's barriers and uploads: they count to its queue)
+    }
 }
 
 void Executor::EndRendering() {
@@ -627,9 +639,9 @@ void Executor::Flush() {
         return;
     }
     const auto& f = Fn();
-    if (device_lost_) { // recorded before the loss was seen: discarded
+    if (Failed()) { // never publish completion or recycle an unsubmitted batch
         f.vkEndCommandBuffer(cur_.cb);
-        free_.push_back(std::move(cur_));
+        abandoned_.push_back(std::move(cur_));
         cur_ = Batch{};
         open_ = false;
         commands_ = 0;
@@ -641,7 +653,9 @@ void Executor::Flush() {
         Label(kLabelOther | 5, "W batch end: write-backs, host barrier");
     }
     // the GPU's writes of guest buffers (video memory) copied back to the host before the batch's fences
-    if (prof_) {
+    if (prof_queues_) {
+        ProfQueue(prof_queue_);
+    } else if (prof_) {
         ProfMark(3, "before a command: its barriers, uploads, render pass changes");
     }
     InspMark(Inspector::kGpuTransfer);
@@ -753,7 +767,7 @@ void Executor::Flush() {
                                .pCommandBufferInfos = cbis,
                                .signalSemaphoreInfoCount = 1,
                                .pSignalSemaphoreInfos = &signal};
-        r = f.vkQueueSubmit2(ctx_.Queue(), 1, &si, VK_NULL_HANDLE);
+        r = ctx_.Failed() ? ctx_.Failure() : f.vkQueueSubmit2(ctx_.Queue(), 1, &si, VK_NULL_HANDLE);
     }
     const u64 submit_t1 = GS::Ticks();
     stats_.submit_ns += GS::TicksToNs(submit_t1 - submit_t0);
@@ -765,20 +779,23 @@ void Executor::Flush() {
         }
         StallTrace::Span(StallTrace::Ev::Submit, locked_t, submit_t1, cur_.value, static_cast<u32>(commands_));
     }
-    if (diag_ != nullptr) {
-        diag_->Submitted(cur_.value, batch_first_cmd_, batch_last_cmd_);
-    }
-    if (r == VK_ERROR_DEVICE_LOST) {
+    if (r != VK_SUCCESS) {
         const u64 value = cur_.value;
-        in_flight_.push_back(std::move(cur_));
+        SSPC_LOG(GPU, Error, "native backend: vkQueueSubmit2 failed (VkResult {}, value {}, in-flight {}); "
+                            "batch quarantined, no completion will be published",
+                 static_cast<int>(r), value, in_flight_.size());
+        ctx_.Fail("vkQueueSubmit2", r);
+        abandoned_.push_back(std::move(cur_));
         cur_ = Batch{};
         open_ = false;
         commands_ = 0;
-        OnDeviceLost("vkQueueSubmit2", value);
+        if (r == VK_ERROR_DEVICE_LOST) {
+            OnDeviceLost("vkQueueSubmit2", value);
+        }
         return;
     }
-    if (r != VK_SUCCESS) {
-        SSPC_LOG(GPU, Error, "native backend: vkQueueSubmit2 failed ({})", static_cast<int>(r));
+    if (diag_ != nullptr) {
+        diag_->Submitted(cur_.value, batch_first_cmd_, batch_last_cmd_);
     }
     in_flight_.push_back(std::move(cur_));
     cur_ = Batch{};
@@ -787,9 +804,15 @@ void Executor::Flush() {
 }
 
 void Executor::Poll() {
+    if (Failed()) {
+        return;
+    }
     const u64 completed = timeline_.Completed();
     if (timeline_.Lost()) {
         OnDeviceLost("vkGetSemaphoreCounterValue", completed + 1);
+        return;
+    }
+    if (Failed()) {
         return;
     }
     FrameLog::GpuCompleted(completed);
@@ -936,6 +959,7 @@ void Executor::OnDeviceLost(const char* where, u64 value) {
         return;
     }
     device_lost_ = true;
+    ctx_.Fail(where, VK_ERROR_DEVICE_LOST);
     std::string in_flight;
     for (const auto& b : in_flight_) {
         in_flight += fmt::format("  value {}: queues", b.value);
@@ -1031,12 +1055,22 @@ void Executor::ProfMark(u64 key, const std::string& label) {
     if (!prof_ || !open_ || cur_.prof_base == ~0u || cur_.prof_count >= kProfPerBatch) {
         return;
     }
+    if (prof_queues_ && (key >> 32) != kProfQueueTag && key != 5) {
+        return; // (=q: the queue marks and the batch end's write-backs only)
+    }
     Fn().vkCmdWriteTimestamp2(cur_.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_pool_, cur_.prof_base + cur_.prof_count);
     ++cur_.prof_count;
     cur_.prof_keys.push_back(key);
     if (auto& acc = prof_acc_[key]; acc.label.empty()) {
         acc.label = label;
     }
+}
+
+void Executor::ProfQueue(u32 next) {
+    const u32 q = prof_queue_;
+    prof_queue_ = next;
+    ProfMark((kProfQueueTag << 32) | q,
+             fmt::format("queue {} runs: its commands with their barriers, uploads, shadows", q));
 }
 
 void Executor::ProfCollect(Batch& b) {
@@ -1287,7 +1321,8 @@ void Executor::ProfReport() {
         double ns[3] = {}, ns_1x1 = 0;
         u64 n[3] = {}, n_1x1 = 0;
         for (const auto& [k, a] : prof_acc_) {
-            const bool other = (k < 8 && (k & 3) != 1) || (k >> 32) == 0xD1A6; // ProfMark's 2..5 and the DIAG keys
+            const bool other = (k < 8 && (k & 3) != 1) || (k >> 32) == 0xD1A6 || // ProfMark's 2..5, the DIAG keys,
+                               (k >> 32) == kProfQueueTag;                        // the queue runs (=q)
             const u32 kind = other ? 2 : (k & 3) == 0 ? 0 : (k & 3) == 1 ? 1 : 2;
             ns[kind] += static_cast<double>(a.ns);
             n[kind] += a.count;
@@ -1841,7 +1876,7 @@ void Executor::BeforeUpload() {
 }
 
 bool Executor::WaitOldest(u64 timeout_ns) {
-    if (in_flight_.empty() || device_lost_) {
+    if (in_flight_.empty() || Failed()) {
         return false;
     }
     const bool done = timeline_.Wait(in_flight_.front().value, timeout_ns);
@@ -1860,7 +1895,7 @@ void Executor::SyncFrom(u32 source) {
     // the CPU side of a packet must land after the GPU work before it: complete everything handed on so far
     ++stats_.syncs;
     GuestMemoryChanged(); // (P4.7: write-backs land in the host's memory)
-    if (device_lost_) {
+    if (Failed()) {
         return;
     }
     if (!open_ && in_flight_.empty()) {
@@ -1876,7 +1911,7 @@ void Executor::SyncFrom(u32 source) {
     const StallTrace::Scope trace_sync(StallTrace::Ev::GpuSync, in_flight_.empty() ? 0 : in_flight_.back().value, 0,
                                        static_cast<u16>(source));
     // until done (a CPU access follows): a timeout without a lost device waits on (review MEDIUM 6)
-    for (u32 round = 0; !in_flight_.empty() && !timeline_.Wait(in_flight_.back().value, 5'000'000'000ull); ++round) {
+    for (u32 round = 0; !Failed() && !in_flight_.empty() && !timeline_.Wait(in_flight_.back().value, 5'000'000'000ull); ++round) {
         if (timeline_.Lost()) {
             OnDeviceLost("vkWaitSemaphores (Synchronize)", in_flight_.back().value);
             break;
@@ -2078,7 +2113,7 @@ bool Executor::PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bin
 bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                          std::vector<VkWriteDescriptorSet>& writes, std::vector<VkDescriptorBufferInfo>& buffers,
                          std::vector<VkDescriptorImageInfo>& image_infos, std::vector<CachedImage*>& bound,
-                         bool& writes_memory, const std::vector<CachedImage*>& targets) {
+                         bool& writes_memory, const std::vector<CachedImage*>& targets, const u32* user_data) {
     const auto& s = *static_cast<const GS::StageView*>(stage_view);
     const GS::ResourceBindingPlan& plan = s.plan;
     const GS::ShaderReflection& refl = s.module->result.reflection;
@@ -2122,6 +2157,11 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                 return false;
             }
             std::memcpy(sl.data, plan.flat.data(), bytes);
+            if (s.native_shared && user_data != nullptr) {
+                // P5.3: the registers part of the flattened user data is this draw's (the snapshot pointers differ
+                // from those of the draw that made the shared preparation; everything past them is the same)
+                std::memcpy(sl.data, user_data, std::min<u64>(bytes, 16 * 4));
+            }
             info = {sl.buffer, sl.offset, bytes};
             break;
         }
@@ -2899,10 +2939,12 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     bool writes_memory = false;
     info_images_.clear();
     const u64 tb0 = GS::FineTicks();
-    if (has_ps && !BindStage(&ps, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets)) {
+    if (has_ps && !BindStage(&ps, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
+                             d.user_data[static_cast<size_t>(Cp::Stage::Ps)].data())) {
         return;
     }
-    if (!BindStage(&vs, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets)) {
+    if (!BindStage(&vs, false, push, writes, buf_infos, img_infos, bound, writes_memory, targets,
+                   d.user_data[static_cast<size_t>(Cp::Stage::Vs)].data())) {
         return;
     }
     stats_.t_bind += GS::FineTicks() - tb0;
@@ -4308,6 +4350,7 @@ void Executor::CaptureImageAt() {
         if (GetEnvironmentVariableA("SSPC_DIAG_CAPTURE_IMAGE", s, sizeof(s)) > 0) {
             for (char* p = s; *p != 0;) {
                 Want w{std::strtoull(p, &p, 16), 0};
+                u64 flips = 1;
                 if (*p == ':') {
                     w.flip = std::strtoull(p + 1, &p, 10);
                 }
@@ -4328,26 +4371,10 @@ void Executor::CaptureImageAt() {
     if (wants.empty() || !Begin()) {
         return;
     }
-                u64 flips = 1;
     const u64 id = VideoOut::NextFlipId();
     for (const Want& w : wants) {
         if (w.flip == id) {
             CaptureTargets(&w.addr, 1, -1, 0, 0);
-        }
-        CachedImage* img = images_.FindTargetAt(w.addr);
-        if (img == nullptr) {
-            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: no GPU-written image at {:#x} at flip {}", w.addr, id);
-            continue;
-        }
-        images_.Touch(*img, cur_.value);
-        EndRendering();
-        if (pending_writes_) {
-            GlobalBarrier();
-        }
-        images_.Transition(cur_.cb, *img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                           VK_ACCESS_2_TRANSFER_READ_BIT);
-        if (!readback_) {
-            readback_ = std::make_unique<ImageReadback>(ctx_);
         }
     }
 }
@@ -4367,10 +4394,29 @@ void Executor::CaptureTargets(const u64* addresses, u32 count, s32 pass, u32 nat
         const struct {
             u64 addr;
         } w{addresses[k]};
+        CachedImage* img = images_.FindTargetAt(w.addr);
+        if (img == nullptr) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: no GPU-written image at {:#x} at flip {}", w.addr, id);
+            continue;
+        }
+        images_.Touch(*img, cur_.value);
+        EndRendering();
+        if (pending_writes_) {
+            GlobalBarrier();
+        }
+        images_.Transition(cur_.cb, *img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                           VK_ACCESS_2_TRANSFER_READ_BIT);
+        if (!readback_) {
+            readback_ = std::make_unique<ImageReadback>(ctx_);
+        }
         const bool depth = img->layout.props.is_depth;
         const VkFormat fmt = depth ? VK_FORMAT_D32_SFLOAT : img->format;
         const u32 texel = depth ? 4u : std::max<u32>(img->layout.num_bits / 8, 1);
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
         for (u32 layer = 0; layer < std::min<u32>(std::max<u32>(img->layout.layers, 1), 8); ++layer) {
+            const std::string stem = pass < 0 ? fmt::format("image_{:x}_{}_l{}", w.addr, id, layer)
+                                              : fmt::format("p{}_{:x}_{}_l{}", pass, w.addr, id, layer);
             readback_->Record(cur_.cb, cur_.value, img->image, fmt, depth ? VK_IMAGE_ASPECT_DEPTH_BIT : img->aspect,
                               layer, img->layout.size.width, img->layout.size.height, texel, dir / stem, true);
         }
@@ -4395,11 +4441,7 @@ void Executor::CaptureTargets(const u64* addresses, u32 count, s32 pass, u32 nat
 void Executor::DiagCaptureDraw(u32 pipeline, const std::array<CachedImage*, 8>& color_img, bool after) {
     // SSPC_DIAG_CAPTURE_DRAW=<hex address>:<first flip>:<count>:<pipeline>: in each of those flips, the render target at
     // that address before and after the first draw of that pipeline, downsampled 4x -> logs\p45\draw\<before|after>_
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
     // <flip> (P4.5: what one draw adds, frame after frame - the smoke's own flicker against its background's)
-            const std::string stem = pass < 0 ? fmt::format("image_{:x}_{}_l{}", w.addr, id, layer)
-                                              : fmt::format("p{}_{:x}_{}_l{}", pass, w.addr, id, layer);
     struct Range {
         u64 addr = 0, first = 0, count = 0;
         u32 pipeline = 0;

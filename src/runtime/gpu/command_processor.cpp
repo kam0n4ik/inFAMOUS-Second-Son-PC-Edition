@@ -7,9 +7,11 @@
 #include <cstring>
 
 #include <fmt/format.h>
+#include <intrin.h>  // __rdtsc (the native operations' time)
 #include <windows.h> // GetEnvironmentVariableA (SSPC_P53_CAPTURE_*)
 
 #include "base/log.h"
+#include "runtime/gpu/stall_trace.h"
 
 // Descriptors and fence records are filled naming only the fields a packet sets.
 #pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
@@ -587,7 +589,16 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
     switch (op) {
     case O::Nop: {
         if (Engine::Render::IsMarker(p)) {
-            return NativeMarker(q, addr, p);
+            NativeTimeBegin();
+            const StepStatus s = NativeMarker(q, addr, p);
+            NativeTimeEnd();
+            return s;
+        }
+        if (p.size() == Engine::Render::kStreamTokenDwords && p[1] == Engine::Render::kStreamMagic) {
+            NativeTimeBegin();
+            const StepStatus s = NativeRun(q, addr, p);
+            NativeTimeEnd();
+            return s;
         }
         const Pm4::NopMarker m = Pm4::ClassifyNop(p);
         if (m == Pm4::NopMarker::PatchedFlip) {
@@ -926,7 +937,7 @@ void CommandProcessor::ExtentHint(const Frame& f, u32 reg, u32 count) {
     }
 }
 
-StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, DrawKind kind) {
+StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, DrawKind kind, bool packet) {
     const u8 op = static_cast<u8>(p[0] >> 8);
     if (q.compute) {
         return Fail(q, CpErrorKind::UnsupportedForm, addr, op, static_cast<u32>(p.size()),
@@ -938,6 +949,16 @@ StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, Dr
     if (b.size() < need) {
         return Fail(q, CpErrorKind::ShortPacket, addr, op, static_cast<u32>(p.size()),
                     fmt::format("{} body dwords, {} needed", b.size(), need));
+    }
+    // P5.3 direct path: the engine's description in the free dwords of the NOP right after the game's draw packet
+    if (packet && !(engine_next_.valid && engine_next_.queue == q.id) && Engine::Render::DirectOn()) {
+        const Frame& f = q.frames[q.depth - 1];
+        if (u64{f.pos} + 4 <= f.size && f.data[f.pos] == Engine::Render::kDrawNopHeader &&
+            f.data[f.pos + 1] == Engine::Render::kDescribeMagic) {
+            NativeTimeBegin();
+            DescribedDraw(q, f.data[f.pos + 2], f.data[f.pos + 3]);
+            NativeTimeEnd();
+        }
     }
     DrawDescriptor d;
     switch (kind) {
@@ -984,9 +1005,21 @@ StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, Dr
     if (native_expect_ != nullptr && native_expect_queue_ == q.id) {
         VerifyNativeDraw(d);
     }
+    if (engine_next_.valid && engine_next_.queue == q.id) {
+        d.engine_pass = engine_next_.pass;
+        d.engine_vs = engine_next_.vs;
+        d.engine_ps = engine_next_.ps;
+        engine_next_.valid = false;
+    }
     d.seq = ++q.work_seq;
     ++stats_.draws;
+    if (native_t0_ != 0) { // (a timed native operation: the executor's part is not the transport's)
+        native_acc_ += __rdtsc() - native_t0_;
+    }
     options_.work->Draw(d);
+    if (native_t0_ != 0) {
+        native_t0_ = __rdtsc();
+    }
     return StepStatus::Packet;
 }
 
@@ -1130,7 +1163,7 @@ StepStatus CommandProcessor::NativeMarker(Queue& q, u64 addr, std::span<const u3
         return StepStatus::Packet;
     }
     R::DrawOp op;
-    if (!R::DecodeDrawMarker(p, op, flags) || (flags & (R::kVerify | R::kApply)) == 0) {
+    if (!R::DecodeDrawMarker(p, op, flags) || (flags & (R::kVerify | R::kApply | R::kDescribe)) == 0) {
         c.malformed.fetch_add(1, std::memory_order_relaxed);
         return StepStatus::Packet;
     }
@@ -1138,6 +1171,33 @@ StepStatus CommandProcessor::NativeMarker(Queue& q, u64 addr, std::span<const u3
     if (native_expect_ != nullptr) {
         c.orphaned.fetch_add(1, std::memory_order_relaxed); // the previous marker met no draw
         native_expect_.reset();
+    }
+    // P5.3: the description goes with the queue's next draw (this marker's own draw in apply mode, else the game's
+    // packet right after it); a marker that meets no draw leaves nothing behind
+    if (engine_next_.valid) {
+        c.described_orphaned.fetch_add(1, std::memory_order_relaxed);
+    }
+    // (a kVerify-only marker leaves the game's path as it is: the A/B comparison's PM4 blocks are the legacy path)
+    engine_next_.valid = !op.canary && (flags & (R::kApply | R::kDescribe)) != 0;
+    engine_next_.queue = q.id;
+    engine_next_.pass = op.pass;
+    const auto table = [](const R::StageTable& t, EngineTable& out) {
+        out = {};
+        if (!t.present || t.refs == 0 || t.dwords == 0) {
+            return;
+        }
+        out.dwords = t.dwords;
+        out.refs = static_cast<u8>(t.refs);
+        for (u32 i = 0; i < t.refs; ++i) {
+            out.sgpr[i] = t.ref[i].sgpr;
+            out.offset[i] = t.ref[i].offset;
+        }
+    };
+    table(op.table[R::kStageVs], engine_next_.vs);
+    table(op.table[R::kStagePs], engine_next_.ps);
+    if ((flags & (R::kVerify | R::kApply)) == 0) {
+        c.described.fetch_add(1, std::memory_order_relaxed);
+        return StepStatus::Packet; // kDescribe: the game's draw packet follows
     }
     const bool apply = (flags & R::kApply) != 0;
     const bool indexed = op.indexed;
@@ -1159,10 +1219,187 @@ StepStatus CommandProcessor::NativeMarker(Queue& q, u64 addr, std::span<const u3
     if (indexed) {
         const u32 body[6] = {header(Pm4::Op::DrawIndex2, 5), count, static_cast<u32>(base),
                              static_cast<u32>(base >> 32), count, 0u};
-        return Draw(q, addr, body, DrawKind::Index2);
+        return Draw(q, addr, body, DrawKind::Index2, false);
     }
     const u32 body[3] = {header(Pm4::Op::DrawIndexAuto, 2), count, 2u};
-    return Draw(q, addr, body, DrawKind::IndexAuto);
+    return Draw(q, addr, body, DrawKind::IndexAuto, false);
+}
+
+// --- P5.3 direct path (engine/render/native_render_ops.h) ---
+
+namespace {
+
+/// The engine's interned table shape as the frontend takes it (an unknown or empty one: no table).
+void TableFromShape(const Engine::Render::TableShape* s, EngineTable& out) {
+    out = {};
+    if (s == nullptr || s->refs == 0 || s->dwords == 0 || s->refs > 7) {
+        return;
+    }
+    out.dwords = s->dwords;
+    out.refs = s->refs;
+    for (u32 i = 0; i < s->refs; ++i) {
+        out.sgpr[i] = s->sgpr[i];
+        out.offset[i] = s->offset[i];
+    }
+}
+
+} // namespace
+
+void CommandProcessor::NativeTimeBegin() {
+    if ((++native_calls_ & 7) == 0) {
+        native_acc_ = 0;
+        native_t0_ = __rdtsc();
+    }
+}
+
+void CommandProcessor::NativeTimeEnd() {
+    if (native_t0_ == 0) {
+        return;
+    }
+    native_acc_ += __rdtsc() - native_t0_;
+    native_t0_ = 0;
+    Engine::Render::DirectCounters& d = Engine::Render::Direct();
+    d.native_tsc.fetch_add(native_acc_ * 8, std::memory_order_relaxed);
+    d.native_calls.fetch_add(8, std::memory_order_relaxed);
+}
+
+void CommandProcessor::DescribedDraw(Queue& q, u32 word, u32 ps_shape) {
+    namespace R = Engine::Render;
+    R::DirectCounters& dc = R::Direct();
+    const u32 vs_shape = word >> 8;
+    const R::TableShape* vs = R::ShapeOf(vs_shape);
+    const R::TableShape* ps = R::ShapeOf(ps_shape);
+    if ((vs_shape != 0 && vs == nullptr) || (ps_shape != 0 && ps == nullptr)) {
+        dc.described_bad.fetch_add(1, std::memory_order_relaxed);
+        return; // (the draw goes undescribed: the frontend's own path)
+    }
+    const s32 pass = R::DescribedPass(word);
+    PassCaptureMarker(pass, false);
+    engine_next_.valid = true;
+    engine_next_.queue = q.id;
+    engine_next_.pass = pass;
+    TableFromShape(vs, engine_next_.vs);
+    TableFromShape(ps, engine_next_.ps);
+    dc.described.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CommandProcessor::ApplyNativeRegisters(const u32* pairs, u32 count) {
+    // as the native commit's marker (NativeMarker, OpKind::Registers)
+    for (u32 i = 0; i < count; ++i) {
+        const u32 reg = pairs[2 * i];
+        if (!regs_.WriteReg(reg, pairs[2 * i + 1])) {
+            Engine::Render::Counters().malformed.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        for (u32 s = 0; s < static_cast<u32>(Stage::Count); ++s) {
+            const u32 ud = kStageBase[s] + 4;
+            if (reg >= ud && reg < ud + 16) {
+                inline_sharps_[s] = static_cast<u16>(inline_sharps_[s] & ~(1u << (reg - ud)));
+            }
+        }
+    }
+}
+
+bool CommandProcessor::ApplyNativeState(const u32* pairs, u32 count) {
+    // as a kApply state marker (NativeMarker, OpKind::State)
+    namespace R = Engine::Render;
+    bool ok = true;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 reg = pairs[2 * i], value = pairs[2 * i + 1];
+        if (R::IsStatePseudo(reg)) {
+            (reg == R::kStateDbExtent ? db_extent_ : cb_extent_[reg - R::kStateCbExtent0]) = value;
+        } else if (!regs_.WriteReg(reg, value)) {
+            R::Counters().malformed.fetch_add(1, std::memory_order_relaxed);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+StepStatus CommandProcessor::NativeDrawOp(Queue& q, u64 addr, s32 pass, bool indexed, u32 count, u64 base,
+                                          u32 vs_shape, u32 ps_shape) {
+    namespace R = Engine::Render;
+    PassCaptureMarker(pass, true);
+    engine_next_.valid = true;
+    engine_next_.queue = q.id;
+    engine_next_.pass = pass;
+    TableFromShape(R::ShapeOf(vs_shape), engine_next_.vs);
+    TableFromShape(R::ShapeOf(ps_shape), engine_next_.ps);
+    R::Counters().applied_draws.fetch_add(1, std::memory_order_relaxed);
+    // what sceGnmDrawIndex / DrawIndexAuto write (as a kApply draw marker)
+    const auto header = [](u8 opcode, u32 body_dwords) {
+        return 0xC0000000u | ((body_dwords - 1) << 16) | (u32{opcode} << 8);
+    };
+    if (indexed) {
+        const u32 body[6] = {header(Pm4::Op::DrawIndex2, 5), count, static_cast<u32>(base),
+                             static_cast<u32>(base >> 32), count, 0u};
+        return Draw(q, addr, body, DrawKind::Index2, false);
+    }
+    const u32 body[3] = {header(Pm4::Op::DrawIndexAuto, 2), count, 2u};
+    return Draw(q, addr, body, DrawKind::IndexAuto, false);
+}
+
+StepStatus CommandProcessor::NativeRun(Queue& q, u64 addr, std::span<const u32> p) {
+    namespace R = Engine::Render;
+    R::DirectCounters& dc = R::Direct();
+    R::DrawCounters& c = R::Counters();
+    dc.runs.fetch_add(1, std::memory_order_relaxed);
+    R::StreamRun run;
+    if (q.compute || !R::StreamTake(p, run)) {
+        dc.runs_stale.fetch_add(1, std::memory_order_relaxed);
+        return StepStatus::Packet;
+    }
+    if (native_expect_ != nullptr) {
+        c.orphaned.fetch_add(1, std::memory_order_relaxed); // a verification marker met no draw
+        native_expect_.reset();
+    }
+    StepStatus status = StepStatus::Packet;
+    u32 ops = 0, draws = 0, commits = 0, reg_writes = 0, states = 0, state_writes = 0;
+    for (u32 i = 0; i < run.count && status == StepStatus::Packet;) {
+        const u32 h = run.words[i];
+        const u32 n = h >> 8;
+        const u32* body = run.words + i + 1;
+        if (n > run.count - i - 1) {
+            c.malformed.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+        i += 1 + n;
+        ++ops;
+        switch (static_cast<R::StreamOp>(h & 0xFF)) {
+        case R::StreamOp::Registers:
+            ApplyNativeRegisters(body, n / 2);
+            ++commits;
+            reg_writes += n / 2;
+            break;
+        case R::StreamOp::State:
+            ApplyNativeState(body, n / 2);
+            ++states;
+            state_writes += n / 2;
+            break;
+        case R::StreamOp::Draw:
+            if (n != R::kStreamDrawWords) {
+                c.malformed.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            status = NativeDrawOp(q, addr, static_cast<s32>(body[0]), (body[1] & 1) != 0, body[2],
+                                  u64{body[3]} | (u64{body[4]} << 32), body[5], body[6]);
+            ++draws;
+            break;
+        default:
+            c.malformed.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+    }
+    R::StreamDone(run);
+    dc.ops.fetch_add(ops, std::memory_order_relaxed);
+    dc.draws.fetch_add(draws, std::memory_order_relaxed);
+    dc.register_writes.fetch_add(reg_writes, std::memory_order_relaxed);
+    dc.state_writes.fetch_add(state_writes, std::memory_order_relaxed);
+    c.applied_commits.fetch_add(commits, std::memory_order_relaxed);
+    c.applied_registers.fetch_add(reg_writes, std::memory_order_relaxed);
+    c.state_applied.fetch_add(states, std::memory_order_relaxed);
+    c.state_applied_writes.fetch_add(state_writes, std::memory_order_relaxed);
+    return status;
 }
 
 void CommandProcessor::PassCaptureMarker(s32 pass, bool applied) {
@@ -1656,6 +1893,8 @@ bool CommandProcessor::WriteFence(Queue& q, FenceOp& op) {
     }
     op.written = true;
     ++stats_.fences_written;
+    // (P5.4: the wake-up point of whoever polls this label - the game's frame and compute waits)
+    StallTrace::Instant(StallTrace::Ev::FenceWrite, op.addr, static_cast<u32>(op.data), static_cast<u16>(q.id));
     if (fence_stats_.size() < 4096 || fence_stats_.contains(op.addr)) { // bounded (review LOW 10)
         FenceStat& fs = fence_stats_[op.addr];
         ++fs.count;
@@ -1688,6 +1927,7 @@ StepStatus CommandProcessor::Fence(Queue& q, FenceOp& op) {
         op.deferred = true;
         q.fences[(q.fence_head + q.fence_count++) % kMaxFences] = op;
         ++stats_.fences_deferred;
+        StallTrace::Instant(StallTrace::Ev::FenceHeld, op.addr, static_cast<u32>(op.data), static_cast<u16>(q.id));
         options_.work->Fence(op);
         return StepStatus::Packet;
     }

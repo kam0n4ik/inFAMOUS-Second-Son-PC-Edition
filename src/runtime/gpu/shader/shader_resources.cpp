@@ -432,6 +432,9 @@ bool SrtProgram::Run(std::span<const u32, 16> user_data, std::span<u32> flat, Gu
                 return false;
             }
             std::memcpy(dst, reinterpret_cast<const u8*>(user_data.data()) + offset, bytes);
+            for (u64 i = static_cast<u64>(offset) / 4; i <= (static_cast<u64>(offset) + bytes - 1) / 4; ++i) {
+                stats.user_data_read |= 1u << i;
+            }
             return true;
         }
         ++stats.reads;
@@ -500,10 +503,16 @@ bool SrtProgram::Run(std::span<const u32, 16> user_data, std::span<u32> flat, Gu
         case LoadR10Flat:
             if (!flat_index(op.disp, fi)) goto flat_error;
             r10 = flat[fi];
+            if (fi < 16) {
+                stats.user_data_read |= 1u << fi; // (the registers' copy at the flattened data's start)
+            }
             break;
         case StoreFlat:
             if (!flat_index(op.disp, fi)) goto flat_error;
             flat[fi] = static_cast<u32>(r10);
+            if (fi < 16) {
+                stats.user_data_written = true;
+            }
             break;
         case MovR10Imm64:
             r10 = op.imm;

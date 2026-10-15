@@ -166,6 +166,15 @@ void PipelineFactory::Destroy(PipelineObjects& p) {
     }
 }
 
+std::vector<u64> PipelineFactory::UsedDescriptions() const {
+    std::vector<u64> out;
+    out.reserve(by_desc_.size());
+    for (const auto& [hash, made] : by_desc_) {
+        out.push_back(hash);
+    }
+    return out;
+}
+
 VkDevice PipelineFactory::Device() const {
     return ctx_.Device();
 }

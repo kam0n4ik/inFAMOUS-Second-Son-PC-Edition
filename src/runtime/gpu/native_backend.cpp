@@ -32,6 +32,7 @@
 #include "runtime/gpu/shader_trace.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/kernel/clock.h"
+#include "runtime/gpu/shader/game_shader_index.h"
 #include "runtime/gpu/shader/shader_disk_cache.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_translator.h"
@@ -100,7 +101,9 @@ public:
         return unordered_labels && VideoOut::IsLabel(addr, bytes);
     }
     bool Write(u64 addr, const void* src, u64 bytes) override {
-        if (frontend != nullptr) {
+        if (parallel != nullptr && parallel->FrontendThread()) {
+            parallel->FrontGpuWrote(addr, bytes); // (P5.3D: to the frontend's thread, in stream order)
+        } else if (frontend != nullptr) {
             frontend->GpuWrote(addr, bytes); // (P5.2)
         }
         if (parallel != nullptr) {
@@ -295,6 +298,15 @@ private:
     /// their next use): before the work the guest submitted after them, and at each met WAIT_REG_MEM on memory (data a
     /// CPU thread published with a flag; P4.5). true: there were some. GPU thread.
     bool DrainCpuWrites();
+    /// The guest's CPU wrote [addr, addr + size): the frontend's programs there are read again - on the frontend's
+    /// own thread in stream order when it has one (P5.3D), else at once (it runs on this thread).
+    void FrontendInvalidate(u64 addr, u64 size) {
+        if (parallel_ && parallel_->FrontendThread()) {
+            parallel_->FrontInvalidate(addr, size);
+        } else {
+            frontend_->Invalidate(addr, size);
+        }
+    }
     /// The executor reached a flip marker (its batch submitted, the flip queued): the frame log's row (P4.6).
     void OnFlip(u64 gpu_value);
     /// P4.10.4: a queued timeline copy the executor refused, done as the processor would (after Synchronize): the CPU
@@ -325,6 +337,8 @@ private:
     // P4.14 (before the factory: destroyed after it and its precompiler)
     std::unique_ptr<GS::ShaderDiskCache> disk_;
     std::unique_ptr<Vk::PipelineCacheFile> pcache_;
+    GS::GameShaderIndex game_index_; ///< the game's programs (P4.14 offline index; empty without it)
+    u64 cached_in_game_ = 0;
     std::atomic<u64> pc_saved_count_{0}, pc_prev_count_{0};
     std::chrono::steady_clock::time_point pc_saved_at_{};
     std::unique_ptr<Vk::PipelineFactory> pipelines_;
@@ -346,7 +360,7 @@ private:
     std::atomic<bool> quiet_{true};    ///< IsQuiet (diagnostics)
     std::atomic<bool> recorded_{true}; ///< IsRecorded (diagnostics)
     std::atomic<bool> stop_{false};
-    std::atomic<bool> device_lost_{false};
+    std::atomic<VkResult> failure_result_{VK_SUCCESS};
     std::thread thread_;
     CpuSampler game_sampler_; ///< SSPC_DIAG_SAMPLE_GAME=<name part>: the game's threads (gpu_cpu_profile_game.txt)
     CpuSampler sampler_; ///< SSPC_DIAG_SAMPLE=1: where the GPU thread's CPU time goes (logs\gpu_cpu_profile.txt)
@@ -495,6 +509,53 @@ bool Backend::Start(const Options& o, std::string& error) {
                                    "pages stay unwritten", s);
         }
     }
+    // P5.3 Native Render Frontend: SSPC_P53_NATIVE_FRONTEND=[verify:]<passes> - the stages of draws the engine
+    // described (draw markers; SSPC_P53_NATIVE_DRAW) in these passes take a cached preparation with exactly their
+    // inputs. <passes>: "apply" (or 1/on: the passes of SSPC_P53_NATIVE_DRAW=apply:..), "all", or a list 0..40.
+    if (char v[160] = {}; GetEnvironmentVariableA("SSPC_P53_NATIVE_FRONTEND", v, sizeof(v)) > 0) {
+        std::string_view s(v);
+        if (s.rfind("verify", 0) == 0) {
+            fo.native_stages = GS::NativeStages::Verify;
+            s.remove_prefix(s.size() > 6 && s[6] == ':' ? 7 : 6);
+        } else if (s != "0" && s != "off") {
+            fo.native_stages = GS::NativeStages::On;
+        }
+        const auto passes_of = [](std::string_view list) {
+            u64 mask = 0;
+            for (size_t at = 0; at < list.size();) {
+                size_t end = list.find(',', at);
+                end = end == std::string_view::npos ? list.size() : end;
+                const std::string item(list.substr(at, end - at));
+                if (item == "all") {
+                    mask |= (u64{1} << 44) - 1; // 0..40, pre, post, deformation (Engine::Render::PassSlot)
+                } else if (!item.empty() && std::isdigit(static_cast<unsigned char>(item[0])) != 0) {
+                    const unsigned long p = std::strtoul(item.c_str(), nullptr, 10);
+                    mask |= p <= 40 ? u64{1} << p : 0;
+                }
+                at = end + 1;
+            }
+            return mask;
+        };
+        if (s.empty() || s == "1" || s == "on" || s == "apply") {
+            char d[160] = {};
+            const std::string_view draw(d, GetEnvironmentVariableA("SSPC_P53_NATIVE_DRAW", d, sizeof(d)));
+            fo.native_passes = draw.rfind("apply:", 0) == 0 ? passes_of(draw.substr(6)) : 0;
+        } else {
+            fo.native_passes = passes_of(s);
+        }
+        if (fo.native_stages != GS::NativeStages::Off) {
+            SSPC_LOG(GPU, Warning,
+                     "EXPERIMENT: SSPC_P53_NATIVE_FRONTEND={} - the Native Render Frontend: stages of the engine's "
+                     "draws in passes {:#x} (bits) take a cached preparation with exactly their inputs{}",
+                     v, fo.native_passes,
+                     fo.native_stages == GS::NativeStages::Verify ? " (verify: prepared in full anyway and compared)"
+                                                                  : "");
+            if (fo.native_passes == 0) {
+                SSPC_LOG(GPU, Error, "SSPC_P53_NATIVE_FRONTEND={}: no pass (with 'apply': SSPC_P53_NATIVE_DRAW has "
+                                     "no apply:<passes>) - off", v);
+            }
+        }
+    }
     frontend_ = std::make_unique<GS::ShaderFrontend>(fo);
     // P4.14: SSPC_SHADER_STALL_TRACE (its times are moved to the frame log's origin once that starts, below)
     ShaderTrace::Start(o.logs_dir);
@@ -510,9 +571,10 @@ bool Backend::Start(const Options& o, std::string& error) {
     images_->SetBufferCache(buffers_.get());
     executor_ = std::make_unique<Vk::Executor>(*ctx_, *timeline_, *ring_, *guest_, *buffers_, *images_, *pipelines_,
                                                *frontend_, presenter_.get(), gds_, eo);
-    // P4.10: SSPC_P410_PARALLEL_CP=1 - draws and dispatches recorded on a second thread behind the command processor
-    // (parallel_cp.h); 0 or unset: one thread (the default). SSPC_P410_SPIN_US: how long a waiting side spins first.
-    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_P410_PARALLEL_CP", v, sizeof(v)) == 1 && v[0] == '1') {
+    // P4.10: draws and dispatches recorded on a second thread behind the command processor (parallel_cp.h). On by
+    // default since P5.3D (the owner's decision; single-thread CP ~32 FPS vs ~41 parallel on the beach);
+    // SSPC_P410_PARALLEL_CP=0: one thread (the rollback). SSPC_P410_SPIN_US: how long a waiting side spins first.
+    if (char v[8] = {}; !(GetEnvironmentVariableA("SSPC_P410_PARALLEL_CP", v, sizeof(v)) == 1 && v[0] == '0')) {
         u32 spin_us = 20;
         if (char s[16] = {}; GetEnvironmentVariableA("SSPC_P410_SPIN_US", s, sizeof(s)) > 0) {
             spin_us = static_cast<u32>(std::strtoul(s, nullptr, 10));
@@ -545,16 +607,23 @@ bool Backend::Start(const Options& o, std::string& error) {
             po.frontend = frontend_.get();
             po.map_gen = &memory_.map_gen;
             po.timeline = timeline_.get();
+            // P5.3D: SSPC_P53_FRONTEND_THREAD=1 - the frontend on a third thread between the processor and the
+            // recording thread (parallel_cp.h, Options::frontend_thread)
+            char ft[4] = {};
+            po.frontend_thread = GetEnvironmentVariableA("SSPC_P53_FRONTEND_THREAD", ft, sizeof(ft)) == 1 && ft[0] == '1';
         }
         parallel_ = std::make_unique<ParallelCp>(*executor_, buffers_.get(), po);
         parallel_->SetCopyFallback(
             [](void* self, u64 src, u64 dst, u64 bytes) { return static_cast<Backend*>(self)->CpuCopy(src, dst, bytes); },
             this);
-        SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_P410_PARALLEL_CP=1 - draws and dispatches are recorded on a second "
-                               "thread behind the command processor (spin {} us before a blocking wait; other calls {}, "
+        SSPC_LOG(GPU, Warning, "parallel command processor (default; SSPC_P410_PARALLEL_CP=0 turns it off) - draws and "
+                               "dispatches are recorded on a second thread behind the command processor (spin {} us "
+                               "before a blocking wait; other calls {}, "
                                "timeline copies {}; the shader frontend on the {} thread; met memory waits {})",
                  spin_us, async ? "queued" : "drained", async && async_copies ? "queued" : "drained",
-                 frontend_ahead ? "processor's" : "recording",
+                 po.frontend_thread ? "frontend's own (SSPC_P53_FRONTEND_THREAD=1)"
+                 : frontend_ahead   ? "processor's"
+                                    : "recording",
                  po.async_acquire && async && frontend_ahead ? "queued (SSPC_P411_ASYNC_ACQUIRE=1)" : "drained");
     }
     Cp::Options cpo;
@@ -745,7 +814,11 @@ bool Backend::Start(const Options& o, std::string& error) {
 }
 
 void Backend::Apply(const Submission& s) {
-    executor_->GuestMemoryChanged(); // (P4.7: the guest's CPU may have written anything before it submitted)
+    if (parallel_ && parallel_->FrontendThread()) {
+        parallel_->MemoryChanged(); // (P5.3D: the frontend's thread is told with the next record)
+    } else {
+        executor_->GuestMemoryChanged(); // (P4.7: the guest's CPU may have written anything before it submitted)
+    }
     switch (s.kind) {
     case Submission::Kind::Graphics:
         ++submissions_;
@@ -786,7 +859,7 @@ bool Backend::DrainCpuWrites() {
         any = true;
         images_->InvalidateCoarse(a, sz); // whole 64 KiB blocks: a GPU-written image counts only its interior ones
         buffers_->InvalidateCoarse(a, sz); // whole 64 KiB blocks: the GPU's pending pages there stay
-        frontend_->Invalidate(a, sz);
+        FrontendInvalidate(a, sz);
     });
     return any;
 }
@@ -852,7 +925,7 @@ void Backend::Loop() {
                 inval.swap(pending_inval_);
             }
             for (const auto& [a, sz] : inval) {
-                frontend_->Invalidate(a, sz);
+                FrontendInvalidate(a, sz);
             }
         }
         // the guest's writes to tracked pages, before the work it submitted after them
@@ -883,6 +956,8 @@ void Backend::Loop() {
                 continue;
             }
             u32 i = 0;
+            const u64 slice_t0 = StallTrace::On() ? StallTrace::Now() : 0; // (P5.4: the queue's slice of the round)
+            u16 slice_stop = 0;
             for (; i < 4096; ++i) {
                 const Cp::StepStatus st = cp_->Step(q);
                 if (st == Cp::StepStatus::Packet) {
@@ -891,9 +966,11 @@ void Backend::Loop() {
                 }
                 if (st == Cp::StepStatus::Blocked) {
                     blocked = true;
+                    slice_stop = 1;
                     const u64 poll = cp_->BlockedPoll(q);
                     blocked_label |= poll >= label_base_ && poll < label_base_ + VideoOut::kMaxBuffers * 8;
                 } else if (st == Cp::StepStatus::Faulted) {
+                    slice_stop = 3;
                     if (cp_errors_++ == 0) {
                         first_cp_error_ = cp_->LastError().Text();
                         SSPC_LOG(GPU, Error, "native backend: the command processor stopped a submission: {}",
@@ -901,6 +978,10 @@ void Backend::Loop() {
                     }
                 }
                 break;
+            }
+            if (slice_t0 != 0 && (i != 0 || slice_stop == 1)) {
+                StallTrace::Span(StallTrace::Ev::CpQueueSlice, slice_t0, StallTrace::Now(), q, i,
+                                 i == 4096 ? u16{2} : slice_stop);
             }
             round_packets += i; // (P4.12: the round's packets; a queue that stopped at the limit)
             round_capped += i == 4096 ? 1 : 0;
@@ -932,13 +1013,13 @@ void Backend::Loop() {
         prof_poll += poll_ns;
         tot_busy_ns_ += poll_ns;
         tot_poll_ns_ += poll_ns;
-        if (executor_->DeviceLost()) {
-            // VK_ERROR_DEVICE_LOST: the report is written, nothing more is submitted; the process ends with an
-            // explicit status (a run with a lost device is not a successful run)
-            device_lost_.store(true, std::memory_order_release);
-            SSPC_LOG(GPU, Error, "native backend: stopped after VK_ERROR_DEVICE_LOST; the process exits with code 5");
+        if (ctx_->Failed()) {
+            const VkResult result = ctx_->Failure();
+            failure_result_.store(result, std::memory_order_release);
+            SSPC_LOG(GPU, Error, "native backend: stopped after VkResult {}; the process exits with code 5",
+                     static_cast<int>(result));
             std::thread([] {
-                Lifecycle::Exit(5, "native GPU backend: VK_ERROR_DEVICE_LOST (logs\\gpu_device_lost.txt)");
+                Lifecycle::Exit(5, "native GPU backend failure (see GPU log)");
             }).detach();
             return;
         }
@@ -1282,6 +1363,10 @@ void Backend::Stop() {
         SSPC_LOG(GPU, Info, "pipeline cache: {:.1f} MiB saved", static_cast<double>(pcache_->SavedBytes()) / (1 << 20));
     }
     if (disk_) {
+        if (pipelines_) {
+            const auto used = pipelines_->UsedDescriptions();
+            disk_->AddUsage(used); // (P4.14: the next start prepares these first)
+        }
         disk_->Close(); // (what is queued written first)
     }
     std::error_code ec;
@@ -1393,18 +1478,30 @@ void Backend::StartShaderCache(const Options& o) {
              ds.open_ms, ds.recreated ? fmt::format(", started anew ({})", ds.recreate_reason) : "",
              ds.torn_bytes != 0 ? fmt::format(", {} bytes of a torn tail cut off", ds.torn_bytes) : "",
              ds.skipped_records != 0 ? fmt::format(", {} records not used", ds.skipped_records) : "");
-    pcache_ = std::make_unique<Vk::PipelineCacheFile>(*ctx_, root / gen / "vulkan.bin");
+    pcache_ = std::make_unique<Vk::PipelineCacheFile>(*ctx_, *disk);
     if (!pcache_->Load()) {
         SSPC_LOG(GPU, Warning, "pipeline cache (driver): {}", pcache_->LoadNote());
         pcache_.reset();
     } else {
         SSPC_LOG(GPU, Info, "pipeline cache (driver): {}", pcache_->LoadNote());
     }
+    // the offline index of the game's programs (--scan-game-shaders): the cache's coverage of the game
+    if (std::string ierr; game_index_.Load(root / "game_programs.idx", ierr)) {
+        for (const GS::ProgramIdentity& id : disk->ProgramIdentities()) {
+            cached_in_game_ += game_index_.Find(id.hash, id.length) != nullptr ? 1 : 0;
+        }
+        SSPC_LOG(GPU, Info, "game shader index: {} programs in {} packs; the cache has {} of them ({:.1f} %)",
+                 game_index_.Programs().size(), game_index_.Packs().size(), cached_in_game_,
+                 100.0 * static_cast<double>(cached_in_game_) /
+                     static_cast<double>(std::max<size_t>(game_index_.Programs().size(), 1)));
+    } else {
+        SSPC_LOG(GPU, Info, "game shader index: {}", ierr);
+    }
     disk_ = std::move(disk);
     pipelines_->SetPersistence(pcache_ ? pcache_->Handle() : VK_NULL_HANDLE, disk_.get());
     frontend_->SetDiskCache(disk_.get());
     pc_saved_at_ = std::chrono::steady_clock::now();
-    if (pcache_) {
+    if (pcache_ && disk_->Writable()) {
         disk_->SetPeriodic([](void* self) { static_cast<Backend*>(self)->MaybeSavePipelineCache(); }, this, 10000);
     }
     if (o.precompile) {
@@ -1415,7 +1512,8 @@ void Backend::StartShaderCache(const Options& o) {
 }
 
 void Backend::RunPrecompile(const Options& o) {
-    std::vector<GS::PipelineDesc> descs = disk_->Pipelines();
+    // the pipelines the last runs used first (a skipped wait, or the time limit, leaves the likeliest ones ready)
+    std::vector<GS::PipelineDesc> descs = disk_->PipelinesByUse();
     if (descs.empty()) {
         SSPC_LOG(GPU, Info, "shader precompiler: the manifest is empty (a first run): nothing to prepare");
         return;
@@ -1513,6 +1611,35 @@ std::string Backend::CacheReport() {
         out += fmt::format("pipeline cache (driver): at start {}; saved {} times, last {:.1f} MiB\n", pcache_->LoadNote(),
                            pcache_->Saves(), static_cast<double>(pcache_->SavedBytes()) / (1 << 20));
     }
+    if (!game_index_.Empty()) {
+        // the packs this run's programs are in (observed, not guessed from the packs' names)
+        std::unordered_map<u32, u64> by_pack;
+        u64 met = 0, found = 0;
+        for (const GS::Program* p : frontend_->Programs().All()) {
+            ++met;
+            if (const GS::GameProgram* g = game_index_.Find(p->id.hash, p->id.length)) {
+                ++found;
+                for (u32 i = 0; i < g->members; ++i) {
+                    ++by_pack[game_index_.Members()[g->first_member + i].pack];
+                }
+            }
+        }
+        std::vector<std::pair<u64, u32>> order;
+        for (const auto& [pack, n] : by_pack) {
+            order.emplace_back(n, pack);
+        }
+        std::ranges::sort(order, std::greater<>{});
+        out += fmt::format("game programs (offline index): {} in {} packs; the cache had {} at start ({:.1f} %); this run "
+                           "met {} programs, {} of them in the packs, in {} packs; the packs with most:",
+                           game_index_.Programs().size(), game_index_.Packs().size(), cached_in_game_,
+                           100.0 * static_cast<double>(cached_in_game_) /
+                               static_cast<double>(std::max<size_t>(game_index_.Programs().size(), 1)),
+                           met, found, order.size());
+        for (size_t i = 0; i < order.size() && i < 12; ++i) {
+            out += fmt::format(" {} {};", game_index_.Packs()[order[i].second], order[i].first);
+        }
+        out += "\n";
+    }
     return out;
 }
 
@@ -1542,11 +1669,14 @@ ShaderCacheInfo Backend::CacheInfo() {
         info.precompile_ms = p.elapsed_ms;
     }
     info.created_on_demand = pipelines_->CreatedOnDemand();
+    info.game_programs = game_index_.Programs().size();
+    info.cached_in_game = cached_in_game_;
     return info;
 }
 
 std::string Backend::Report() {
-    std::string out = device_lost_.load() ? "STATUS: FAILED - VK_ERROR_DEVICE_LOST (logs\\gpu_device_lost.txt)\n"
+    std::string out = failure_result_.load() != VK_SUCCESS
+                          ? fmt::format("STATUS: FAILED - VkResult {}\n", static_cast<int>(failure_result_.load()))
                       : parallel_ && parallel_->Failed()
                           ? "STATUS: FAILED - " + parallel_->FailureText() + "\n"
                           : "STATUS: running/stopped normally\n";
@@ -1768,6 +1898,7 @@ std::string Backend::Report() {
                                "different {}\n",
                                fs.memo_verified, fs.memo_mismatches);
         }
+        out += frontend_->NativeReport(); // (P5.3; empty when off)
         out += frontend_->MemoReport();
     }
     {

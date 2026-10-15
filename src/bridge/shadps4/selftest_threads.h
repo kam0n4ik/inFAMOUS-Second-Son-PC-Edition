@@ -45,6 +45,9 @@ std::vector<TestGroup> TestGpu(const App::Config& cfg);
 
 /// P4.2 (src/bridge/shadps4/selftest_gpu_cp.cpp): SecondSonPC's GPU command processor.
 std::vector<TestGroup> TestGpuCommandProcessor(const App::Config& cfg);
+/// P5.3 (same file): the native operations' direct path (no markers) through the processor - also run with
+/// SSPC_SELFTEST_ONLY=shader.
+std::vector<TestGroup> TestGpuNativeDirect();
 
 /// P4.3 (src/bridge/shadps4/selftest_shader.cpp): SecondSonPC's shader frontend.
 std::vector<TestGroup> TestShaderFrontend(const App::Config& cfg);

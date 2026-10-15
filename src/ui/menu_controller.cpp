@@ -233,6 +233,11 @@ MenuEnv BuildEnv() {
         env.shader_cache_content =
             env.ru ? fmt::format("шейдеров: {}, конвейеров: {}", ci.modules, ci.pipelines)
                    : fmt::format("{} shaders, {} pipelines", ci.modules, ci.pipelines);
+        if (ci.game_programs != 0) { // (the offline index: how much of the game the cache covers)
+            env.shader_cache_content +=
+                env.ru ? fmt::format("; программ игры: {} из {}", ci.cached_in_game, ci.game_programs)
+                       : fmt::format("; game programs: {} of {}", ci.cached_in_game, ci.game_programs);
+        }
         env.shader_cache_run =
             env.ru ? fmt::format("заранее {} из {} ({:.1f} с), из кэша: {}, новых: {}", ci.precompile_built,
                                  ci.precompile_total, ci.precompile_ms / 1000.0, ci.module_loads, ci.translations)
@@ -537,7 +542,7 @@ bool ShowStartupProgress(u32 done, u32 total, u32 failed, double elapsed_s, bool
               true);
     st.overlay.Present(st.hwnd, list);
     // Esc while the game window is in front (pressed since the last call)
-    return GetForegroundWindow() == st.hwnd && (GetAsyncKeyState(VK_ESCAPE) & 1) != 0;
+    return GetForegroundWindow() == st.hwnd && (GetAsyncKeyState(VK_ESCAPE) & 0x8001) != 0; // (down now, or since)
 }
 
 MenuController& Menu() {

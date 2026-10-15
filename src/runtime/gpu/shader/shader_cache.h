@@ -172,6 +172,7 @@ public:
         u64 addr = 0;         ///< P5.2: where it was read (Invalidate)
         bool tracked = false; ///< P5.2: its bytes were write-tracked before the read that validated them
         bool dirty = false;   ///< P5.2: written since (read again at the next use)
+        u64 version = 0;      ///< P5.3: bumped whenever what it holds changes (the native frontend's key)
     };
     const Entry& Get(GuestReader& memory, u64 addr, u32 sgpr_base, u64 epoch, Validation validation);
     size_t Size() const { return entries_.size(); }

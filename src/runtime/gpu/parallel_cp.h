@@ -1,6 +1,7 @@
 // SecondSonPC — the parallel command processor (Phase 4, P4.10; docs/PHASE4_P410_PARALLEL_COMMAND_PROCESSING.md).
 //
-// SSPC_P410_PARALLEL_CP=1 (off by default): the native backend's command processor and its executor on two threads.
+// On by default since P5.3D (SSPC_P410_PARALLEL_CP=0: off): the native backend's command processor and its executor
+// on two threads.
 //
 //   thread 1 (the backend's GPU thread)  PM4 packets, the register file, the processor's memory reads/writes, fences,
 //                                        waits, everything between the loop's rounds (polls, flushes, idle waits);
@@ -108,6 +109,11 @@ struct ParallelTotals {
     u64 gw_now = 0;               ///< ranges pending now (P4.11 soak telemetry)
     u64 async_acquires = 0;       ///< P4.11: met memory waits queued with their CPU writes applied on thread 1
     u64 copy_failures = 0;        ///< P4.11: queued copies neither recorded nor copied by the CPU (reported, completed)
+    // P5.3D (SSPC_P53_FRONTEND_THREAD=1): the frontend on its own thread between thread 1 and thread 2
+    u64 tf_busy_ticks = 0;    ///< the frontend thread preparing records (journal replay included)
+    u64 tf_idle_ticks = 0;    ///< ... waiting for records from thread 1
+    u64 tf_wait_ticks = 0;    ///< ... waiting for thread 2 (a read of memory a GPU write may still be pending for)
+    u64 tf_waits = 0;
 };
 
 /// P4.10.4 diagnostics: every N-th queued timeline copy is refused on thread 2 as if the executor had refused it (its
@@ -136,6 +142,12 @@ public:
         /// guest's GPU runs unsynchronized with those writes too (a CPU write after a wait for that work completing is
         /// made only after thread 2 executed it: its label is written after that).
         bool async_acquire = false;
+        /// P5.3D (SSPC_P53_FRONTEND_THREAD=1; with `frontend`): the frontend on a third thread - thread 1 only
+        /// processes packets, the frontend thread prepares the records in order against its own replica of the
+        /// register file, thread 2 executes the prepared ones. Guest memory changes thread 1 meets reach the frontend
+        /// as flags of the next record (stream order); a read of memory a GPU write may still be pending for waits
+        /// until thread 2 executed every earlier record (not a drain of thread 1). async_acquire is off with it.
+        bool frontend_thread = false;
     };
     /// `buffers`: the executor's buffer cache (the processor's writes invalidate it on thread 2).
     ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const Options& options);
@@ -175,6 +187,13 @@ public:
     void DeferInvalidateIfCached(u64 addr, u64 bytes);
     /// The frontend runs on thread 1 (stage 2).
     bool FrontendAhead() const { return frontend_ != nullptr; }
+    /// P5.3D: the frontend runs on its own thread.
+    bool FrontendThread() const { return fthread_mode_; }
+    /// Thread 1, frontend thread mode: what the processor's thread tells the frontend (ShaderFrontend::Invalidate /
+    /// GpuWrote - not thread-safe) reaches it where it is in the stream: before the next record it prepares, or at once
+    /// when the queue is empty (the frontend thread parked).
+    void FrontInvalidate(u64 addr, u64 size) { FrontEvent(addr, size, false); }
+    void FrontGpuWrote(u64 addr, u64 size) { FrontEvent(addr, size, true); }
     /// thread 2 caught an exception (nothing more is executed; the backend stops).
     bool Failed() const { return failed_.load(std::memory_order_acquire); }
     std::string FailureText() const;
@@ -218,6 +237,7 @@ private:
         bool blocked = false;  ///< MemoryAcquired
         bool hook_done = false, applied = false; ///< MemoryAcquired with P4.11's async_acquire (applied: writes found)
         bool prepared = false; ///< stage 2: the frontend's preparation below (a filtered draw has none)
+        bool front_memo = false; ///< frontend thread: a guest memory change (memo) before this record
         u64 journal_end = 0;   ///< the journal applied up to here before it executes
         u64 reg_hash = 0;      ///< Options::verify: the processor's registers at the packet
         Cp::DrawDescriptor draw;
@@ -231,7 +251,11 @@ private:
         // stage 2: the frontend's preparation, copied at the packet (the frontend's own state is the next command's)
         GS::DrawPreparation prep;
         GS::StageView stage, ps; ///< VS or CS; PS
+        /// P5.3: the Native Render Frontend's shared preparations of the draw's VS/PS (instead of the copies above)
+        std::shared_ptr<const GS::StageView> stage_shared, ps_shared;
         const GS::GraphicsPipelineState* state = nullptr;
+        const GS::StageView& Vs() const { return stage_shared != nullptr ? *stage_shared : stage; }
+        const GS::StageView& Ps() const { return ps_shared != nullptr ? *ps_shared : ps; }
     };
     static constexpr u32 kSlots = 1024; ///< records (power of two)
     static constexpr u32 kJournalWords = 1u << 22; ///< 16 MiB of register writes (power of two)
@@ -272,9 +296,22 @@ private:
     /// until head_ >= target; `why`: the DrainReason of a drain, kWhyFull / kWhyJournal for backpressure (P4.12 trace)
     void WaitHead(u64 target, bool full, u16 why);
     static constexpr u16 kWhyFull = 0xFFFF, kWhyJournal = 0xFFFE;
-    /// Stage 2: the frontend for the record being filled; its GPU writes noted; the memo told when it writes memory.
-    void PrepareDraw(Record& r);
-    void PrepareDispatch(Record& r);
+    /// Stage 2: the frontend for record `index`, `regs` as they are at its packet; its GPU writes noted; the memo told
+    /// when it writes memory. (Thread 1 with the record being filled, or the frontend thread.)
+    void PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs);
+    void PrepareDispatch(Record& r, u64 index);
+    // P5.3D frontend thread
+    void FrontLoop();
+    void FrontStep(Record& r, u64 index);
+    /// The frontend thread: until thread 2 executed every record before `index` (it then waits for this one).
+    void FrontWaitExecuted(u64 index);
+    /// The frontend thread, thread 2 parked before the record being prepared: GPU writes whose completion value fell
+    /// out of the ring, asked of the executor (thread 1's ApplyPending does it without this thread).
+    void DropUnknownGpuWrites();
+    void FrontApplyJournal(u64 end);
+    void FrontEvent(u64 addr, u64 size, bool gpu);
+    /// The queued frontend events of records up to `upto` (the frontend thread; thread 1 with the queue empty).
+    void ApplyFrontEvents(u64 upto);
     void NoteStageWrites(const GS::StageView& s, u64 record, bool& writes);
     /// Stage 2, the queue not idle: a GPU write of a record not executed, or not known complete, may overlap.
     bool MayBeGpuWritten(u64 addr, u64 bytes);
@@ -283,7 +320,9 @@ private:
     void RebuildGpuWriteBits();
     /// Stage 2: the processor's calls queued for thread 2 tell the frontend here, in stream order (thread 2 does not).
     void FrontMemoChanged() {
-        if (frontend_ != nullptr) {
+        if (fthread_mode_) {
+            pending_front_memo_ = true; // (the frontend thread is told with the next record: stream order)
+        } else if (frontend_ != nullptr) {
             frontend_->GuestMemoryChanged();
         }
     }
@@ -353,6 +392,35 @@ private:
     std::mutex deferred_mutex_;
     std::vector<Deferred> deferred_; ///< InvalidateIfCached ranges in stream order (under deferred_mutex_)
     std::atomic<bool> has_deferred_{false};
+
+    // P5.3D frontend thread (fthread_mode_): it reads tail_, publishes fhead_ (thread 2 executes up to it)
+    bool fthread_mode_ = false;
+    std::thread fthread_;
+    Cp::RegisterFile freplica_; ///< the frontend thread's registers (its journal position fjhead_)
+    alignas(64) std::atomic<u64> fhead_{0};         ///< records prepared (the frontend thread writes)
+    alignas(64) std::atomic<u32> f_waiting_{0};      ///< the frontend thread sleeps until tail_ moves
+    alignas(64) std::atomic<u64> f_wait_target_{0};  ///< ... until head_ reaches it (0: not sleeping on it)
+    alignas(64) std::atomic<u64> fjhead_{0};         ///< its journal position (thread 1's reservation reads it)
+    u64 f_current_ = 0;              ///< the frontend thread: the record being prepared
+    bool pending_front_memo_ = false; ///< thread 1: a memo change for the frontend thread, with the next record
+    struct FrontEventEntry {
+        u64 before = 0; ///< applied before the frontend thread prepares this record
+        u64 addr = 0, size = 0;
+        bool gpu = false; ///< GpuWrote (else Invalidate)
+    };
+    std::mutex fe_mutex_;
+    std::vector<FrontEventEntry> fe_; ///< (under fe_mutex_)
+    std::atomic<bool> has_fe_{false};
+    /// The frontend's counters: written by the one thread running the frontend (thread 1, or the frontend thread),
+    /// read by thread 1's reports - atomics written as a single writer's (load + store, no locked add).
+    struct FrontCounters {
+        std::atomic<u64> ticks{0}, reads{0}, read_hits{0}, syncs{0}, gpu_writes{0}, gw_max{0}, gw_block_hits{0},
+            gw_rebuilds{0}, gw_now{0}, busy{0}, idle{0}, wait_ticks{0}, waits{0};
+    };
+    FrontCounters fc_;
+    static void Bump(std::atomic<u64>& a, u64 v = 1) {
+        a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed);
+    }
 
     std::thread thread_;
     bool started_ = false;

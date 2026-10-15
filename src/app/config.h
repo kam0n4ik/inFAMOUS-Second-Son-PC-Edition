@@ -103,6 +103,7 @@ struct Config {
     // (shadPS4's Vulkan renderer) runs the game; SecondSonPC's Vulkan foundation is checked on its own (--gpu-probe).
     enum class GpuBackend : u8 { Bridge, Sspc };
     GpuBackend gpu_backend = GpuBackend::Bridge; // --gpu-backend bridge|sspc (P4.4: sspc = SecondSonPC's own backend)
+    std::string render_mode; // --render-mode legacy|hybrid|native_experimental (P5.3; empty: SSPC_RENDER_MODE, else legacy)
     bool gpu_native_validate = false;        // --gpu-native-validate: the Vulkan validation layer on the native backend
     bool gpu_native_diag = false;            // --gpu-native-diag: command journal, checkpoints, markers (device loss)
     u64 gpu_capture_flip = 0;                // --gpu-capture-native-frame <flip>: that flip's frame -> logs\p44\native_frame.png
@@ -130,6 +131,7 @@ struct Config {
     bool shader_cache = true;
     std::filesystem::path shader_cache_dir;
     bool clear_shader_cache = false;         // --clear-shader-cache: delete <dir>\<game> and exit
+    bool scan_game_shaders = false;          // --scan-game-shaders: index the game's GCN programs and exit (P4.14)
 };
 
 /// Parses <root>\SecondSonPC.toml. On failure returns nullopt and fills `errors`.

@@ -19,6 +19,8 @@
 //                      reflection, flattened user data, fetch shader code, vertex V#s (a translation's inputs and
 //                      outputs: it can be translated again from them)
 //     'L' pipeline     a PipelineDesc (what vkCreate*Pipelines needs, no handle) and the time it took
+//     'U' usage        at a run's end: the pipelines it used (description hashes) - the next start prepares the ones
+//                      used last and most often first
 // At open every record is read and checked; the first bad one and everything after it is cut off (a write cut by
 // the process's end leaves a torn last record, nothing else). New records are appended by the cache's own thread;
 // a record is in the file whole or not at all for the next run. A second process on the same directory reads it
@@ -30,6 +32,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -125,6 +128,9 @@ public:
     void Close();
     bool IsOpen() const { return open_; }
     bool Writable() const { return writable_; }
+    /// Serializes an auxiliary persistent write with Close. The writer lock remains held
+    /// throughout fn; a reader or closed cache never invokes it. fn must not call this cache.
+    bool WithWriteOwnership(const std::function<bool()>& fn);
     const std::filesystem::path& Dir() const { return options_.dir; }
 
     // ---- the frontend (its owner thread)
@@ -139,6 +145,14 @@ public:
     // ---- pipelines
     /// The pipeline records, in the order they were first met.
     std::vector<PipelineDesc> Pipelines() const;
+    /// The same, those the last runs used first (the latest run's, then by how many runs used them, then first met).
+    std::vector<PipelineDesc> PipelinesByUse() const;
+    /// The pipelines this run used (their description hashes): one usage record (the end of a run).
+    void AddUsage(std::span<const u64> hashes);
+    /// Usage records read at open (runs that recorded what they used).
+    u32 Runs() const;
+    /// The programs the cache has modules or code of (the offline index's coverage).
+    std::vector<ProgramIdentity> ProgramIdentities() const;
     bool HasPipeline(const PipelineDesc& desc, u64 hash) const;
     /// A pipeline the executor created (queued for writing unless known). Any thread.
     void AddPipeline(const PipelineDesc& desc, u64 hash, u64 create_ns);
@@ -189,6 +203,11 @@ private:
     std::unordered_map<SpirvHash, u32, SpirvHashHasher> spirv_;
     std::vector<PipelineDesc> pipelines_;
     std::unordered_multimap<u64, u32> pipeline_index_; ///< hash -> pipelines_ index
+    struct Use {
+        u32 last_run = 0, runs = 0;
+    };
+    std::unordered_map<u64, Use> uses_; ///< description hash -> the runs that used it
+    u32 runs_ = 0;
     u64 queued_bytes_ = 0;
     std::deque<std::pair<u32, std::vector<u8>>> queue_;
     std::condition_variable cv_, idle_cv_;
@@ -199,6 +218,7 @@ private:
     void* periodic_ctx_ = nullptr;
     u32 periodic_ms_ = 0;
     std::atomic<u64> tear_next_{0};
+    bool crash_after_tear_ = false; ///< SSPC_DIAG_SHADER_CACHE_TEAR: the process ends right after the cut write
     DiskCacheStats stats_;
 };
 

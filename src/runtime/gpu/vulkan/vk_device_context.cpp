@@ -127,7 +127,8 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     f.vkEnumerateInstanceExtensionProperties(nullptr, &n, iexts.data());
     std::vector<const char*> ienable;
     if (options.presentation) {
-        for (const char* e : {"VK_KHR_surface", "VK_KHR_win32_surface"}) {
+        for (const char* e : {"VK_KHR_surface", "VK_KHR_win32_surface",
+                              "VK_KHR_get_surface_capabilities2", "VK_EXT_surface_maintenance1"}) {
             if (!Has(iexts, e)) {
                 error = fmt::format("the instance extension {} is missing", e);
                 return nullptr;
@@ -341,6 +342,11 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
             return nullptr;
         }
         denable.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        if (!Has(dexts, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+            error = "native presentation requires VK_EXT_swapchain_maintenance1 for safe present resource retirement";
+            return nullptr;
+        }
+        denable.push_back(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
     }
     for (const char* e : kWantedExtensions) {
         if (Has(dexts, e)) {
@@ -390,6 +396,8 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
 
     // --- features: every one the device has among those the translated code and the backend use (queried, then
     // passed back; the chain only holds structures of enabled extensions)
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swap_maintenance{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
     VkPhysicalDeviceRobustness2FeaturesEXT rob{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
     VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR div{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
@@ -431,6 +439,9 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
         *tail = &s;
         tail = &s.pNext;
     };
+    if (options.presentation) {
+        link(swap_maintenance);
+    }
     link(rob);
     link(div);
     if (enabled(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME)) {
@@ -482,6 +493,11 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
         link(m5);
     }
     f.vkGetPhysicalDeviceFeatures2(pd, &f2);
+    caps.swapchain_maintenance1 = options.presentation && swap_maintenance.swapchainMaintenance1 == VK_TRUE;
+    if (options.presentation && !caps.swapchain_maintenance1) {
+        error = "native presentation requires the swapchainMaintenance1 feature";
+        return nullptr;
+    }
     const auto need = [&](VkBool32 have, const char* what) {
         if (!have && error.empty()) {
             error = fmt::format("{} lacks {}", ctx->name_, what);
@@ -619,6 +635,17 @@ DeviceContext::~DeviceContext() {
     if (module_ != nullptr) {
         FreeLibrary(static_cast<HMODULE>(module_));
         module_ = nullptr;
+    }
+}
+
+void DeviceContext::Fail(const char* where, VkResult result) {
+    if (result == VK_SUCCESS) {
+        return;
+    }
+    VkResult expected = VK_SUCCESS;
+    if (failure_.compare_exchange_strong(expected, result, std::memory_order_acq_rel)) {
+        SSPC_LOG(GPU, Error, "native backend failure: {} returned VkResult {}; submissions stopped",
+                 where, static_cast<int>(result));
     }
 }
 

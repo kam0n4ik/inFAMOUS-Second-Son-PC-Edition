@@ -40,7 +40,8 @@ struct PipelineObjects;
 /// The driver's pipeline cache and its file.
 class PipelineCacheFile {
 public:
-    PipelineCacheFile(DeviceContext& ctx, std::filesystem::path file);
+    /// owner must outlive this object. Save holds its writer lease through atomic publication.
+    PipelineCacheFile(DeviceContext& ctx, GS::ShaderDiskCache& owner);
     ~PipelineCacheFile(); ///< destroys the cache (not saved: Save() first)
     PipelineCacheFile(const PipelineCacheFile&) = delete;
     PipelineCacheFile& operator=(const PipelineCacheFile&) = delete;
@@ -59,7 +60,9 @@ public:
     void TestTearNextSave(u64 bytes) { tear_ = bytes; }
 
 private:
+    bool SaveOwned();
     DeviceContext& ctx_;
+    GS::ShaderDiskCache& owner_;
     std::filesystem::path file_;
     VkPipelineCache cache_ = VK_NULL_HANDLE;
     std::string note_;
@@ -68,6 +71,7 @@ private:
     std::atomic<u32> saves_{0};
     std::mutex save_mutex_;
     u64 tear_ = 0;
+    bool crash_after_tear_ = false; ///< SSPC_DIAG_PIPELINE_CACHE_TEAR
 };
 
 struct PrecompileOptions {

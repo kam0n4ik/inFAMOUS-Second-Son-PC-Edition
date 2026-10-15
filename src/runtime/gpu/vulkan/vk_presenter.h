@@ -60,6 +60,8 @@ public:
         std::string last_error;
     };
     Stats GetStats();
+    /// Diagnostic test seam: uses the same retirement path as resize/out-of-date.
+    bool TestRecreate();
 
     struct Impl;
 

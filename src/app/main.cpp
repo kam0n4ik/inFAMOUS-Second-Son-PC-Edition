@@ -41,6 +41,8 @@
 //     --frame-pacing           the flip timeline (submit, GPU thread, flip, vblank) -> logs\frame_pacing.csv
 //     --gpu-backend bridge|sspc   the game's GPU backend (bridge, the default; sspc is refused for the game in
 //                              P4.1: it executes no GPU command of the game yet)
+//     --render-mode legacy|hybrid|native_experimental   P5.3: the native render path of --gpu-backend sspc
+//                              (engine/render/native_draw.h ApplyRenderMode; SSPC_RENDER_MODE the same)
 //     --perf-opt <name>        P2.5 bridge performance change on / --no-perf-opt <name> off
 //                              (barrier-memo: on by default; docs\PHASE2_P25_PERFORMANCE.md)
 //     --vram-log <seconds>     video memory budget/usage samples (SSPC-001)
@@ -63,6 +65,8 @@
 //     --shader-cache <dir>     the persistent shader cache in <dir> for this run ([ShaderCache] dir)
 //     --no-shader-cache        no persistent shader cache for this run
 //     --clear-shader-cache     deletes the cache generations under [ShaderCache] dir and exits
+//     --scan-game-shaders      indexes every GCN program of the game's .xpps packs (read only) into
+//                              [ShaderCache] dir\<game>\native\game_programs.idx and exits (P4.14)
 //     --exports all|native|observers|none, --no-bind <name>   which exports are bound
 //     --stock-bootstrap        shadPS4's own startup path inside this binary
 //   PC settings (docs/PC_SETTINGS_IMPLEMENTATION.md): the in-game menu (F1) saves changes to
@@ -73,6 +77,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -88,7 +95,9 @@
 #include "bridge/shadps4/loader_host.h"
 #include "bridge/shadps4/perf_opts.h"
 #include "runtime/gpu/cp_replay.h"
+#include "runtime/gpu/shader/game_shader_index.h"
 #include "runtime/gpu/vulkan/vk_foundation.h"
+#include "runtime/gpu/vulkan/vk_stability_tests.h"
 #include "runtime/language.h"
 #include "runtime/system/system_service.h"
 #include "settings/settings_service.h"
@@ -134,8 +143,9 @@ int main(int argc, char* argv[]) {
             user_settings_file = std::filesystem::absolute(argv[++i]);
             explicit_settings = true;
         } else if (a == "--no-user-settings" || a == "--press" || a == "--selftest" || a == "--fault-test" ||
-                   a == "--patch-race-test" || a == "--gpu-probe" || a == "--gpu-probe-window" ||
-                   a == "--gpu-replay" || a == "--gpu-shader-verify" || a == "--clear-shader-cache") {
+                   a == "--patch-race-test" || a == "--gpu-stability-test" || a == "--gpu-probe" || a == "--gpu-probe-window" ||
+                   a == "--gpu-replay" || a == "--gpu-shader-verify" || a == "--clear-shader-cache" ||
+                   a == "--scan-game-shaders") {
             user_settings = false;
         }
     }
@@ -147,6 +157,7 @@ int main(int argc, char* argv[]) {
         Settings::ApplyOverrides(*config, user_overrides);
     }
     bool stock_bootstrap = false;
+    bool gpu_stability_test = false;
     u32 vram_log_seconds = 0; // --vram-log <seconds>: video memory budget/usage samples (SSPC-001)
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
@@ -228,6 +239,12 @@ int main(int argc, char* argv[]) {
             } else {
                 return Fail("--gpu-backend must be bridge|sspc");
             }
+        } else if (arg == "--render-mode" && has_value) {
+            const std::string_view mode = argv[++i];
+            if (mode != "legacy" && mode != "hybrid" && mode != "native_experimental" && mode != "native") {
+                return Fail("--render-mode must be legacy|hybrid|native_experimental");
+            }
+            config->render_mode = std::string(mode); // (P5.3; needs --gpu-backend sspc, else legacy runs)
         } else if (arg == "--gpu-native-validate") {
             config->gpu_native_validate = true;
         } else if (arg == "--gpu-native-diag") {
@@ -237,6 +254,8 @@ int main(int argc, char* argv[]) {
             if (config->gpu_capture_flip == 0) {
                 return Fail("--gpu-capture-native-frame <flip>: a flip number from 1");
             }
+        } else if (arg == "--gpu-stability-test") {
+            gpu_stability_test = true;
         } else if (arg == "--gpu-probe") {
             config->gpu_probe = true;
         } else if (arg == "--gpu-probe-window" && has_value) {
@@ -333,6 +352,8 @@ int main(int argc, char* argv[]) {
             config->shader_cache = false;
         } else if (arg == "--clear-shader-cache") {
             config->clear_shader_cache = true;
+        } else if (arg == "--scan-game-shaders") {
+            config->scan_game_shaders = true;
         } else {
             return Fail(std::string("unknown argument: ") + std::string(arg));
         }
@@ -443,6 +464,9 @@ int main(int argc, char* argv[]) {
     if (config->fault_test) {
         return Base::RunFaultSelfTest(config->logs_dir); // before any bridge code: no other handlers
     }
+    if (gpu_stability_test) {
+        return Gpu::Vk::RunStabilityTests(config->logs_dir);
+    }
     if (config->gpu_probe) {
         // P4.1.4: SecondSonPC's Vulkan foundation on its own (levels A/B); no game, no bridge renderer.
         return Gpu::Vk::RunProbe(config->logs_dir, config->gpu_device, config->gpu_probe_window_s, false);
@@ -474,11 +498,73 @@ int main(int argc, char* argv[]) {
                     ++removed;
                 }
             }
+            // P4.14: the native backend's generations (<dir>\<game>\native\<generation>, each with its shaders.pack)
+            for (const auto& gen : dirs_in(game / "native")) {
+                std::error_code ec;
+                if (std::filesystem::is_regular_file(gen / "shaders.pack", ec) &&
+                    std::filesystem::remove_all(gen, ec) > 0 && !ec) {
+                    ++removed;
+                }
+            }
         }
         SSPC_LOG(App, Info, "--clear-shader-cache: {} cache generation(s) removed from {}", removed,
                  config->shader_cache_dir.string());
         std::printf("SecondSonPC: %llu shader cache generation(s) removed from %s\n",
                     static_cast<unsigned long long>(removed), config->shader_cache_dir.string().c_str());
+        return 0;
+    }
+    if (config->scan_game_shaders) {
+        // P4.14 (docs\OFFLINE_SHADER_PRECOMPILATION.md): every GCN program of the game's packs by content, read only
+        Gpu::Shader::GameShaderIndex index;
+        Gpu::Shader::GameShaderIndex::ScanStats st;
+        std::string error;
+        const std::string game = config->game_dir.filename().string();
+        const auto out = Gpu::Shader::NativeCacheRoot(config->shader_cache_dir, game) / "game_programs.idx";
+        std::printf("SecondSonPC: scanning %s for shader programs (read only)...\n", config->game_dir.string().c_str());
+        const auto progress = [](void*, u64 done, u64 total) {
+            if (done % 100 == 0 || done == total) {
+                std::printf("  %llu / %llu packs\n", static_cast<unsigned long long>(done),
+                            static_cast<unsigned long long>(total));
+            }
+        };
+        if (!index.Scan(config->game_dir, st, error, progress, nullptr) || !index.Save(out, error)) {
+            return Fail("--scan-game-shaders: " + error);
+        }
+        std::map<u32, u64> by_type;
+        std::vector<u64> per_pack(index.Packs().size());
+        u64 shared = 0;
+        for (const auto& p : index.Programs()) {
+            ++by_type[p.footer_type];
+            shared += p.members > 1 ? 1 : 0;
+        }
+        for (const auto& m : index.Members()) {
+            ++per_pack[m.pack];
+        }
+        std::string text = fmt::format(
+            "game shader scan (P4.14): {} packs, {:.1f} GiB read in {:.1f} s; {} footers, {} without their program's "
+            "start; {} distinct programs ({} in more than one pack) -> {}\nby footer type:",
+            st.files, static_cast<double>(st.bytes) / (1ull << 30), st.ms / 1000.0, st.footers, st.unresolved,
+            index.Programs().size(), shared, out.string());
+        for (const auto& [type, n] : by_type) {
+            text += fmt::format(" type {}: {};", type, n);
+        }
+        text += "\nprograms (with repeats) per pack, the 40 largest:\n";
+        std::vector<std::pair<u64, size_t>> order;
+        for (size_t i = 0; i < per_pack.size(); ++i) {
+            if (per_pack[i] != 0) {
+                order.emplace_back(per_pack[i], i);
+            }
+        }
+        std::ranges::sort(order, std::greater<>{});
+        for (size_t i = 0; i < order.size() && i < 40; ++i) {
+            text += fmt::format("  {:6} {}\n", order[i].first, index.Packs()[order[i].second]);
+        }
+        text += fmt::format("packs with programs: {} of {}\n", order.size(), index.Packs().size());
+        std::error_code ec;
+        std::filesystem::create_directories(config->logs_dir, ec);
+        std::ofstream(config->logs_dir / "game_shader_scan.txt", std::ios::trunc) << text;
+        SSPC_LOG(App, Info, "{}", text);
+        std::printf("%s", text.c_str());
         return 0;
     }
     Base::StartVramLog(vram_log_seconds);

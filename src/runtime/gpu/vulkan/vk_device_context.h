@@ -10,6 +10,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <filesystem>
 
 #include <memory>
@@ -50,6 +51,7 @@ struct DeviceCaps {
     bool attachment_feedback_loop = false;
     bool image_view_min_lod = false;
     bool maintenance5 = false;
+    bool swapchain_maintenance1 = false; ///< present fences: required for safe native presentation teardown
     bool debug_utils = false;
     /// SSPC_GPU_MARKERS=1 (P4.6-G6, diagnostic): debug labels around the recorded commands and object names, for a
     /// GPU profiler's capture (NVIDIA Nsight Graphics GPU Trace) to be read by pass/pipeline; needs VK_EXT_debug_utils
@@ -84,6 +86,10 @@ public:
     VkPhysicalDevice Physical() const { return physical_; }
     VkDevice Device() const { return device_; }
     VkQueue Queue() const { return queue_; }
+    /// First fatal runtime error, shared by recording, presentation and timeline waiters.
+    void Fail(const char* where, VkResult result);
+    VkResult Failure() const { return failure_.load(std::memory_order_acquire); }
+    bool Failed() const { return Failure() != VK_SUCCESS; }
     u32 QueueFamily() const { return family_; }
     const DeviceCaps& Caps() const { return caps_; }
     const VkPhysicalDeviceMemoryProperties& Memory() const { return memory_; }
@@ -135,6 +141,7 @@ private:
     u32 vendor_id_ = 0, device_id_ = 0;
     std::array<u8, VK_UUID_SIZE> cache_uuid_{};
     std::mutex queue_mutex_;
+    std::atomic<VkResult> failure_{VK_SUCCESS};
 };
 
 } // namespace SecondSon::Gpu::Vk

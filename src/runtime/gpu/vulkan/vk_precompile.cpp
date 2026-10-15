@@ -44,7 +44,8 @@ double TscMs(u64 ticks) {
 
 // ---- the pipeline cache file
 
-PipelineCacheFile::PipelineCacheFile(DeviceContext& ctx, std::filesystem::path file) : ctx_(ctx), file_(std::move(file)) {}
+PipelineCacheFile::PipelineCacheFile(DeviceContext& ctx, GS::ShaderDiskCache& owner)
+    : ctx_(ctx), owner_(owner), file_(owner.Dir() / "vulkan.bin") {}
 
 PipelineCacheFile::~PipelineCacheFile() {
     if (cache_ != VK_NULL_HANDLE) {
@@ -55,6 +56,22 @@ PipelineCacheFile::~PipelineCacheFile() {
 bool PipelineCacheFile::Load() {
     const u64 t0 = __rdtsc();
     std::vector<u8> data;
+    // SSPC_DIAG_PIPELINE_CACHE_DRIVER=<hex>: the file is checked as if the driver had this version (a driver update,
+    // without changing the driver); SSPC_DIAG_PIPELINE_CACHE_TEAR=<bytes>: the next save stops there and the process
+    // ends (a crash while saving)
+    u32 driver = ctx_.DriverVersion();
+    if (char v[24] = {}; GetEnvironmentVariableA("SSPC_DIAG_PIPELINE_CACHE_DRIVER", v, sizeof(v)) > 0) {
+        driver = static_cast<u32>(std::strtoul(v, nullptr, 16));
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_PIPELINE_CACHE_DRIVER={:#x} - the pipeline cache file is checked "
+                               "against this driver version",
+                 driver);
+    }
+    if (char v[24] = {}; GetEnvironmentVariableA("SSPC_DIAG_PIPELINE_CACHE_TEAR", v, sizeof(v)) > 0) {
+        tear_ = std::max<u64>(std::strtoull(v, nullptr, 10), 1);
+        crash_after_tear_ = true;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_PIPELINE_CACHE_TEAR={} - the next save is cut and the process ends",
+                 tear_);
+    }
     std::ifstream in(file_, std::ios::binary);
     if (!in) {
         note_ = "no file: an empty cache";
@@ -68,10 +85,9 @@ bool PipelineCacheFile::Load() {
             note_ = "another format version: an empty cache";
         } else if (h.vendor_id != ctx_.VendorId() || h.device_id != ctx_.DeviceId()) {
             note_ = fmt::format("written for another device ({:04x}:{:04x}): an empty cache", h.vendor_id, h.device_id);
-        } else if (h.driver_version != ctx_.DriverVersion() ||
+        } else if (h.driver_version != driver ||
                    std::memcmp(h.uuid, ctx_.PipelineCacheUuid().data(), VK_UUID_SIZE) != 0) {
-            note_ = fmt::format("written by another driver ({:#x}, now {:#x}): an empty cache", h.driver_version,
-                                ctx_.DriverVersion());
+            note_ = fmt::format("written by another driver ({:#x}, now {:#x}): an empty cache", h.driver_version, driver);
         } else if (h.data_bytes > (1ull << 31)) {
             note_ = "an implausible size: an empty cache";
         } else {
@@ -115,6 +131,10 @@ bool PipelineCacheFile::Save() {
         return false;
     }
     std::scoped_lock lock{save_mutex_};
+    return owner_.WithWriteOwnership([this] { return SaveOwned(); });
+}
+
+bool PipelineCacheFile::SaveOwned() {
     const u64 t0 = __rdtsc();
     size_t size = 0;
     if (Fn().vkGetPipelineCacheData(ctx_.Device(), cache_, &size, nullptr) != VK_SUCCESS || size == 0) {
@@ -150,6 +170,10 @@ bool PipelineCacheFile::Save() {
         const u64 bytes = tear_ != 0 ? std::min<u64>(std::exchange(tear_, 0), all.size()) : all.size();
         out.write(reinterpret_cast<const char*>(all.data()), static_cast<std::streamsize>(bytes));
         if (!out || bytes != all.size()) {
+            if (crash_after_tear_) {
+                out.flush();
+                TerminateProcess(GetCurrentProcess(), 0xDEAD); // (the diagnostic crash while saving)
+            }
             return false; // (self-test: the process "died" here - the old file is untouched)
         }
     }

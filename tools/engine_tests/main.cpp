@@ -6,10 +6,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -18,6 +20,7 @@
 #include "engine/guest_hooks.h"
 #include "engine/guest_probe.h"
 #include "engine/job_system.h"
+#include "engine/particles/smoke_quality.h"
 #include "engine/render/dcb_scan.h"
 #include "engine/render/native_draw.h"
 #include "engine/render/native_render_ops.h"
@@ -372,6 +375,61 @@ void TestEntryProbe() {
     CHECK(g_add_original(20, 22) == 42);                         // the trampoline is the original function
     CHECK(reinterpret_cast<AddFn>(page)(2, 3) == 1005);          // callers of the entry reach the probe
     CHECK(reinterpret_cast<AddFn>(page)(-7, 7) == 1000 && g_add_probe_calls == 2);
+}
+
+void TestSmokeScale() {
+    using Particles::ScaleSpawn;
+    using Particles::SmokeDensity;
+    CHECK(SmokeDensity("high") == 1.0f && SmokeDensity("medium") == 0.65f && SmokeDensity("low") == 0.35f);
+    CHECK(SmokeDensity("verylow") == 0.20f && SmokeDensity("0.5") == 0.5f && SmokeDensity("0") == 0.0f);
+    CHECK(!SmokeDensity("bogus") && !SmokeDensity("1.5") && !SmokeDensity("") && !SmokeDensity("-0.1"));
+    CHECK(!SmokeDensity("nan") && !SmokeDensity("inf") && !SmokeDensity(" 0.5") && !SmokeDensity("0.5x"));
+    CHECK(Particles::ParticleLevel("auto") == -1 && Particles::ParticleLevel("full") == 0 &&
+          Particles::ParticleLevel("half") == 1 && Particles::ParticleLevel("quarter") == 2 &&
+          !Particles::ParticleLevel("Half") && !Particles::ParticleLevel(""));
+    // without an installed probe the setting is kept for Install, the density in effect stays the original
+    Particles::SetSmokeQuality("low");
+    CHECK(Particles::CurrentDensity() == 1.0f);
+    Particles::SetSmokeQuality("high");
+
+    float carry = 0.5f;
+    CHECK(ScaleSpawn(7, 1.0f, carry, false) == 7 && carry == 0.5f); // the original density: untouched
+    CHECK(ScaleSpawn(0, 0.35f, carry, true) == 0);
+    // Long-run rate is exact: a continuous emitter (10 per frame, 1 per frame) and bursts of 30.
+    for (const auto [added, density] : {std::pair{10u, 0.35f}, std::pair{1u, 0.20f}, std::pair{30u, 0.65f}}) {
+        carry = 0.5f;
+        u64 kept = 0;
+        bool over = false;
+        for (int i = 0; i < 1000; ++i) {
+            const u32 k = ScaleSpawn(added, density, carry, false);
+            over |= k > added;
+            kept += k;
+        }
+        const double want = 1000.0 * added * density;
+        CHECK(!over && std::abs(static_cast<double>(kept) - want) <= 1.0);
+    }
+    // An emitter with nothing alive always shows a particle; density 0 (diagnostics) spawns nothing.
+    carry = 0.0f;
+    CHECK(ScaleSpawn(1, 0.20f, carry, true) == 1 && carry < 0.0f);
+    carry = 0.0f;
+    CHECK(ScaleSpawn(3, 0.0f, carry, true) == 0);
+
+    // The engine's name hash: reflection-table names and emitter ids seen in the village and on the beach.
+    using Particles::EngineNameHash;
+    using Particles::SmokeEmitterName;
+    CHECK(EngineNameHash("PARTICLE_COUNT_RATIO") == 0xe8c7ff5f056cdb5aull);
+    CHECK(EngineNameHash("ALPHA") == 0x260578ae6ull && EngineNameHash("lifetime") == 0x298973b4039f6bull);
+    CHECK(EngineNameHash("smoke01") == 0x00007014345e5a98ull && EngineNameHash("thick_smoke") == 0xdb15fac831af4989ull);
+    CHECK(EngineNameHash("flames_small") == 0xa66d04e778429f20ull);
+    std::string name;
+    CHECK(SmokeEmitterName(0x00007014345e5a98ull, &name) && name == "smoke01");
+    CHECK(SmokeEmitterName(0xdb15fac831af4989ull, &name) && name == "thick_smoke");
+    CHECK(SmokeEmitterName(EngineNameHash("smoke_near")) && SmokeEmitterName(EngineNameHash("smoke")));
+    CHECK(SmokeEmitterName(EngineNameHash("campfire_smoke_01"))); // longer than the exact recovery: the dictionary
+    CHECK(!SmokeEmitterName(0xa66d04e778429f20ull) && !SmokeEmitterName(0x8d939ba84d2e8e69ull)); // flames_*
+    CHECK(!SmokeEmitterName(EngineNameHash("embers"), &name) && name == "embers");
+    CHECK(!SmokeEmitterName(EngineNameHash("thick_steam")) && !SmokeEmitterName(EngineNameHash("light_fire")));
+    CHECK(!SmokeEmitterName(EngineNameHash("dust_cloud")) && !SmokeEmitterName(EngineNameHash("foam_out")));
 }
 
 struct Pm4Writer {
@@ -824,6 +882,7 @@ int main(int argc, char** argv) {
     TestQuit();
     TestStress();
     TestEntryProbe();
+    TestSmokeScale();
     TestDcbScan();
     TestPassGraph();
     TestNativeDrawShadow();

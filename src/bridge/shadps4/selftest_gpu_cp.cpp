@@ -1043,6 +1043,154 @@ void TestTrace(TestGroup& g, const App::Config& cfg) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+
+/// P5.3 direct path (engine/render/native_render_ops.h): descriptions in the draws' trailing NOPs, the native stream's
+/// runs at their tokens - in the stream's order, once.
+void TestNativeDirect(TestGroup& g) {
+    namespace R = Engine::Render;
+    R::TableShape a;
+    a.dwords = 48;
+    a.refs = 2;
+    a.sgpr[1] = 4;
+    a.offset[1] = 0x10;
+    R::TableShape b = a;
+    b.offset[1] = 0x12;
+    u32 ia = 0, ia2 = 0, ib = 0;
+    const bool interned = R::InternShape(a, ia) && R::InternShape(a, ia2) && R::InternShape(b, ib);
+    const R::TableShape* sa = R::ShapeOf(ia);
+    g.Check("table shapes interned: one shape one id, another shape another; 0 and ids never given name none",
+            interned && ia != 0 && ia == ia2 && ib != ia && sa != nullptr && std::memcmp(sa, &a, sizeof(a)) == 0 &&
+                R::ShapeOf(0) == nullptr && R::ShapeOf(R::kMaxShapes - 1) == nullptr,
+            fmt::format("ids {} {} {}", ia, ia2, ib));
+
+    const auto draw_with_nop = [](Stream& s, u32 count, const std::array<u32, 4>& nop) {
+        s.Draw(count);
+        s.d.insert(s.d.end(), nop.begin(), nop.end());
+    };
+    const std::array<u32, 4> described{R::kDrawNopHeader, R::kDescribeMagic, R::DescribeWord(5, ia), ib};
+    {
+        R::SetDirect(true);
+        Rig r;
+        Stream s;
+        draw_with_nop(s, 3, described);
+        draw_with_nop(s, 4, {R::kDrawNopHeader, 0, 0, 0}); // the driver's NOP as it writes it
+        draw_with_nop(s, 5, {R::kDrawNopHeader, R::kDescribeMagic, R::DescribeWord(5, R::kMaxShapes - 1), 0});
+        const StepStatus st = r.Gfx(s);
+        const auto& d = r.rec.draws;
+        g.Check("a draw whose trailing NOP carries a description gets the pass and the VS/PS tables; the driver's plain "
+                "NOP and an unknown shape id leave the draw undescribed (the frontend's own path)",
+                st == StepStatus::Idle && d.size() == 3 && d[0].engine_pass == 5 && d[0].engine_vs.dwords == 48 &&
+                    d[0].engine_vs.refs == 2 && d[0].engine_vs.sgpr[1] == 4 && d[0].engine_vs.offset[1] == 0x10 &&
+                    d[0].engine_ps.offset[1] == 0x12 && d[1].engine_pass == Cp::kNoEnginePass &&
+                    d[2].engine_pass == Cp::kNoEnginePass,
+                fmt::format("{} draws", d.size()));
+        R::SetDirect(false);
+        Rig off;
+        Stream s2;
+        draw_with_nop(s2, 3, described);
+        off.Gfx(s2);
+        g.Check("without the direct path no description is read from a NOP",
+                off.rec.draws.size() == 1 && off.rec.draws[0].engine_pass == Cp::kNoEnginePass, "");
+    }
+    {
+        R::SetDirect(true);
+        Rig r;
+        R::StreamCursor c;
+        constexpr u64 kAt = kCmd + 0x100; // where the engine's DCB would carry the token (the run is found by its content)
+        u32 token[R::kStreamTokenDwords] = {}, unused[R::kStreamTokenDwords] = {};
+        // the commit's registers: PS user data 0, VS user data 2
+        u32* op = R::StreamReserve(c, kAt, 5);
+        bool ok = op != nullptr;
+        if (ok) {
+            const u32 w[5] = {R::OpHeader(R::StreamOp::Registers, 4), 0x2C0C, 0x1111, 0x2C4E, 0x2222};
+            std::memcpy(op, w, sizeof(w));
+        }
+        const bool first_joined = ok && R::StreamCommit(c, 5, token);
+        R::StreamTokenWritten(c, kAt + 16);
+        // render state: CB_BLEND0_CONTROL and colour target 0's extent (a pseudo register)
+        op = R::StreamReserve(c, kAt + 16, 5);
+        ok = ok && op != nullptr;
+        if (ok) {
+            const u32 w[5] = {R::OpHeader(R::StreamOp::State, 4), 0xA1E0, 0x12345, R::kStateCbExtent0, 0x00400030};
+            std::memcpy(op, w, sizeof(w));
+        }
+        const bool state_joined = ok && R::StreamCommit(c, 5, unused);
+        op = R::StreamReserve(c, kAt + 16, 1 + R::kStreamDrawWords);
+        ok = ok && op != nullptr;
+        if (ok) {
+            const u32 w[8] = {R::OpHeader(R::StreamOp::Draw, R::kStreamDrawWords), 1, 1, 33, 0x10090000, 0, ia, ib};
+            std::memcpy(op, w, sizeof(w));
+        }
+        const bool draw_joined = ok && R::StreamCommit(c, 8, unused);
+        Stream s;
+        s.Sh(0x2C0C, {0x0AAA}); // the game's packets before the run
+        s.d.insert(s.d.end(), token, token + R::kStreamTokenDwords);
+        s.Sh(0x2C0C, {0x0BBB}); // ... and after it
+        s.Draw(7);
+        const u64 runs0 = R::Direct().runs.load(), stale0 = R::Direct().runs_stale.load();
+        r.Gfx(s);
+        const auto& d = r.rec.draws;
+        constexpr size_t kPs = static_cast<size_t>(Cp::Stage::Ps), kVs = static_cast<size_t>(Cp::Stage::Vs);
+        g.Check("operations with no game packet between them share one run (one token); the run runs at its token: "
+                "commit registers, render state, the native draw with its pass and tables - before the game's next "
+                "packets",
+                !first_joined && state_joined && draw_joined && token[1] == R::kStreamMagic && d.size() == 2 &&
+                    d[0].index_count == 33 && d[0].index_base == 0x10090000 && d[0].engine_pass == 1 &&
+                    d[0].engine_vs.dwords == 48 && d[0].engine_ps.offset[1] == 0x12 && d[0].user_data[kPs][0] == 0x1111 &&
+                    d[0].user_data[kVs][2] == 0x2222 && d[0].cb_extent[0] == 0x00400030 &&
+                    d[1].user_data[kPs][0] == 0x0BBB && d[1].engine_pass == Cp::kNoEnginePass &&
+                    r.cp.Registers().Get(0xA1E0) == 0x12345 && R::Direct().runs.load() == runs0 + 1 &&
+                    R::Direct().runs_stale.load() == stale0,
+                fmt::format("{} draws", d.size()));
+        r.rec.draws.clear();
+        r.Gfx(s);
+        g.Check("the same token again (a buffer replayed): its run was taken - nothing of it runs twice; counted",
+                r.rec.draws.size() == 1 && r.rec.draws[0].index_count == 7 && R::Direct().runs_stale.load() == stale0 + 1,
+                "");
+        // the processor took the run: an operation for it now is not lost - it starts a run of its own
+        op = R::StreamReserve(c, kAt + 16, 3);
+        u32 token2[R::kStreamTokenDwords] = {};
+        if (op != nullptr) {
+            const u32 w[3] = {R::OpHeader(R::StreamOp::Registers, 2), 0x2C0C, 0x3333};
+            std::memcpy(op, w, sizeof(w));
+        }
+        const bool late_joined = op == nullptr || R::StreamCommit(c, 3, token2);
+        R::StreamTokenWritten(c, kAt + 0x200);
+        // a game packet after the token (the DCB moved on): the next operation starts a new run
+        op = R::StreamReserve(c, kAt + 0x208, 3);
+        u32 token3[R::kStreamTokenDwords] = {};
+        if (op != nullptr) {
+            const u32 w[3] = {R::OpHeader(R::StreamOp::Registers, 2), 0x2C0C, 0x4444};
+            std::memcpy(op, w, sizeof(w));
+        }
+        const bool moved_joined = op == nullptr || R::StreamCommit(c, 3, token3);
+        Stream s3;
+        s3.d.insert(s3.d.end(), token2, token2 + R::kStreamTokenDwords);
+        s3.Draw(8);
+        s3.d.insert(s3.d.end(), token3, token3 + R::kStreamTokenDwords);
+        s3.Draw(9);
+        r.rec.draws.clear();
+        r.Gfx(s3);
+        const auto& d3 = r.rec.draws;
+        g.Check("an operation after the processor took its run, and one after a game packet: each a run and token of "
+                "its own, run in the stream's order",
+                !late_joined && !moved_joined && token2[2] != token[2] && token3[2] != token2[2] && d3.size() == 2 &&
+                    d3[0].user_data[kPs][0] == 0x3333 && d3[1].user_data[kPs][0] == 0x4444,
+                fmt::format("{} draws", d3.size()));
+        Stream bad;
+        bad.d.insert(bad.d.end(), {R::kStreamTokenHeader, R::kStreamMagic, 5u | (4000u << 16), 0xDEADu});
+        bad.Draw(10);
+        r.rec.draws.clear();
+        const u64 stale1 = R::Direct().runs_stale.load();
+        r.Gfx(bad);
+        g.Check("a token naming no run (a block not given out with that generation): nothing run, counted; the "
+                "stream goes on",
+                r.rec.draws.size() == 1 && R::Direct().runs_stale.load() == stale1 + 1, "");
+        R::SetDirect(false);
+    }
+}
+
 } // namespace
 
 std::vector<TestGroup> TestGpuCommandProcessor(const App::Config& cfg) {
@@ -1061,6 +1209,13 @@ std::vector<TestGroup> TestGpuCommandProcessor(const App::Config& cfg) {
     TestErrors(out[4]);
     TestRings(out[5]);
     TestTrace(out[6], cfg);
+    return out;
+}
+
+std::vector<TestGroup> TestGpuNativeDirect() {
+    std::vector<TestGroup> out(1);
+    out[0].name = "GpuCp(direct)";
+    TestNativeDirect(out[0]);
     return out;
 }
 

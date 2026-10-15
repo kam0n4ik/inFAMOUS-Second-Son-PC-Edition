@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #include <windows.h>
 
@@ -235,6 +238,234 @@ DrawCounters& Counters() {
 NativeControl& Control() {
     static NativeControl control;
     return control;
+}
+
+// --- P5.3 direct path ---------------------------------------------------------------------------------------------
+
+namespace {
+
+static_assert(sizeof(TableShape) == 24, "TableShape is compared and hashed as its bytes");
+
+/// The interned shapes: entries written once under the lock, then found without it (a slot holds an entry's id).
+struct ShapeTable {
+    static constexpr u32 kSlots = kMaxShapes * 2; ///< at most half full: a probe always meets an empty slot
+    std::mutex insert;
+    TableShape entries[kMaxShapes];
+    std::atomic<u32> count{1}; ///< id 0: no table
+    std::atomic<u32> slots[kSlots] = {};
+};
+
+ShapeTable& Shapes() {
+    static ShapeTable* table = new ShapeTable(); // (never freed: the processor may still read it at exit)
+    return *table;
+}
+
+u32 ShapeSlot(const TableShape& s) {
+    u64 w[3];
+    std::memcpy(w, &s, sizeof(w));
+    u64 h = w[0] * 0x9E3779B97F4A7C15ull;
+    h = (h ^ w[1]) * 0xBF58476D1CE4E5B9ull;
+    h = (h ^ w[2]) * 0x94D049BB133111EBull;
+    return static_cast<u32>(h ^ (h >> 31)) & (ShapeTable::kSlots - 1);
+}
+
+std::atomic<bool> g_direct{false};
+
+constexpr u64 kBlockSealed = 1ull << 31; ///< block state: runs written (bits 0..30), sealed, runs done (bits 32..)
+constexpr u32 kRunTaken = 1u << 31;      ///< run state: its words | taken by the processor
+
+struct Stream {
+    std::unique_ptr<u32[]> words{new u32[size_t{kStreamBlocks} * kStreamBlockWords]};
+    std::atomic<u64> state[kStreamBlocks] = {};
+    std::atomic<u32> generation[kStreamBlocks] = {};
+    std::mutex free_mutex;
+    std::vector<u16> free;
+    Stream() {
+        free.reserve(kStreamBlocks);
+        for (u32 b = kStreamBlocks; b-- > 0;) {
+            free.push_back(static_cast<u16>(b));
+        }
+    }
+    u32* Block(u32 b) {
+        return words.get() + size_t{b} * kStreamBlockWords;
+    }
+};
+
+Stream& TheStream() {
+    static Stream* stream = new Stream(); // (never freed, as the shapes)
+    return *stream;
+}
+
+s32 AllocBlock(u32& generation) {
+    Stream& s = TheStream();
+    u16 b = 0;
+    {
+        std::scoped_lock lock(s.free_mutex);
+        if (s.free.empty()) {
+            return -1;
+        }
+        b = s.free.back();
+        s.free.pop_back();
+    }
+    s.state[b].store(0, std::memory_order_relaxed);
+    generation = s.generation[b].fetch_add(1, std::memory_order_acq_rel) + 1;
+    Direct().blocks_in_use.fetch_add(1, std::memory_order_relaxed);
+    return b;
+}
+
+void FreeBlock(u32 b) {
+    Stream& s = TheStream();
+    Direct().blocks_in_use.fetch_sub(1, std::memory_order_relaxed);
+    std::scoped_lock lock(s.free_mutex);
+    s.free.push_back(static_cast<u16>(b));
+}
+
+/// The engine left the block: free once the processor is done with every run in it.
+void SealBlock(u32 b) {
+    const u64 old = TheStream().state[b].fetch_or(kBlockSealed, std::memory_order_acq_rel);
+    if ((old >> 32) == (old & (kBlockSealed - 1))) {
+        FreeBlock(b);
+    }
+}
+
+} // namespace
+
+bool InternShape(const TableShape& shape, u32& id) {
+    ShapeTable& t = Shapes();
+    constexpr u32 mask = ShapeTable::kSlots - 1;
+    const u32 first = ShapeSlot(shape);
+    for (u32 i = first;; i = (i + 1) & mask) {
+        const u32 v = t.slots[i].load(std::memory_order_acquire);
+        if (v == 0) {
+            break;
+        }
+        if (std::memcmp(&t.entries[v], &shape, sizeof(shape)) == 0) {
+            id = v;
+            return true;
+        }
+    }
+    std::scoped_lock lock(t.insert);
+    u32 i = first;
+    for (;; i = (i + 1) & mask) { // again: another thread may have added it meanwhile
+        const u32 v = t.slots[i].load(std::memory_order_relaxed);
+        if (v == 0) {
+            break;
+        }
+        if (std::memcmp(&t.entries[v], &shape, sizeof(shape)) == 0) {
+            id = v;
+            return true;
+        }
+    }
+    const u32 n = t.count.load(std::memory_order_relaxed);
+    if (n >= kMaxShapes) {
+        Direct().shapes_full.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    t.entries[n] = shape;
+    t.count.store(n + 1, std::memory_order_release);
+    t.slots[i].store(n, std::memory_order_release);
+    id = n;
+    return true;
+}
+
+const TableShape* ShapeOf(u32 id) {
+    ShapeTable& t = Shapes();
+    return id == 0 || id >= t.count.load(std::memory_order_acquire) ? nullptr : &t.entries[id];
+}
+
+void SetDirect(bool on) {
+    g_direct.store(on, std::memory_order_release);
+}
+
+bool DirectOn() {
+    return g_direct.load(std::memory_order_relaxed);
+}
+
+u32* StreamReserve(StreamCursor& c, u64 cmd_ptr, u32 max_words) {
+    Stream& s = TheStream();
+    c.append = c.token_end != 0 && cmd_ptr == c.token_end && c.block >= 0 && c.used + 2 + max_words <= kStreamBlockWords;
+    if (c.append) {
+        return s.Block(static_cast<u32>(c.block)) + c.used;
+    }
+    if (c.block < 0 || c.used + 2 + max_words > kStreamBlockWords) {
+        c.token_end = 0; // (the open run stays in the block left)
+        if (c.block >= 0) {
+            SealBlock(static_cast<u32>(c.block));
+            c.block = -1;
+        }
+        const s32 b = AllocBlock(c.generation);
+        if (b < 0) {
+            Direct().stream_full.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+        c.block = b;
+        c.used = 0;
+    }
+    return s.Block(static_cast<u32>(c.block)) + c.used + 2;
+}
+
+bool StreamCommit(StreamCursor& c, u32 words, u32* token) {
+    Stream& s = TheStream();
+    u32* base = s.Block(static_cast<u32>(c.block));
+    if (c.append) {
+        u32 expect = c.run_words;
+        if (std::atomic_ref<u32>(base[c.run_at])
+                .compare_exchange_strong(expect, c.run_words + words, std::memory_order_release,
+                                         std::memory_order_relaxed)) {
+            c.used += words;
+            c.run_words += words;
+            return true;
+        }
+        // the processor took the run already (its DCB submitted while still recorded): this operation starts one here
+        std::memmove(base + c.used + 2, base + c.used, size_t{words} * 4);
+    }
+    c.run_at = c.used;
+    base[c.run_at + 1] = c.generation;
+    s.state[c.block].fetch_add(1, std::memory_order_release); // a run written (before any token names it)
+    std::atomic_ref<u32>(base[c.run_at]).store(words, std::memory_order_release);
+    c.used = c.run_at + 2 + words;
+    c.run_words = words;
+    c.token_end = 0;
+    token[0] = kStreamTokenHeader;
+    token[1] = kStreamMagic;
+    token[2] = static_cast<u32>(c.block) | (c.run_at << 16);
+    token[3] = c.generation;
+    return false;
+}
+
+bool StreamTake(std::span<const u32> token, StreamRun& run) {
+    if (token.size() != kStreamTokenDwords || token[1] != kStreamMagic) {
+        return false;
+    }
+    const u32 block = token[2] & 0xFFFF;
+    const u32 at = token[2] >> 16;
+    const u32 generation = token[3];
+    if (block >= kStreamBlocks || at + 2 > kStreamBlockWords) {
+        return false;
+    }
+    Stream& s = TheStream();
+    if (s.generation[block].load(std::memory_order_acquire) != generation) {
+        return false; // the block was given out again: a stale token (left untouched)
+    }
+    u32* w = s.Block(block) + at;
+    const u32 st = std::atomic_ref<u32>(w[0]).fetch_or(kRunTaken, std::memory_order_acq_rel);
+    if ((st & kRunTaken) != 0 || w[1] != generation || at + 2 + st > kStreamBlockWords) {
+        return false;
+    }
+    run = StreamRun{w + 2, st, block};
+    return true;
+}
+
+void StreamDone(const StreamRun& run) {
+    const u64 old = TheStream().state[run.block].fetch_add(1ull << 32, std::memory_order_acq_rel);
+    if ((old & kBlockSealed) != 0 && (old >> 32) + 1 == (old & (kBlockSealed - 1))) {
+        FreeBlock(run.block);
+    }
+}
+
+DirectCounters& Direct() {
+    static DirectCounters counters;
+    return counters;
 }
 
 } // namespace SecondSon::Engine::Render

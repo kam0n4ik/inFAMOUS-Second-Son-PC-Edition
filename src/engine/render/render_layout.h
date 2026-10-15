@@ -10,9 +10,14 @@ namespace SecondSon::Engine::Render::Layout {
 
 // --- Frame object (DAT_00f1bcd0; SubmitFrame 0x1f1e30, AcquireContext 0x1f2c60) ------------------------------------
 inline constexpr u64 kFrame = 0xf1bcd0;
+inline constexpr u64 kFrameVideoOut = 0x14;      ///< s32: the VideoOut handle SubmitFrame flips on
+inline constexpr u64 kFrameDisplayPair = 0x20;   ///< s32: display buffers 2n, 2n+1 (the flip's buffer: n * 2 + half)
 inline constexpr u64 kFrameArenaPairs = 0x28;    ///< 5 x {base[2], current, end, size u32, half u32}, stride 0x30
 inline constexpr u64 kFrameArenaStride = 0x30;
+inline constexpr u64 kFrameLabelIndex = 0x124;   ///< s32: the frame's label in kLabelArray
 inline constexpr u64 kFrameCounter = 0x128;      ///< u64: fence value written by the frame's EOP
+inline constexpr u64 kFramePrevFence = 0x130;    ///< u64: the last submitted frame's fence (SubmitFrame waits for it)
+inline constexpr u64 kFrameDisplayHalf = 0x17dc; ///< s32 0/1: the half of kFrameDisplayPair, toggled after each flip
 inline constexpr u64 kFramePreContext = 0x1f80;  ///< context R recorded on the main thread before the pool
 inline constexpr u64 kFramePostContext = 0xfe10; ///< context R after the pool
 inline constexpr u64 kFrameCurrent = 0x1dca0;    ///< R*: the main thread's current context
@@ -21,6 +26,14 @@ inline constexpr u64 kPoolSlotStride = 0xdef0;
 inline constexpr u32 kPoolSlots = 254;
 inline constexpr u64 kFrameAcquired = 0xdf0ef0; ///< s32: slots acquired this frame (atomic)
 inline constexpr u64 kFrameRecorded = 0xdf0ef4; ///< s32: slots recorded this frame (atomic)
+
+// --- GPU labels and the async compute queue (P5.4; SubmitFrame 0x1f1e30, compute queue 0x168b70 / 0x1691e0 / 0x1695e0)
+inline constexpr u64 kLabelArray = 0xe17e80;   ///< u64*: the engine's labels, 8 bytes each, the value in the low 32 bits
+inline constexpr u64 kComputeQueue = 0x7d3cf10; ///< the particles' async compute queue object (main loop 0x29c8d0)
+inline constexpr u64 kQueueSubmitted = 0x1b88;  ///< u32: the value its last submission's RELEASE_MEM writes
+inline constexpr u64 kQueueLabelIndex = 0x1b8c; ///< s32: its label in kLabelArray
+inline constexpr u64 kSubmitMode = 0x1d20388;    ///< s32: where SubmitFrame calls sceGnmSubmitDone (0: before its wait)
+inline constexpr u64 kSubmitFlipArg = 0x1d20384; ///< s32: the flip argument SubmitFrame passes
 
 // --- Render context R (0xDE90 bytes, vtable 0xcd14f8; Init 0x11efc0, Reset 0x11f050) --------------------------------
 inline constexpr u64 kContextSize = 0xde90;

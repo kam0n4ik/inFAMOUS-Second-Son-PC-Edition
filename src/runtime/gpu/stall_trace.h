@@ -71,6 +71,18 @@ enum class Ev : u16 {
     GameSubmitLock, ///< a submission waits for the driver's submit lock
     GameIdleWait,   ///< a submission waits until no SubmitDone holds the submission lock
     GameSubmitFlip, ///< sceGnmSubmitAndFlipCommandBuffers from entry to return
+    // P5.4 frame lifecycle (SSPC_P54_FRAME_TRACE=1, engine/render/frame_trace.h): the game's frame and its waits
+    GameSubmitFrame, ///< the engine's SubmitFrame 0x1f1e30 from entry to return (a = the frame's fence after it)
+    GameComputeWait, ///< the engine's wait 0x1695e0 for its async compute queue's label (a = label address,
+                     ///< b = the value waited for, c = 1: it had to wait)
+    GameSubmitDone,  ///< sceGnmSubmitDone from entry to return
+    GameDingDong,    ///< instant: sceGnmDingDong (a = vqid, b = the new write offset in dwords)
+    // the command processor's fences (EOP / EOS / RELEASE_MEM / ...), on the thread that writes them
+    FenceHeld,       ///< instant: a fence waits for the GPU work before it (a = address, b = value, c = queue)
+    FenceWrite,      ///< instant: a fence written to guest memory (a = address, b = value low 32 bits, c = queue)
+    GameEarlySubmit, ///< P5.4 SSPC_P54_EARLY_SUBMIT: the frame handed on inside sceGnmSubmitDone (a = DCBs, b = buffer)
+    CpQueueSlice,    ///< P5.4: thread 1 steps one queue in a round (a = queue, b = packets, c = how it stopped: 0 nothing
+                     ///< left, 1 blocked, 2 the round's cap, 3 faulted)
     Count,
 };
 constexpr size_t kEvents = static_cast<size_t>(Ev::Count);

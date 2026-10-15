@@ -245,9 +245,10 @@ private:
     /// The shadow of exactly [b, e) (made, or its host bytes copied in when not in step: `inited`); nullptr: none.
     WbShadow* ShadowFor(u64 b, u64 e, VkCommandBuffer cb, u64 seq, bool& inited);
     bool host_wait_binds_ = false; ///< the binds complete on the host (validation runs; SSPC_DIAG_BIND_HOST_WAIT=1)
-    /// P4.9 experiment (off; SSPC_P49_BLOCK_UPLOAD=1): a block's first missing page brings the block's other used,
-    /// invalid pages along - village GPU busy -5.9 ms a frame, but no FPS gain measured (docs\PHASE4_P49_*.md)
-    bool block_upload_ = false;
+    /// P4.9-B (on by default since 2026-10-14; SSPC_P49_BLOCK_UPLOAD=0: off): a block's first missing page brings the
+    /// block's other used, invalid pages along - village GPU busy -7 ms, 26.4 -> 31.3 FPS with the parallel command
+    /// processor (docs\PHASE4_P49_*.md, docs\SMOKE_QUALITY.md)
+    bool block_upload_ = true;
     void (*before_upload_)(void*) = nullptr;
     void* before_upload_ctx_ = nullptr;
     BufferCacheStats stats_;

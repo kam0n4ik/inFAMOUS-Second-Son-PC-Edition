@@ -25,6 +25,8 @@
 #include "engine/render/dcb_scan.h"
 #include "engine/render/pass_graph.h"
 #include "engine/render/render_layout.h"
+#include "runtime/gpu/gnm/gnm_driver.h"
+#include "runtime/gpu/stall_trace.h"
 
 namespace SecondSon::Engine::Render::Trace {
 
@@ -71,6 +73,8 @@ struct Options {
 u64 g_base = 0;
 Options g_options;
 SubmitFrameFn g_submit = nullptr;
+bool g_lifecycle = false; ///< P5.4: SubmitFrame's span goes to the stall trace (SSPC_P54_FRAME_TRACE=1)
+void SubmitFrameTimed(u8* frame, u32 flags);
 ResetFn g_reset = nullptr;
 ReserveFn g_reserve = nullptr;
 SetterFn g_setters[4] = {};
@@ -516,7 +520,11 @@ SSPC_SYSV_ABI void SubmitFrameProbe(u8* frame, u32 flags) {
         }
     }
 
-    g_submit(frame, flags);
+    if (g_lifecycle) {
+        SubmitFrameTimed(frame, flags);
+    } else {
+        g_submit(frame, flags);
+    }
 
     if (!ours) {
         return;
@@ -573,9 +581,110 @@ std::string Env(const char* name) {
     return n > 0 && n < sizeof(v) ? std::string(v, n) : std::string();
 }
 
+// --- P5.4 frame lifecycle (SSPC_P54_FRAME_TRACE=1) -------------------------------------------------------------------
+// The engine's wait for its async compute queue, 0x1695e0 (the main loop 0x29c8d0 calls it twice a frame, through
+// 0x3edef0 and 0x3ee470): `target = q[+0x1b88]; while (labels[q[+0x1b8c]] < target) delay(50)` with the label array
+// re-read on every pass. Its first 20 bytes hold a RIP-relative LEA (no entry probe), so it is replaced by the same loop,
+// which also records the wait.
+constexpr GuestFunction kComputeWait{0x1695e0, 0x4b, 0x8f127063248d809eull};
+constexpr GuestFunction kDelay{0x53b2b0, 0xa7, 0x89bfe4b7f4c237fbull}; // delay(us): rdtsc spin, up to 500 us
+
+using DelayFn = SSPC_SYSV_ABI void (*)(u32 microseconds);
+DelayFn g_delay = nullptr;
+
+template <typename T>
+T Volatile(u64 address) {
+    return *reinterpret_cast<const volatile T*>(address);
+}
+
+SSPC_SYSV_ABI void ComputeWaitHook(u8* queue) {
+    const u64 q = reinterpret_cast<u64>(queue);
+    const u32 target = Volatile<u32>(q + L::kQueueSubmitted);
+    const u64 t0 = Gpu::StallTrace::Now();
+    u64 label = 0;
+    u16 waited = 0;
+    for (;;) {
+        const s32 index = Volatile<s32>(q + L::kQueueLabelIndex);
+        label = Volatile<u64>(g_base + L::kLabelArray) + static_cast<u64>(static_cast<s64>(index)) * 8;
+        if (Volatile<u32>(label) >= target) {
+            break;
+        }
+        waited = 1;
+        g_delay(50);
+    }
+    Gpu::StallTrace::Span(Gpu::StallTrace::Ev::GameComputeWait, t0, Gpu::StallTrace::Now(), label, target, waited);
+}
+
+/// SubmitFrame with its span: a = the frame's label address, b = its fence after the call, c = the flags.
+void SubmitFrameTimed(u8* frame, u32 flags) {
+    const u64 t0 = Gpu::StallTrace::Now();
+    g_submit(frame, flags);
+    const u64 f = reinterpret_cast<u64>(frame);
+    const u64 label = At<u64>(g_base + L::kLabelArray) +
+                      static_cast<u64>(static_cast<s64>(At<s32>(f + L::kFrameLabelIndex))) * 8;
+    Gpu::StallTrace::Span(Gpu::StallTrace::Ev::GameSubmitFrame, t0, Gpu::StallTrace::Now(), label,
+                          At<u32>(f + L::kFrameCounter), static_cast<u16>(flags));
+}
+
+SSPC_SYSV_ABI void LifecycleSubmitProbe(u8* frame, u32 flags) {
+    SubmitFrameTimed(frame, flags);
+}
+
 u32 EnvU32(const char* name, u32 fallback) {
     const std::string v = Env(name);
     return v.empty() ? fallback : static_cast<u32>(std::strtoul(v.c_str(), nullptr, 10));
+}
+
+// --- P5.4 early frame submission (SSPC_P54_EARLY_SUBMIT=1) -----------------------------------------------------------
+// SubmitFrame (pinned by kSubmitFrameSite's hash) with its list complete (0x1f26d5): step 4 `if (mode == 0)
+// sceGnmSubmitDone()` (call 0x1f26e2, return 0x1f26e7); step 5 `while (labels[frame+0x124] < frame+0x130) delay(50)`;
+// 0x28eb20 (eboot data and a condition variable, no GPU memory); step 6 when flags != 0
+// sceGnmSubmitAndFlipCommandBuffers(count [rbp-0x38], dcbs rbp-0x1838, sizes rbp-0x838, 0, 0, frame+0x14,
+// frame+0x20 * 2 + frame+0x17dc, 1, (s32) [0x1d20384]); nothing writes the list or those fields in between. Its frame
+// (push rbp; mov rbp, rsp; five pushes; sub rsp, 0x1888; no other stack adjustment): at the call rbp = the slot of the
+// return address + 0x18b8; flags at rbp-0x187c, frame at rbp-0x1870.
+constexpr u64 kStep4Return = 0x1f26e7;
+constexpr u64 kStep4Rbp = 0x18b8; ///< rbp - the return address' slot
+constexpr u64 kListCount = 0x38, kListDcbs = 0x1838, kListSizes = 0x838, kFlags = 0x187c, kFrameArg = 0x1870;
+constexpr u32 kListMax = 512; ///< the stack arrays' size
+
+std::atomic<u64> g_early_foreign{0}; ///< sceGnmSubmitDone calls from elsewhere (they take the submission lock)
+std::atomic<bool> g_early_refused_logged{false};
+
+bool EarlyFrameSource(const u64* return_slot, Gpu::Gnm::EarlyFrame& out) {
+    const u64 ret = *return_slot;
+    if (ret != g_base + kStep4Return) {
+        // (logged at the 1st, 10th, 100th, ... such call: whether they come during play, when frames are in flight)
+        const u64 n = g_early_foreign.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000 || n == 100000) {
+            SSPC_LOG(Engine, Info, "early frame submission: sceGnmSubmitDone called from {} (not SubmitFrame's step 4 "
+                     "{:#x}), call {} from elsewhere: hands on nothing, takes the submission lock as before",
+                     Hex(ret - g_base), kStep4Return, n);
+        }
+        return false;
+    }
+    const u64 rbp = reinterpret_cast<u64>(return_slot) + kStep4Rbp;
+    if (At<u32>(rbp - kFlags) == 0) {
+        return false; // no flip: sceGnmSubmitCommandBuffers at step 6, as before
+    }
+    const u32 count = At<u32>(rbp - kListCount);
+    const u64 frame = At<u64>(rbp - kFrameArg);
+    if (count == 0 || count > kListMax || frame != Frame() || At<s32>(g_base + L::kSubmitMode) != 0) {
+        if (!g_early_refused_logged.exchange(true, std::memory_order_relaxed)) {
+            SSPC_LOG(Engine, Error, "early frame submission: SubmitFrame's step 4 with {} DCBs, frame {} (expected "
+                     "1..{}, {}), mode {}: left to its own call (logged once)", count, Hex(frame), kListMax,
+                     Hex(Frame()), At<s32>(g_base + L::kSubmitMode));
+        }
+        return false;
+    }
+    out.count = count;
+    out.dcbs = reinterpret_cast<u32* const*>(rbp - kListDcbs);
+    out.dcb_sizes = reinterpret_cast<const u32*>(rbp - kListSizes);
+    out.vo_handle = At<u32>(frame + L::kFrameVideoOut);
+    out.buffer_index = static_cast<u32>(At<s32>(frame + L::kFrameDisplayPair) * 2 + At<s32>(frame + L::kFrameDisplayHalf));
+    out.flip_mode = 1;
+    out.flip_arg = At<s32>(g_base + L::kSubmitFlipArg);
+    return true;
 }
 
 } // namespace
@@ -636,6 +745,59 @@ bool InstallFromEnvironment(u64 eboot_base) {
     if (g_options.stats_s != 0) {
         std::thread(Reporter, g_options.stats_s).detach();
     }
+    return true;
+}
+
+bool InstallLifecycleFromEnvironment(u64 eboot_base) {
+    if (Env("SSPC_P54_FRAME_TRACE") != "1") {
+        return true;
+    }
+    std::string error;
+    for (const GuestFunction& f : {kComputeWait, kDelay, kSubmitFrameSite.function}) {
+        if (!VerifyGuestFunction(eboot_base, f, error)) {
+            SSPC_LOG(Engine, Error, "frame lifecycle trace not installed: {}", error);
+            return false;
+        }
+    }
+    g_base = eboot_base;
+    g_delay = reinterpret_cast<DelayFn>(eboot_base + kDelay.rva);
+    if (g_submit == nullptr) { // (the render trace's probe on SubmitFrame records the span when it is in)
+        void* original =
+            InstallEntryProbe(eboot_base, kSubmitFrameSite, reinterpret_cast<const void*>(&LifecycleSubmitProbe), error);
+        if (original == nullptr) {
+            SSPC_LOG(Engine, Critical, "frame lifecycle trace: {}", error); // (as the render trace: never half-probed)
+            std::abort();
+        }
+        g_submit = reinterpret_cast<SubmitFrameFn>(original);
+    }
+    g_lifecycle = true;
+    if (!InstallJump(eboot_base + kComputeWait.rva, reinterpret_cast<const void*>(&ComputeWaitHook), error)) {
+        SSPC_LOG(Engine, Critical, "frame lifecycle trace: {}", error);
+        std::abort();
+    }
+    SSPC_LOG(Engine, Warning,
+             "DIAGNOSTICS: SSPC_P54_FRAME_TRACE=1 - SubmitFrame 0x1f1e30 probed, the async compute wait 0x1695e0 replaced "
+             "by the same loop with a span; the events go to the stall trace (SSPC_P412_STALL_TRACE=deep,...)");
+    return true;
+}
+
+bool InstallEarlySubmitFromEnvironment(u64 eboot_base) {
+    if (Env("SSPC_P54_EARLY_SUBMIT") != "1") {
+        return true;
+    }
+    // (an entry probe on SubmitFrame - the render or the lifecycle trace - was installed on the verified function and
+    // changed its first bytes: the body the source reads is the one verified then)
+    std::string error;
+    if (g_submit == nullptr && !VerifyGuestFunction(eboot_base, kSubmitFrameSite.function, error)) {
+        SSPC_LOG(Engine, Error, "early frame submission not installed: {}", error);
+        return false;
+    }
+    g_base = eboot_base;
+    Gpu::Gnm::SetEarlyFrameSource(&EarlyFrameSource);
+    SSPC_LOG(Engine, Warning,
+             "EXPERIMENT: SSPC_P54_EARLY_SUBMIT=1 - SubmitFrame 0x1f1e30's frame is handed on at its sceGnmSubmitDone "
+             "(step 4), before its wait for the previous frame's label; its sceGnmSubmitAndFlipCommandBuffers (step 6) "
+             "returns that result; no submission lock");
     return true;
 }
 

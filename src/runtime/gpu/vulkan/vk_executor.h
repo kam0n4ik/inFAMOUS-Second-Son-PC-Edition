@@ -177,6 +177,7 @@ public:
     void SetDiagnostics(Diagnostics* diag) { diag_ = diag; }
     /// VK_ERROR_DEVICE_LOST was seen: nothing more is recorded or submitted (the backend stops).
     bool DeviceLost() const { return device_lost_; }
+    bool Failed() const;
     /// Compute queue -> its Gnm pipe (interrupts of RELEASE_MEM name the pipe).
     void SetQueuePipe(u32 queue, u32 pipe);
 
@@ -203,9 +204,9 @@ public:
     u64 RecordedValue() const;
     void CacheAction(const Cp::CacheActionOp& op) override;
     void Flip(const Cp::FlipMarker& marker) override;
-    void Fence(const Cp::FenceOp& op) override;
     /// P5.3D A/B: images at those addresses now -> SSPC_DIAG_CAPTURE_DIR (CaptureImageAt's output, pass < 0 there).
     void CaptureTargets(const u64* addresses, u32 count, s32 pass, u32 native_draws, u32 pm4_draws) override;
+    void Fence(const Cp::FenceOp& op) override;
     void Dma(const Cp::DmaOp& op) override;
     void Interrupt(u32 queue, Cp::FenceKind kind) override;
     void Synchronize(u32 queue) override;
@@ -283,6 +284,7 @@ public:
     std::string InspectorPipelines() const;
 
 private:
+    friend struct StabilityTestAccess;
     struct Batch {
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandBuffer cb = VK_NULL_HANDLE;
@@ -454,9 +456,12 @@ private:
     /// 7 before a draw, 8 before a dispatch
     void GlobalBarrier(u32 site = 0);
     void Skipped(Skip why, const std::string& detail);
+    /// `user_data`: the draw's 16 user data registers of the stage (P5.3: a shared preparation's flattened user data
+    /// gets them in place of the registers of the draw that made it); nullptr for a dispatch.
     bool BindStage(const void* stage_view, bool compute, PushData& push, std::vector<VkWriteDescriptorSet>& writes,
                    std::vector<VkDescriptorBufferInfo>& buffers, std::vector<VkDescriptorImageInfo>& images,
-                   std::vector<CachedImage*>& bound, bool& writes_memory, const std::vector<CachedImage*>& targets);
+                   std::vector<CachedImage*>& bound, bool& writes_memory, const std::vector<CachedImage*>& targets,
+                   const u32* user_data = nullptr);
     bool PushDescriptors(const PipelineObjects& p, VkPipelineBindPoint bind, std::vector<VkWriteDescriptorSet>& writes);
     void SetDynamicState(const Cp::RegisterFile& regs, const GS::GraphicsPipelineState& st, bool indexed);
     void RecordFrameCopy();
@@ -657,6 +662,7 @@ private:
     bool open_ = false;
     u32 commands_ = 0;
     std::deque<Batch> in_flight_;
+    std::vector<Batch> abandoned_; ///< never submitted successfully; retained until device teardown
     std::vector<Batch> free_;
     bool rendering_ = false;
     RenderKey render_{};
@@ -748,6 +754,14 @@ private:
     void ProfDescribe(u64 key, const char* what, const void* stage_view, const std::vector<CachedImage*>& bound);
     std::unordered_set<u64> prof_described_;
     bool prof_ = false;
+    /// SSPC_GPU_PROFILE=q: a timestamp only where the recorded commands' guest queue changes and at a batch's end -
+    /// the GPU time of each queue's runs (their barriers, uploads and shadows included) without one timestamp per
+    /// command serializing them
+    bool prof_queues_ = false;
+    u32 prof_queue_ = 0; ///< (=q) the guest queue of the commands since the last timestamp
+    static constexpr u64 kProfQueueTag = 0xD1A7; ///< (=q) a queue run's profile key: tag << 32 | queue
+    /// (=q) the commands since the last timestamp end here (the time is prof_queue_'s); `next` the queue from now on.
+    void ProfQueue(u32 next);
 
     VkQueryPool prof_pool_ = VK_NULL_HANDLE;
     u32 prof_next_batch_ = 0;

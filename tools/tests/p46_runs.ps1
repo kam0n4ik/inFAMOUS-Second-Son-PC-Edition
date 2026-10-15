@@ -27,7 +27,8 @@ $root = "E:\SecondSonPC"
 $sources = @{
     beach    = "$root\logs\performance\p43_ab\snapshot\home"
     early    = "$root\userdata\savedata_backups\2026-10-10_03-44-58_before_manual_sspc"
-    user1022 = "$root\logs\p32\scene_user_1022\home"
+    # (logs\p32\scene_user_1022 was removed in the 2026-10-14 log cleanup; this backup holds the same 10:22 autosave)
+    user1022 = "$root\userdata\savedata_backups\2026-10-10_12-47-35_before_manual_sspc"
 }
 $outRoot = if ($OutRoot) { "$OutRoot\$Tag" } else { "$root\logs\p46\$Tag" }
 New-Item -ItemType Directory -Force $outRoot | Out-Null

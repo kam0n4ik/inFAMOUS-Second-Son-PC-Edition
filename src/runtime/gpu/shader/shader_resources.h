@@ -113,6 +113,8 @@ public:
     struct RunStats {
         u32 reads = 0;  ///< guest memory reads
         u32 faults = 0; ///< reads the memory refused (each yields 0, as the bridge's patched load does)
+        u32 user_data_read = 0; ///< bit i: the walk read user data register i (P5.3 Native Render Frontend)
+        bool user_data_written = false; ///< the walk stored into the flattened data's first 16 dwords (the registers)
     };
     /// Runs the walk: `user_data` (16 registers), `flat` the flattened buffer (its first 16 dwords already the user
     /// data). false with `error` for an out-of-range flat/user data offset or stack misuse (nothing is written past

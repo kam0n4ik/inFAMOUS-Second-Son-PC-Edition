@@ -27,7 +27,7 @@ constexpr char kFileMagic[8] = {'S', 'S', 'P', 'C', 'S', 'H', 'C', '1'};
 constexpr u32 kFormatVersion = 1;
 constexpr u32 kRecMagic = 0x43525053; // "SPRC"
 constexpr u32 kMaxRecordBytes = 64u << 20;
-constexpr u8 kProgram = 'P', kSpirv = 'S', kModule = 'M', kPipeline = 'L';
+constexpr u8 kProgram = 'P', kSpirv = 'S', kModule = 'M', kPipeline = 'L', kUsage = 'U';
 
 struct FileHeader {
     char magic[8];
@@ -460,6 +460,15 @@ bool ShaderDiskCache::Open(const DiskCacheOptions& options, std::string& error) 
         Close();
         return false;
     }
+    // SSPC_DIAG_SHADER_CACHE_TEAR=<bytes>: the next record is written only that far and the process ends at once - a
+    // crash in the middle of a write (the next start must cut the torn record and keep the rest)
+    if (char v[24] = {}; writable_ && GetEnvironmentVariableA("SSPC_DIAG_SHADER_CACHE_TEAR", v, sizeof(v)) > 0) {
+        tear_next_ = std::max<u64>(std::strtoull(v, nullptr, 10), 1);
+        crash_after_tear_ = true;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_SHADER_CACHE_TEAR={} - the next record written is cut and the "
+                               "process ends",
+                 tear_next_.load());
+    }
     stats_.open_ms = MsSince(t0);
     stats_.file_bytes = end_;
     ShaderTrace::Event(ShaderTrace::Kind::CacheLoad, tsc0, __rdtsc(), 0, end_);
@@ -632,6 +641,19 @@ bool ShaderDiskCache::IndexRecord(u32 index, u8 type, std::span<const u8> payloa
         programs_[m.program].stubs.push_back({index, m.layout, m.runtime, m.start, std::move(m.key)});
         ++stats_.modules;
         return true;
+    }
+    case kUsage: {
+        const u32 n = r.Count(8);
+        if (!r.ok) {
+            return false;
+        }
+        ++runs_;
+        for (u32 i = 0; i < n; ++i) {
+            Use& u = uses_[r.U64()];
+            u.last_run = runs_;
+            ++u.runs;
+        }
+        return r.ok;
     }
     case kPipeline: {
         PipelineDesc d;
@@ -821,6 +843,51 @@ std::vector<PipelineDesc> ShaderDiskCache::Pipelines() const {
     return pipelines_;
 }
 
+std::vector<PipelineDesc> ShaderDiskCache::PipelinesByUse() const {
+    std::scoped_lock lock{mutex_};
+    std::vector<std::pair<Use, u32>> order;
+    order.reserve(pipelines_.size());
+    for (u32 i = 0; i < pipelines_.size(); ++i) {
+        const auto it = uses_.find(pipelines_[i].Hash());
+        order.emplace_back(it != uses_.end() ? it->second : Use{}, i);
+    }
+    std::ranges::stable_sort(order, [](const auto& a, const auto& b) {
+        return a.first.last_run != b.first.last_run ? a.first.last_run > b.first.last_run : a.first.runs > b.first.runs;
+    });
+    std::vector<PipelineDesc> out;
+    out.reserve(order.size());
+    for (const auto& [use, i] : order) {
+        out.push_back(pipelines_[i]);
+    }
+    return out;
+}
+
+void ShaderDiskCache::AddUsage(std::span<const u64> hashes) {
+    if (!writable_ || hashes.empty()) {
+        return;
+    }
+    Out o;
+    o.U32(static_cast<u32>(hashes.size()));
+    o.Raw(hashes.data(), hashes.size_bytes());
+    std::scoped_lock lock{mutex_};
+    QueueLocked(kUsage, std::move(o.b));
+}
+
+std::vector<ProgramIdentity> ShaderDiskCache::ProgramIdentities() const {
+    std::scoped_lock lock{mutex_};
+    std::vector<ProgramIdentity> out;
+    out.reserve(programs_.size());
+    for (const auto& [id, entry] : programs_) {
+        out.push_back(id);
+    }
+    return out;
+}
+
+u32 ShaderDiskCache::Runs() const {
+    std::scoped_lock lock{mutex_};
+    return runs_;
+}
+
 bool ShaderDiskCache::HasPipeline(const PipelineDesc& desc, u64 hash) const {
     std::scoped_lock lock{mutex_};
     const auto [a, b] = pipeline_index_.equal_range(hash);
@@ -875,6 +942,10 @@ bool ShaderDiskCache::WriteOne(u32 index, const std::vector<u8>& payload, u8 typ
     }
     end_ = offset + bytes;
     if (tear != 0) {
+        if (crash_after_tear_) {
+            FlushFileBuffers(h);
+            TerminateProcess(GetCurrentProcess(), 0xDEAD); // (the diagnostic crash: nothing else is written)
+        }
         return false;
     }
     std::scoped_lock lock{mutex_};
@@ -885,9 +956,11 @@ bool ShaderDiskCache::WriteOne(u32 index, const std::vector<u8>& payload, u8 typ
 void ShaderDiskCache::WriterLoop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:ShaderCacheIO");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    // SetPeriodic may run immediately after Open starts this thread. Its first read needs
+    // the same mutex as every later read; thread creation does not order later setters.
+    std::unique_lock lock{mutex_};
     auto next_periodic = std::chrono::steady_clock::now() + std::chrono::milliseconds(periodic_ms_);
     bool failed = false; // a write failed (or the self-test's cut): nothing more is written, the next open cuts it
-    std::unique_lock lock{mutex_};
     while (true) {
         const auto wait = std::chrono::milliseconds(periodic_ != nullptr ? std::max<u32>(periodic_ms_, 100) : 1000);
         cv_.wait_for(lock, wait, [&] { return stop_ || !queue_.empty(); });
@@ -947,6 +1020,11 @@ void ShaderDiskCache::Flush() {
     }
     cv_.notify_one();
     idle_cv_.wait(lock, [&] { return queue_.empty() && !writing_; });
+}
+
+bool ShaderDiskCache::WithWriteOwnership(const std::function<bool()>& fn) {
+    std::scoped_lock io{io_mutex_};
+    return lock_ != nullptr && file_ != nullptr && writable_ && fn();
 }
 
 void ShaderDiskCache::Close() {

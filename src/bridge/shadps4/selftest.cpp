@@ -4852,6 +4852,13 @@ void TestPcSettings(Totals& t, const App::Config& cfg) {
 
 int RunSelfTest(const App::Config& cfg) {
     Totals t;
+    // P5.3: SSPC_SELFTEST_ONLY=shader - the shader frontend's groups alone (the full run's stack stress takes the
+    // whole commit of a PC without a page file)
+    char only[16] = {};
+    const bool shader_only = GetEnvironmentVariableA("SSPC_SELFTEST_ONLY", only, sizeof(only)) == 6 &&
+                             std::string_view(only) == "shader";
+    decltype(TestShaderFrontend(cfg)) native_groups;
+    if (!shader_only) {
     TestParamSfo(t, cfg);
     TestFileSystem(t, cfg);
     TestPlayGo(t);
@@ -4872,7 +4879,7 @@ int RunSelfTest(const App::Config& cfg) {
     TestGpuMemory(t, cfg);
     TestGuestMemory(t);
     TestGuestMemoryApi(t);
-    auto native_groups = TestNativeVirtualMemory(Common::ElfInfo::Instance().CompiledSdkVer());
+    native_groups = TestNativeVirtualMemory(Common::ElfInfo::Instance().CompiledSdkVer());
     std::string diff_transcript;
     for (auto& g : TestNativeMemoryAdapters(Common::ElfInfo::Instance().CompiledSdkVer(), &diff_transcript)) {
         native_groups.push_back(std::move(g));
@@ -4913,6 +4920,11 @@ int RunSelfTest(const App::Config& cfg) {
     }
     // P4.2: SecondSonPC's GPU command processor (registers, packets, sync, state, errors, rings, traces).
     for (auto& g : TestGpuCommandProcessor(cfg)) {
+        native_groups.push_back(std::move(g));
+    }
+    } // (!shader_only)
+    // P5.3: the native operations' direct path through the processor (light: also in the shader-only run).
+    for (auto& g : TestGpuNativeDirect()) {
         native_groups.push_back(std::move(g));
     }
     // P4.3: SecondSonPC's shader frontend (programs, resources, SRT walk, translations, caches, captures).

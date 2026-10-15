@@ -55,6 +55,8 @@ struct ShaderCacheInfo {
     u32 precompile_total = 0, precompile_built = 0, precompile_taken = 0;
     double precompile_ms = 0.0;
     u64 created_on_demand = 0;
+    u64 game_programs = 0;   ///< the game's programs (the offline index, --scan-game-shaders; 0 without it)
+    u64 cached_in_game = 0;  ///< ... the cache has
 };
 ShaderCacheInfo CacheInfo();
 

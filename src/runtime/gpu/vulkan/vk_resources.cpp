@@ -55,22 +55,32 @@ Timeline::~Timeline() {
 }
 
 u64 Timeline::Completed() {
+    if (ctx_.Failed()) {
+        return CompletedCached();
+    }
     u64 v = 0;
     const VkResult r = Fn().vkGetSemaphoreCounterValue(ctx_.Device(), semaphore_, &v);
     if (r == VK_SUCCESS) {
         Advance(v);
     } else {
         last_error_.store(r, std::memory_order_release);
+        ctx_.Fail("vkGetSemaphoreCounterValue", r);
     }
     return completed_.load(std::memory_order_acquire);
 }
 
 u64 Timeline::QueryCompleted() const {
+    if (ctx_.Failed()) {
+        return 0;
+    }
     u64 v = 0;
     return Fn().vkGetSemaphoreCounterValue(ctx_.Device(), semaphore_, &v) == VK_SUCCESS ? v : 0;
 }
 
 bool Timeline::Wait(u64 value, u64 timeout_ns) {
+    if (ctx_.Failed()) {
+        return false;
+    }
     if (completed_.load(std::memory_order_acquire) >= value) {
         return true;
     }
@@ -85,6 +95,7 @@ bool Timeline::Wait(u64 value, u64 timeout_ns) {
     }
     if (r != VK_TIMEOUT) {
         last_error_.store(r, std::memory_order_release);
+        ctx_.Fail("vkWaitSemaphores", r);
     }
     return false;
 }

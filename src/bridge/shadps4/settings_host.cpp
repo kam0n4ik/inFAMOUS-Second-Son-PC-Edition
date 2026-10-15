@@ -9,6 +9,7 @@
 #include "base/log.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
+#include "engine/particles/smoke_quality.h"
 #include "settings/settings_service.h"
 #include "ui/menu_controller.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -52,6 +53,10 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
             } else if (d->id == "display.showFps" && bridge_presenter) {
                 EmulatorSettings.SetShowFpsCounter(c.show_fps);
                 Overlay::SetSimpleFps(c.show_fps);
+            } else if (d->id == "graphics.smokeQuality") {
+                Engine::Particles::SetSmokeQuality(c.pc.smoke_quality); // the game's emitters, either backend
+            } else if (d->id == "graphics.particleResolution") {
+                Engine::Particles::SetParticleResolution(c.pc.particle_resolution);
             } else if (d->category == Settings::Category::Graphics) {
                 fsr = true;
             }

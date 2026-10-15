@@ -9,6 +9,8 @@
 // (native_render_ops.h). Counters in the log every SSPC_P53_NATIVE_DRAW_STATS seconds (default 10).
 #pragma once
 
+#include <string>
+
 #include "base/abi.h"
 #include "engine/render/native_render_ops.h"
 
@@ -18,6 +20,18 @@ namespace SecondSon::Engine::Render::NativeDraw {
 /// `native_backend`: SecondSonPC's own GPU backend runs the game (--gpu-backend sspc); only its command processor
 /// knows the markers, so apply mode is refused without it (the bridge would drop the native draws) and shadow runs.
 bool InstallFromEnvironment(u64 eboot_base, bool native_backend);
+
+/// P5.3 render modes (--render-mode / SSPC_RENDER_MODE; one SecondSonPC.exe, one game):
+///   legacy               the game's PM4 through SecondSonPC's command processor, as before (the default)
+///   hybrid               the verified native parts: passes 1 (G-buffer) and 9 (lighting) - commit, draw and render
+///                        state natively; every engine draw described (kDescribe), its stages through the Native
+///                        Render Frontend's cache; all else the game's PM4 (the fallback)
+///   native_experimental  every pass 0..40 natively where the engine's path allows it (commit/state fallbacks to the
+///                        game's functions as counted), the Native Render Frontend for all
+/// A mode sets the SSPC_P53_* switches it consists of unless they are set already (an explicit switch wins). Needs the
+/// native backend; with the bridge the mode is refused (logged) and legacy runs. Before the GPU backend starts.
+/// Returns the mode that runs.
+std::string ApplyRenderMode(std::string mode, bool native_backend);
 
 /// The draw that the context `r` (render context R, its DCB at R+8) is about to issue, from the engine's objects.
 /// `module_base` locates the frame object (pass keys); false when `r` is not a context SecondSonPC knows.

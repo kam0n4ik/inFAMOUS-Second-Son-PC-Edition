@@ -12,6 +12,7 @@
 #include <utility>
 
 #include <fmt/format.h>
+#include <intrin.h>
 #include <windows.h>
 
 #include "base/log.h"
@@ -76,6 +77,8 @@ u64 g_base = 0;
 u64 g_canary = 0;        ///< SSPC_P53_NATIVE_DRAW_CANARY=<n>: every n-th marker is spoiled on purpose (0: none)
 u64 g_apply_passes = 0;  ///< apply:<passes>: bit per pass whose commits and draws run natively
 bool g_verify = true;    ///< SSPC_P53_NATIVE_VERIFY=0 (measurements): no shadow markers, no kVerify on native draws
+bool g_describe = false; ///< P5.3 SSPC_P53_NATIVE_DESCRIBE=1: without verification, the other passes' draws get a
+                         ///< kDescribe marker (their tables for the Native Render Frontend; the game's packet follows)
 DrawIndexFn g_draw_index = nullptr;
 DrawAutoFn g_draw_auto = nullptr;
 CommitFn g_commit = nullptr;
@@ -120,8 +123,17 @@ struct EngineCounters {
     std::atomic<u64> draw_fallbacks{0}; ///< apply pass, but predication/flags: the game's wrapper ran
     std::atomic<u64> native_commits{0};
     std::atomic<u64> commit_fallbacks[4] = {}; ///< CommitCheck reasons: the game's commit ran
+    // P5.3 direct path
+    std::atomic<u64> direct_described{0};   ///< descriptions written into a draw's trailing NOP
+    std::atomic<u64> direct_undescribed{0}; ///< ... the game's draw left no NOP where expected (not described)
+    std::atomic<u64> direct_runs{0};        ///< run tokens written into a DCB
+    std::atomic<u64> direct_ops{0};         ///< operations put into the native stream
 };
 EngineCounters g_engine;
+
+bool g_direct = false; ///< SSPC_P53_DIRECT=1: native operations and descriptions without markers (native_render_ops.h)
+constexpr u32 kStreamContexts = L::kPoolSlots + 2 + L::kDeformContextCount;
+StreamCursor g_cursor[kStreamContexts]; ///< a context's place in the native stream (its recording thread's)
 
 /// Native in this pass now (the A/B schedule may hold it back for a block of frames: NativeActive).
 bool Applies(s32 pass) {
@@ -162,15 +174,13 @@ bool ContextPass(u64 base, u64 r, s32& pass, u32& sub) {
     return false;
 }
 
-void DescribeTable(u64 cue, u32 stage, bool vertex, StageTable& t) {
+/// The stage's table shape from its user-data layout table; false when the stage has none.
+bool LayoutShape(u64 cue, u32 stage, bool vertex, TableShape& s) {
     const u64 layout = At<u64>(cue + L::kCueLayout + u64{stage} * 8);
     if (layout == 0) {
-        return;
+        return false;
     }
-    t.present = true;
-    t.dwords = std::min<u32>(At<u16>(layout), 0x600);
-    t.hash = HashBytes(reinterpret_cast<const void*>(cue + L::kCueShadow + u64{stage} * L::kCueShadowStride),
-                       u64{t.dwords} * 4);
+    s.dwords = static_cast<u16>(std::min<u32>(At<u16>(layout), 0x600));
     // Commit 0x14ad0: SGPR byte -> pointer to snapshot + u16 offset (dwords). 0xFF: not used by the shader.
     struct Ref {
         u32 sgpr_byte;
@@ -180,8 +190,9 @@ void DescribeTable(u64 cue, u32 stage, bool vertex, StageTable& t) {
     static constexpr Ref kVertexRefs[] = {{5, 0x18}, {6, 0x20}};
     const auto add = [&](const Ref& r) {
         const u8 sgpr = At<u8>(layout + r.sgpr_byte);
-        if (sgpr != 0xFF && sgpr <= 14 && t.refs < 7) {
-            t.ref[t.refs++] = TableRef{sgpr, r.offset_field == 0 ? u16{0} : At<u16>(layout + r.offset_field)};
+        if (sgpr != 0xFF && sgpr <= 14 && s.refs < 7) {
+            s.sgpr[s.refs] = sgpr;
+            s.offset[s.refs++] = r.offset_field == 0 ? u16{0} : At<u16>(layout + r.offset_field);
         }
     };
     for (const Ref& r : kRefs) {
@@ -191,6 +202,22 @@ void DescribeTable(u64 cue, u32 stage, bool vertex, StageTable& t) {
         for (const Ref& r : kVertexRefs) {
             add(r);
         }
+    }
+    return true;
+}
+
+void DescribeTable(u64 cue, u32 stage, bool vertex, StageTable& t) {
+    TableShape s;
+    if (!LayoutShape(cue, stage, vertex, s)) {
+        return;
+    }
+    t.present = true;
+    t.dwords = s.dwords;
+    t.hash = HashBytes(reinterpret_cast<const void*>(cue + L::kCueShadow + u64{stage} * L::kCueShadowStride),
+                       u64{t.dwords} * 4);
+    t.refs = s.refs;
+    for (u32 i = 0; i < s.refs; ++i) {
+        t.ref[i] = TableRef{s.sgpr[i], s.offset[i]};
     }
 }
 
@@ -212,6 +239,159 @@ void Advance(u8* dcb, u32* at, u32 dwords) {
     std::memcpy(dcb + L::kCbCmdPtr, &next, sizeof(next));
 }
 
+// --- P5.3 direct path -----------------------------------------------------------------------------------------------
+
+/// The context's index in g_cursor: pool slots, then the pre and post contexts, then the deformation contexts; -1 if
+/// `r` is none of the frame's contexts.
+s32 ContextIndex(u64 base, u64 r) {
+    const u64 frame = base + L::kFrame;
+    const u64 pool = frame + L::kFramePool;
+    if (r >= pool && r < pool + u64{L::kPoolSlots} * L::kPoolSlotStride && (r - pool) % L::kPoolSlotStride == 0) {
+        return static_cast<s32>((r - pool) / L::kPoolSlotStride);
+    }
+    if (r == frame + L::kFramePreContext) {
+        return L::kPoolSlots;
+    }
+    if (r == frame + L::kFramePostContext) {
+        return L::kPoolSlots + 1;
+    }
+    const u64 deform = base + L::kDeformContexts;
+    if (r >= deform && r < deform + u64{L::kDeformContextCount} * L::kContextSize &&
+        (r - deform) % L::kContextSize == 0) {
+        return static_cast<s32>(L::kPoolSlots + 2 + (r - deform) / L::kContextSize);
+    }
+    return -1;
+}
+
+/// The ids of the draw's VS and PS table shapes (0: the stage reads no table); false when the shape table is full.
+bool DrawShapes(u64 cue, u32& vs, u32& ps) {
+    const auto one = [cue](u32 stage, bool vertex, u32& id) {
+        TableShape s;
+        id = 0;
+        return !LayoutShape(cue, stage, vertex, s) || s.refs == 0 || s.dwords == 0 || InternShape(s, id);
+    };
+    return one(kCueStageVs, true, vs) && one(kCueStagePs, false, ps);
+}
+
+/// One operation into the context's native stream: `fill(op)` writes it (header first, at most `max_words`) and returns
+/// its words (0: nothing to run); a run token goes into the DCB when the operation starts a run. False: nothing done
+/// (no room for a token in the DCB, no stream block free) - the caller runs the game's path; `fill` ran only on true.
+template <typename Fill>
+bool EmitDirect(u8* dcb, u32 max_words, Fill&& fill) {
+    const s32 ci = ContextIndex(g_base, reinterpret_cast<u64>(dcb) - L::kContextGfx);
+    if (ci < 0) {
+        return false;
+    }
+    u32* at = Room(dcb, kStreamTokenDwords); // (made before the operation: once it ran, it must be emitted)
+    if (at == nullptr) {
+        g_engine.no_space.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    StreamCursor& c = g_cursor[ci];
+    u32* op = StreamReserve(c, reinterpret_cast<u64>(at), max_words);
+    if (op == nullptr) {
+        return false;
+    }
+    const u32 words = fill(op);
+    if (words == 0) {
+        return true;
+    }
+    u32 token[kStreamTokenDwords];
+    if (!StreamCommit(c, words, token)) {
+        std::memcpy(at, token, sizeof(token));
+        Advance(dcb, at, kStreamTokenDwords);
+        StreamTokenWritten(c, reinterpret_cast<u64>(at + kStreamTokenDwords));
+        g_engine.direct_runs.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_engine.direct_ops.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+constexpr u32 kDrawIndex2Header = 0xC0042700u;   ///< sceGnmDrawIndex: DRAW_INDEX_2, 5 body dwords (gnm_driver.cpp)
+constexpr u32 kDrawIndexAutoHeader = 0xC0012D00u; ///< sceGnmDrawIndexAuto: DRAW_INDEX_AUTO, 2 body dwords
+
+bool Mark(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags, u32 packet_dwords);
+
+/// The direct path's draw wrapper: in an apply pass the draw is a stream operation (after the commit's, in one run
+/// when nothing of the game's came between); otherwise the game's wrapper draws and the description goes into the free
+/// dwords of the NOP the driver wrote after the draw packet. Verification keeps its markers (Mark).
+template <typename Call>
+void DirectDraw(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags, u32 packet_dwords, Call&& game) {
+    const u64 cb = reinterpret_cast<u64>(dcb);
+    const u64 r = cb - L::kContextGfx;
+    s32 pass = -1;
+    u32 sub = 0;
+    if (!ContextPass(g_base, r, pass, sub) || At<u64>(r + L::kContextCue + L::kCueDcb) != cb) {
+        g_engine.draws.fetch_add(1, std::memory_order_relaxed);
+        g_engine.foreign.fetch_add(1, std::memory_order_relaxed);
+        game();
+        return;
+    }
+    const bool apply_pass = Applies(pass);
+    if (!apply_pass && g_verify) {
+        if (!Mark(dcb, indexed, count, indices, flags, packet_dwords)) {
+            game();
+        }
+        return;
+    }
+    g_engine.draws.fetch_add(1, std::memory_order_relaxed);
+    // the predication bit of the buffer (+0x28) and the wrapper's flags reach the packet; a native draw has neither
+    const bool apply = apply_pass && flags == 0 && (At<u32>(cb + 0x28) & 1) == 0;
+    const bool describe = g_describe && NativeActive();
+    if (!apply && !describe) {
+        if (apply_pass) {
+            g_engine.draw_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        }
+        game();
+        return;
+    }
+    u32 vs = 0, ps = 0;
+    const bool shapes = DrawShapes(r + L::kContextCue, vs, ps);
+    if (apply && shapes) {
+        const u64 base = indexed ? indices : 0;
+        const bool emitted = EmitDirect(dcb, 1 + kStreamDrawWords, [&](u32* op) {
+            op[0] = OpHeader(StreamOp::Draw, kStreamDrawWords);
+            op[1] = static_cast<u32>(pass);
+            op[2] = indexed ? 1u : 0u;
+            op[3] = count;
+            op[4] = static_cast<u32>(base);
+            op[5] = static_cast<u32>(base >> 32);
+            op[6] = vs;
+            op[7] = ps;
+            return 1 + kStreamDrawWords;
+        });
+        if (emitted) {
+            g_engine.marked.fetch_add(1, std::memory_order_relaxed);
+            g_engine.native_draws.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    if (apply_pass) {
+        g_engine.draw_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    }
+    game();
+    if (!describe || !shapes) {
+        return;
+    }
+    // the draw packet and its trailing NOP end at the write pointer (in the buffer's current chunk)
+    const u64 end = At<u64>(cb + L::kCbCmdPtr);
+    const u64 packet = end - u64{packet_dwords} * 4;
+    if (end < u64{packet_dwords} * 4 || packet < At<u64>(cb + L::kCbBegin)) {
+        g_engine.direct_undescribed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    auto* p = reinterpret_cast<u32*>(packet);
+    u32* nop = p + packet_dwords - 4;
+    if (p[0] != (indexed ? kDrawIndex2Header : kDrawIndexAutoHeader) || nop[0] != kDrawNopHeader || nop[1] != 0) {
+        g_engine.direct_undescribed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    nop[2] = DescribeWord(pass, vs);
+    nop[3] = ps;
+    nop[1] = kDescribeMagic;
+    g_engine.direct_described.fetch_add(1, std::memory_order_relaxed);
+}
+
 /// Shadow: a kVerify marker before the game's draw packet. Apply (a listed pass): the draw itself as a kApply|kVerify
 /// marker; returns true when the game's wrapper must not run.
 bool Mark(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags, u32 packet_dwords) {
@@ -226,10 +406,12 @@ bool Mark(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags, u32 packet_d
     if (Applies(op.pass) && !apply) {
         g_engine.draw_fallbacks.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!apply && !g_verify) {
+    // P5.3: the other passes' draws described for the Native Render Frontend (in the A/B comparison's native blocks)
+    const bool describe = !apply && g_describe && NativeActive();
+    if (!apply && !g_verify && !describe) {
         return false; // SSPC_P53_NATIVE_VERIFY=0: no shadow marker, the game's draw as it is
     }
-    if (!apply && g_canary != 0 && g_engine.draws.load(std::memory_order_relaxed) % g_canary == 0) {
+    if (!apply && g_verify && g_canary != 0 && g_engine.draws.load(std::memory_order_relaxed) % g_canary == 0) {
         op.canary = true; // the processor must see the count differ
         op.index_count += 1;
     }
@@ -238,7 +420,9 @@ bool Mark(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags, u32 packet_d
         g_engine.no_space.fetch_add(1, std::memory_order_relaxed);
         return false; // nothing written: the game's wrapper draws (it reports its own failure if it has no room)
     }
-    Advance(dcb, at, EncodeDrawMarker(op, apply ? u16(g_verify ? kApply | kVerify : kApply) : u16(kVerify), at));
+    const u16 marker = apply ? u16(g_verify ? kApply | kVerify : kApply)
+                             : u16((g_verify ? kVerify : 0) | (describe ? kDescribe : 0));
+    Advance(dcb, at, EncodeDrawMarker(op, marker, at));
     g_engine.marked.fetch_add(1, std::memory_order_relaxed);
     if (apply) {
         g_engine.native_draws.fetch_add(1, std::memory_order_relaxed);
@@ -247,13 +431,17 @@ bool Mark(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags, u32 packet_d
 }
 
 SSPC_SYSV_ABI void DrawIndexProbe(u8* dcb, u32 count, u64 indices, u32 flags) {
-    if (!Mark(dcb, true, count, indices, flags, 10)) {
+    if (g_direct) {
+        DirectDraw(dcb, true, count, indices, flags, 10, [&] { g_draw_index(dcb, count, indices, flags); });
+    } else if (!Mark(dcb, true, count, indices, flags, 10)) {
         g_draw_index(dcb, count, indices, flags);
     }
 }
 
 SSPC_SYSV_ABI void DrawAutoProbe(u8* dcb, u32 count, u32 flags) {
-    if (!Mark(dcb, false, count, 0, flags, 7)) {
+    if (g_direct) {
+        DirectDraw(dcb, false, count, 0, flags, 7, [&] { g_draw_auto(dcb, count, flags); });
+    } else if (!Mark(dcb, false, count, 0, flags, 7)) {
         g_draw_auto(dcb, count, flags);
     }
 }
@@ -274,6 +462,22 @@ SSPC_SYSV_ABI void CommitProbe(u8* cue_ptr) {
         return;
     }
     u8* dcb = reinterpret_cast<u8*>(r + L::kContextGfx);
+    if (g_direct) {
+        // the commit's register writes as a stream operation (the draw after it joins the run)
+        const bool emitted = EmitDirect(dcb, 1 + 2 * kMaxRegWrites, [&](u32* op) {
+            RegWrite writes[kMaxRegWrites];
+            const u32 n = NativeCommit(cue, g_env, writes);
+            op[0] = OpHeader(StreamOp::Registers, 2 * n);
+            std::memcpy(op + 1, writes, sizeof(RegWrite) * n);
+            return n == 0 ? 0u : 1 + 2 * n;
+        });
+        if (!emitted) {
+            g_commit(cue_ptr);
+            return;
+        }
+        g_engine.native_commits.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     u32* at = Room(dcb, RegistersMarkerDwords(kMaxRegWrites));
     if (at == nullptr) {
         g_engine.no_space.fetch_add(1, std::memory_order_relaxed);
@@ -317,6 +521,17 @@ bool EmitState(u8* dcb, const NativeState::Writer& w, u16 flags) {
     }
     if (w.n == 0) {
         return true;
+    }
+    if (g_direct && flags == kApply) { // (a kVerify state marker is a check: it stays a marker)
+        const bool emitted = EmitDirect(dcb, 1 + 2 * w.n, [&](u32* op) {
+            op[0] = OpHeader(StreamOp::State, 2 * w.n);
+            std::memcpy(op + 1, w.out, sizeof(RegWrite) * w.n);
+            return 1 + 2 * w.n;
+        });
+        if (!emitted) {
+            g_state.fallback[kFbNoSpace].fetch_add(1, std::memory_order_relaxed);
+        }
+        return emitted;
     }
     u32* at = Room(dcb, RegistersMarkerDwords(w.n));
     if (at == nullptr) {
@@ -556,11 +771,54 @@ void ReportState() {
                                c.state_first_bad_want.load(), c.state_first_bad_have.load()));
 }
 
+/// P5.3: what the transport of the native operations costs, per frame of the last interval - the processor's markers
+/// (or the direct path's run tokens and NOP descriptions) and its time in native operations (every 8th call timed).
+void ReportTransport(double seconds, double tsc_per_ms) {
+    struct Last {
+        u64 flips = 0, markers = 0, runs = 0, described = 0, tsc = 0, calls = 0;
+    };
+    static Last last;
+    const DrawCounters& c = Counters();
+    DirectCounters& d = Direct();
+    const Last now{Control().flips.load(), c.markers.load(), d.runs.load(), d.described.load(), d.native_tsc.load(),
+                   d.native_calls.load()};
+    const double frames = static_cast<double>(now.flips - last.flips);
+    if (frames > 0 && tsc_per_ms > 0) {
+        SSPC_LOG(Engine, Info,
+                 "native transport per frame ({:.0f} flips in {:.0f} s): processor markers {:.0f}, run tokens {:.0f}, "
+                 "descriptions in draw NOPs {:.0f}, native-operation calls {:.0f}, time {:.3f} ms",
+                 frames, seconds, static_cast<double>(now.markers - last.markers) / frames,
+                 static_cast<double>(now.runs - last.runs) / frames,
+                 static_cast<double>(now.described - last.described) / frames,
+                 static_cast<double>(now.calls - last.calls) / frames,
+                 static_cast<double>(now.tsc - last.tsc) / tsc_per_ms / frames);
+    }
+    last = now;
+    if (g_direct) {
+        SSPC_LOG(Engine, Info,
+                 "native direct path: engine described {}, undescribed {}, run tokens {}, stream operations {}, stream "
+                 "full {}, shapes full {} | processor described {} (unknown shape {}), runs {} (stale {}), operations "
+                 "{}, draws {}, register writes {}, state writes {}, blocks in use {}",
+                 g_engine.direct_described.load(), g_engine.direct_undescribed.load(), g_engine.direct_runs.load(),
+                 g_engine.direct_ops.load(), d.stream_full.load(), d.shapes_full.load(), d.described.load(),
+                 d.described_bad.load(), d.runs.load(), d.runs_stale.load(), d.ops.load(), d.draws.load(),
+                 d.register_writes.load(), d.state_writes.load(), d.blocks_in_use.load());
+    }
+}
+
 void Reporter(u32 seconds) {
     static constexpr const char* kFields[kMismatchFields] = {"kind",    "index count", "index base", "VS regs",
                                                              "PS regs", "VS table",    "PS table"};
+    auto t0 = std::chrono::steady_clock::now();
+    u64 tsc0 = __rdtsc();
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        const auto t1 = std::chrono::steady_clock::now();
+        const u64 tsc1 = __rdtsc();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        ReportTransport(ms / 1000.0, ms > 0 ? static_cast<double>(tsc1 - tsc0) / ms : 0.0);
+        t0 = t1;
+        tsc0 = tsc1;
         DrawCounters& c = Counters();
         std::string fields;
         for (u32 i = 0; i < kMismatchFields; ++i) {
@@ -801,17 +1059,66 @@ u32 NativeCommit(u64 cue, const CommitEnv& env, RegWrite* out) {
     return w.n;
 }
 
+std::string ApplyRenderMode(std::string mode, bool native_backend) {
+    if (mode.empty()) {
+        mode = Env("SSPC_RENDER_MODE");
+    }
+    for (char& c : mode) {
+        c = static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+    }
+    if (mode == "native") {
+        mode = "native_experimental";
+    }
+    if (mode.empty() || mode == "legacy") {
+        return "legacy";
+    }
+    if (mode != "hybrid" && mode != "native_experimental") {
+        SSPC_LOG(Engine, Error, "render mode '{}': want legacy, hybrid or native_experimental - legacy runs", mode);
+        return "legacy";
+    }
+    if (!native_backend) {
+        SSPC_LOG(Engine, Error,
+                 "render mode {}: needs --gpu-backend sspc (the bridge's renderer has no native path) - legacy runs",
+                 mode);
+        return "legacy";
+    }
+    const bool hybrid = mode == "hybrid";
+    const std::pair<const char*, const char*> preset[] = {
+        {"SSPC_P53_NATIVE_DRAW", hybrid ? "apply:1,9" : "apply:all"},
+        {"SSPC_P53_NATIVE_STATE", "apply"},
+        {"SSPC_P53_NATIVE_VERIFY", "0"},
+        {"SSPC_P53_NATIVE_DESCRIBE", "1"},
+        {"SSPC_P53_NATIVE_FRONTEND", "all"},
+    };
+    std::string set, kept;
+    for (const auto& [name, value] : preset) {
+        if (Env(name).empty()) {
+            SetEnvironmentVariableA(name, value);
+            set += fmt::format(" {}={}", name, value);
+        } else {
+            kept += fmt::format(" {}={}", name, Env(name));
+        }
+    }
+    SSPC_LOG(Engine, Warning, "EXPERIMENT: render mode {} -{}{}", mode, set.empty() ? "" : " set:" + set,
+             kept.empty() ? "" : "; given explicitly:" + kept);
+    return mode;
+}
+
 bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
     const std::string mode = Env("SSPC_P53_NATIVE_DRAW");
     if (mode.empty() || mode == "0" || mode == "off") {
         return true;
     }
     if (mode.rfind("apply:", 0) == 0) {
-        for (size_t at = 6; at < mode.size();) {
+        if (mode == "apply:all") {
+            g_apply_passes = (u64{1} << 41) - 1; // P5.3 NATIVE_EXPERIMENTAL: every pass 0..40
+        }
+        for (size_t at = 6; mode != "apply:all" && at < mode.size();) {
             char* end = nullptr;
             const unsigned long pass = std::strtoul(mode.c_str() + at, &end, 10);
             if (end == mode.c_str() + at || pass > 40) {
-                SSPC_LOG(Engine, Error, "SSPC_P53_NATIVE_DRAW={}: want apply:<pass 0..40>[,<pass>...]; nothing installed",
+                SSPC_LOG(Engine, Error,
+                         "SSPC_P53_NATIVE_DRAW={}: want apply:<pass 0..40>[,<pass>...] or apply:all; nothing installed",
                          mode);
                 return false;
             }
@@ -949,6 +1256,25 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
         SSPC_LOG(Engine, Warning,
                  "SSPC_P53_NATIVE_VERIFY=0: native operations without their checks (no shadow markers in the other "
                  "passes, no comparison of native draws or state) - for measurements; correctness runs keep it on");
+    }
+    if (Env("SSPC_P53_NATIVE_DESCRIBE") == "1") {
+        g_describe = true;
+        SSPC_LOG(Engine, Warning, "SSPC_P53_NATIVE_DESCRIBE=1: the other passes' draws carry the engine's description "
+                                  "(kDescribe markers) for the Native Render Frontend; the game's draw packet follows");
+    }
+    if (const std::string direct = Env("SSPC_P53_DIRECT"); direct == "1") {
+        if (!native_backend) {
+            SSPC_LOG(Engine, Error, "SSPC_P53_DIRECT=1 needs --gpu-backend sspc (its processor runs the native stream); "
+                                    "the markers instead");
+        } else {
+            g_direct = true;
+            SetDirect(true);
+            SSPC_LOG(Engine, Warning,
+                     "EXPERIMENT: SSPC_P53_DIRECT=1 - no markers on the hot path: the apply passes' commits, state and "
+                     "draws go to the native stream (one 4-dword run token in the DCB per run of operations), the other "
+                     "draws' descriptions into the NOP after their draw packet{}",
+                     g_verify ? "; verification markers kept (SSPC_P53_NATIVE_VERIFY)" : "");
+        }
     }
     if (const std::string ab = Env("SSPC_P53_NATIVE_AB"); !ab.empty() && g_apply_passes != 0) {
         Control().ab_frames = static_cast<u32>(std::strtoul(ab.c_str(), nullptr, 10));

@@ -58,6 +58,18 @@ constexpr Choice kEnterButtons[] = {
     {"cross", "Cross", "Крест"},
     {"circle", "Circle", "Круг"},
 };
+constexpr Choice kSmokeQualities[] = {
+    {"high", "High (original)", "Высокое (оригинал)"},
+    {"medium", "Medium (65 %)", "Среднее (65 %)"},
+    {"low", "Low (35 %)", "Низкое (35 %)"},
+    {"verylow", "Very low (20 %)", "Очень низкое (20 %)"},
+};
+constexpr Choice kParticleResolutions[] = {
+    {"auto", "Auto (as the game)", "Авто (как в игре)"},
+    {"full", "Full", "Полное"},
+    {"half", "Half", "Половина"},
+    {"quarter", "Quarter", "Четверть"},
+};
 
 // ---- labels of the keyboard/mouse actions (index = Input::Action)
 
@@ -269,6 +281,34 @@ void Build(Registry& r) {
         .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.pc.sharpness); },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.sharpness = static_cast<u32>(std::get<s64>(x)); },
         .requires_on = "graphics.sharpening",
+    });
+    v.push_back(Desc{
+        .id = "graphics.smokeQuality", .table = "Graphics", .key = "smokeQuality", .category = Category::Graphics,
+        .type = Type::Choice, .apply = Apply::Live, .choices = kSmokeQualities, .en = "Smoke quality (experimental)",
+        .ru = "Качество дыма (эксперимент)",
+        .help_en = "How many particles the game's smoke emitters spawn (fires, chimneys, the smoke powers' clouds): "
+                   "fewer particles mean thinner smoke and less GPU work on its translucent layers. Fire, sparks and "
+                   "the powers' logic are not changed. High is the game's own density.",
+        .help_ru = "Сколько частиц создают эмиттеры дыма игры (костры, трубы, облака дымовых способностей): меньше "
+                   "частиц — реже дым и меньше работы GPU на его прозрачных слоях. Огонь, искры и логика способностей "
+                   "не меняются. «Высокое» — плотность самой игры.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.smoke_quality; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.smoke_quality = std::get<std::string>(x); },
+    });
+    v.push_back(Desc{
+        .id = "graphics.particleResolution", .table = "Graphics", .key = "particleResolution",
+        .category = Category::Graphics, .type = Type::Choice, .apply = Apply::Live, .choices = kParticleResolutions,
+        .en = "Fire and smoke resolution (experimental)", .ru = "Разрешение огня и дыма (эксперимент)",
+        .help_en = "The game's own reduced-resolution mode for its translucent particles (fire, smoke, dust), which the "
+                   "PS4 version switches to by itself when they are slow: the same particles drawn at half or a "
+                   "quarter of the resolution and upscaled. Much less GPU work in scenes full of fire; edges of "
+                   "flames get softer. Auto is the game's own choice.",
+        .help_ru = "Собственный режим игры для прозрачных частиц (огонь, дым, пыль) в пониженном разрешении, в который "
+                   "версия для PS4 переходит сама, когда они тормозят: те же частицы рисуются в половинном или "
+                   "четвертном разрешении и растягиваются. Намного меньше работы GPU в сценах с огнём; края пламени "
+                   "мягче. «Авто» — выбор самой игры.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.particle_resolution; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.particle_resolution = std::get<std::string>(x); },
     });
     struct Missing {
         std::string_view id, en, ru, why_en, why_ru;

@@ -11,6 +11,7 @@
 #include <intrin.h>
 
 #include <fmt/format.h>
+#include <xxhash.h>
 
 #include "base/log.h"
 #include "runtime/gpu/gpu_memory.h"
@@ -165,6 +166,146 @@ u64 StageFingerprint(const StageView& s) {
     return h | 1;
 }
 
+// ---- P5.3 Native Render Frontend
+
+/// What the executor reads of a stage the frontend prepared (the parallel processor's CopyStage, plus the key).
+void CopyView(StageView& d, const StageView& s) {
+    d.status = s.status;
+    d.address = s.address;
+    d.program = s.program;
+    d.footer_hash = s.footer_hash;
+    d.module = s.module;
+    d.runtime = s.runtime;
+    d.start = s.start;
+    d.end = s.end;
+    d.plan = s.plan;
+    d.key = s.key;
+    d.program_error = s.program_error;
+}
+
+bool SameDesc(const auto& a, const auto& b) {
+    return a.raw == b.raw;
+}
+
+/// Two preparations of one stage give the executor the same thing: module, key, the next stage's bindings, the
+/// flattened user data past the registers (the registers themselves are the draw's own: the executor writes them),
+/// every resource.
+bool SameNative(const StageView& a, const StageView& b) {
+    const ResourceBindingPlan& p = a.plan;
+    const ResourceBindingPlan& q = b.plan;
+    if (a.module != b.module || !(a.key == b.key) || !(a.end == b.end) || !(a.start == b.start) ||
+        p.flat.size() != q.flat.size() || p.buffers.size() != q.buffers.size() || p.images.size() != q.images.size() ||
+        p.samplers.size() != q.samplers.size() || p.vertices.size() != q.vertices.size() ||
+        p.status_counts != q.status_counts) {
+        return false;
+    }
+    if (p.flat.size() > 16 && std::memcmp(p.flat.data() + 16, q.flat.data() + 16, (p.flat.size() - 16) * 4) != 0) {
+        return false;
+    }
+    for (size_t i = 0; i < p.buffers.size(); ++i) {
+        const BufferBinding &x = p.buffers[i], &y = q.buffers[i];
+        if (x.binding != y.binding || x.kind != y.kind || !SameDesc(x.desc, y.desc) || x.address != y.address ||
+            x.size != y.size || x.written != y.written || x.formatted != y.formatted || x.status != y.status) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < p.images.size(); ++i) {
+        const ImageBinding &x = p.images[i], &y = q.images[i];
+        if (x.binding != y.binding || x.count != y.count || !SameDesc(x.desc, y.desc) || x.view_type != y.view_type ||
+            x.storage != y.storage || x.depth != y.depth || x.array != y.array || x.atomic != y.atomic ||
+            x.fmask != y.fmask || x.status != y.status) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < p.samplers.size(); ++i) {
+        const SamplerBinding &x = p.samplers[i], &y = q.samplers[i];
+        if (x.binding != y.binding || !SameDesc(x.desc, y.desc) || x.status != y.status) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < p.vertices.size(); ++i) {
+        const VertexBinding &x = p.vertices[i], &y = q.vertices[i];
+        if (x.attribute != y.attribute || !(x.fetch == y.fetch) || x.read != y.read || !SameDesc(x.desc, y.desc) ||
+            x.address != y.address || x.size != y.size || x.status != y.status) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A resource of the preparation lies in [lo, hi) (the snapshot): a later draw with the same bytes elsewhere would get
+/// it at the old place - not cacheable.
+bool PlanTouches(const ResourceBindingPlan& p, u64 lo, u64 hi) {
+    const auto in = [&](u64 a, u64 n) { return a < hi && lo < a + std::max<u64>(n, 1); };
+    for (const BufferBinding& b : p.buffers) {
+        if (b.kind == BufferKind::Guest && b.address != 0 && in(b.address, b.size)) {
+            return true;
+        }
+    }
+    for (const VertexBinding& v : p.vertices) {
+        if (v.address != 0 && in(v.address, v.size)) {
+            return true;
+        }
+    }
+    for (const ImageBinding& im : p.images) {
+        if (im.desc.Base() != 0 && in(im.desc.Base(), 256)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The user data registers a preparation with reflection `r` depended on: those its SRT walk read (`plan.srt`), those
+/// holding (part of) a descriptor the reflection reads from the flattened user data's first 16 dwords, the fetch
+/// shader's and the vertex buffer tables' pointers. Any other register reaches the shader only through those 16
+/// dwords, which the executor writes from the draw itself (StageView::native_shared).
+u32 UserDataUsed(const ShaderReflection& r, const ResourceBindingPlan& plan, const FetchShader* fetch) {
+    u32 m = plan.srt.user_data_read;
+    const auto at = [&](u32 dword) {
+        if (dword < 16) {
+            m |= 1u << dword;
+        }
+    };
+    const auto sharp = [&](const SharpLocation& l, u32 dwords) { // (the dwords FetchSharp reads)
+        if (l.summary == SharpLocation::Summary::SingleLoad) {
+            for (u32 i = 0; i < dwords; ++i) {
+                at(u32{l.offsets[0]} + i);
+            }
+        } else if (l.summary == SharpLocation::Summary::MultiLoad) {
+            for (u32 i = 0; i < dwords && i < l.offsets.size(); ++i) {
+                if ((l.load_mask >> i) & 1) {
+                    at(l.offsets[i]);
+                }
+            }
+        }
+    };
+    for (const BufferResource& b : r.buffers) {
+        if (b.kind == BufferKind::Guest) {
+            sharp(b.sharp, 4);
+        }
+    }
+    for (const ImageResource& im : r.images) {
+        sharp(im.sharp, im.is_r128 ? 4 : 8);
+    }
+    for (const SamplerResource& s : r.samplers) {
+        sharp(s.sharp, 4);
+        if (s.post_op == SharpPostOp::DisableAnisoIfSingleLod) {
+            at(s.post_op_tsharp_dw3);
+        }
+    }
+    if (r.fetch.present) {
+        at(r.fetch.sgpr_base);
+        at(r.fetch.sgpr_base + 1);
+    }
+    if (fetch != nullptr && fetch->present) {
+        for (const FetchAttribute& a : fetch->attributes) {
+            at(a.sgpr_base);
+            at(a.sgpr_base + 1);
+        }
+    }
+    return m;
+}
+
 } // namespace
 
 GuestReader& GameMemory() {
@@ -178,6 +319,7 @@ ShaderFrontend::ShaderFrontend(const FrontendOptions& options) : options_(option
     translator_ = options_.translator != nullptr ? options_.translator : GetShaderTranslator();
     programs_.SetValidation(options_.validation);
     memo_on_ = options_.stage_memo;
+    native_on_ = options_.native_stages != NativeStages::Off && options_.native_passes != 0;
     if (char v[4] = {}; memo_on_ && GetEnvironmentVariableA("SSPC_DIAG_MEMO_STATS", v, sizeof(v)) == 1 && v[0] == '1') {
         memo_diag_ = true;
     }
@@ -223,14 +365,88 @@ std::string ShaderFrontend::MemoReport() const {
     return t + "\n";
 }
 
+std::string ShaderFrontend::NativeReport() const {
+    if (!native_on_) {
+        return {};
+    }
+    const FrontendStats& st = stats_;
+    u64 bytes = 0, cached = 0;
+    for (const auto& [h, e] : native_) {
+        bytes += sizeof(NativeEntry) + e.snapshot.capacity() * 4;
+        if (e.view != nullptr) {
+            ++cached;
+            const ResourceBindingPlan& p = e.view->plan;
+            bytes += sizeof(StageView) + p.flat.capacity() * 4 + p.buffers.capacity() * sizeof(BufferBinding) +
+                     p.images.capacity() * sizeof(ImageBinding) + p.samplers.capacity() * sizeof(SamplerBinding) +
+                     p.vertices.capacity() * sizeof(VertexBinding) + e.view->key.words.capacity() * 4;
+        }
+    }
+    const double rate = st.native_lookups != 0 ? 100.0 * static_cast<double>(st.native_hits) /
+                                                     static_cast<double>(st.native_lookups)
+                                               : 0.0;
+    std::string t = fmt::format(
+        "native render frontend (P5.3, {}; passes {:#x}): engine-described stages looked up {}, taken from the cache {} "
+        "({:.1f} %), prepared and cached {}, not cacheable {} (a read outside the snapshot {}, a resource in it {}, a "
+        "failed read {}), known not cacheable {}, not looked up {} (pointers disagree / snapshot unreadable), hash "
+        "collisions {}; entries {} ({} cached, {:.1f} MiB), evicted {}; first sightings not cached {} (cached at "
+        "sighting {}); shapes {}, their masks grown {}, user data registers keyed per cached preparation {:.2f} "
+        "(besides the snapshot pointers)",
+        options_.native_stages == NativeStages::Verify ? "verify" : "on", options_.native_passes, st.native_lookups,
+        st.native_hits, rate, st.native_learned, st.native_uncacheable, st.native_uncacheable_by[0],
+        st.native_uncacheable_by[1], st.native_uncacheable_by[2], st.native_known_uncacheable, st.native_unkeyed,
+        st.native_collisions, native_.size(), cached, static_cast<double>(bytes) / (1 << 20), st.native_evicted,
+        st.native_first_seen, std::max(options_.native_admit, 1u), native_masks_.size(), st.native_mask_grew,
+        st.native_learned != 0
+            ? static_cast<double>(st.native_keyed_registers) / static_cast<double>(st.native_learned)
+            : 0.0);
+    if (options_.native_stages == NativeStages::Verify) {
+        const double vrate = st.native_lookups != 0 ? 100.0 * static_cast<double>(st.native_verified) /
+                                                          static_cast<double>(st.native_lookups)
+                                                    : 0.0;
+        t += fmt::format("; verify: hits prepared in full {} ({:.1f} % of the lookups), different {}; misses: inputs "
+                         "never seen {}, the same inputs and bytes {} (evicted / not yet admitted), other bytes {} "
+                         "(dwords differing 1: {}, 2: {}, 3-4: {}, 5-8: {}, more: {}; only first dwords of 4-dword "
+                         "groups: {})",
+                         st.native_verified, vrate, st.native_mismatches, st.native_miss_new, st.native_miss_same,
+                         st.native_miss_bytes, st.native_miss_dwords[0], st.native_miss_dwords[1],
+                         st.native_miss_dwords[2], st.native_miss_dwords[3], st.native_miss_dwords[4],
+                         st.native_miss_word0);
+        t += fmt::format("; of the inputs never seen: a new shape {}, else keyed user data registers differing:",
+                         st.native_miss_new_shape);
+        for (u32 i = 0; i < 16; ++i) {
+            if (st.native_miss_ud[i] != 0) {
+                t += fmt::format(" s{} {}", i, st.native_miss_ud[i]);
+            }
+        }
+    }
+    return t + "\n";
+}
+
 const StageView& ShaderFrontend::Stage(HwStage stage) const {
-    return stages_[static_cast<size_t>(stage)];
+    const size_t si = static_cast<size_t>(stage);
+    return shared_[si] != nullptr ? *shared_[si] : stages_[si];
 }
 
 void ShaderFrontend::NewFrame() {
     programs_.NewEpoch();
     ++stats_.epochs;
     ++memory_gen_;
+    ++native_frame_;
+    if (native_on_ && native_.size() > options_.native_max_entries) {
+        NativeEvict();
+    }
+    if (native_seen_.size() > size_t{options_.native_max_entries} * 2) {
+        native_seen_.clear(); // (inputs seen once long ago: a sighting again counts as the first)
+    }
+    if (native_last_snap_.size() > size_t{options_.native_max_entries} * 2) {
+        native_last_snap_.clear();
+    }
+    if (native_last_ud_.size() > size_t{options_.native_max_entries} * 2) {
+        native_last_ud_.clear();
+    }
+    if (native_masks_.size() > size_t{options_.native_max_entries} * 2) {
+        native_masks_.clear(); // (learned again; a cached key holds its own mask, so none is taken wrongly)
+    }
     // fold what the worker counted
     std::scoped_lock lock{mutex_};
     stats_.translations += std::exchange(w_translations_, 0);
@@ -527,8 +743,9 @@ void ShaderFrontend::Prepare(Module& m) {
 
 StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u64 addr,
                                          std::span<const u32, 16> user_data, const BindingStart& start,
-                                         GuestReader& memory, bool may_queue) {
+                                         GuestReader& memory, bool may_queue, const Cp::EngineTable* engine) {
     const size_t si = static_cast<size_t>(hw);
+    shared_[si].reset();
     // P4.7: the stage's last ready preparation again (its StageView holds it) when nothing it was built from changed
     StageMemo& memo = memo_[si];
     u64 verify = 0; // SSPC_DIAG_STAGE_MEMO=verify: a hit prepared in full anyway - the fingerprint of what it would give
@@ -659,21 +876,59 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         fetch = &fe->fetch;
     }
 
+    // P5.3 Native Render Frontend: the engine described this stage's resource table - the preparation of a draw with
+    // exactly these inputs is taken again (no SRT walk, decoding, key or module search), or this one is cached
+    NativeKey nkey;
+    u64 nbase = 0, nhash = 0, nshape = 0, nsnap = 0, ninputs = 0;
+    u32 nptrs = 0;
+    NativeEntry* nhit = nullptr; // verify: the cached preparation the full one is compared with
+    bool nmiss = false;          // looked up, not found: the preparation below may be cached (native_admit)
+    if (engine != nullptr && native_on_) {
+        const u64 fver = fe != nullptr ? fe->version : 0;
+        if (NativeKeyOf(hw, *engine, user_data, memory, s, first, fe, fver, start, nkey, nbase, nshape, nptrs, nsnap)) {
+            ++stats_.native_lookups;
+            const auto ms = native_masks_.find(nshape);
+            NativeMask(nkey, user_data, nptrs, ms != native_masks_.end() ? ms->second : 0xFFFFu, nsnap, ninputs, nhash);
+            const auto it = native_.find(nhash);
+            if (it == native_.end()) {
+                nmiss = true;
+            } else if (!(it->second.key == nkey) || it->second.snapshot != native_snap_[si]) {
+                ++stats_.native_collisions; // (another key or other bytes with this hash: prepared, not cached)
+            } else if (it->second.view == nullptr) {
+                ++stats_.native_known_uncacheable;
+                it->second.last_frame = native_frame_;
+            } else if (it->second.view->module->state.load(std::memory_order_acquire) == ModuleState::Ready) {
+                it->second.last_frame = native_frame_;
+                if (options_.native_stages != NativeStages::Verify) {
+                    ++stats_.native_hits;
+                    shared_[si] = it->second.view;
+                    ++it->second.view->module->uses;
+                    NoteGpuWrites(*it->second.view); // (P5.2: its writes happen again with this draw)
+                    return StageStatus::Ready;
+                }
+                nhit = &it->second; // (the full preparation below is the draw's; compared at the end)
+            }
+        }
+    }
+    NativeRecorder recorder(memory, nbase, nbase + u64{nkey.dwords} * 4);
+    GuestReader& rmem = nmiss ? static_cast<GuestReader&>(recorder) : memory;
+
     // resources and the key
     const u64 tr = FineTicks();
-    if (!ResolveResources(r, first.srt, start, fetch, user_data, addr, memory, s.plan)) {
+    if (!ResolveResources(r, first.srt, start, fetch, user_data, addr, rmem, s.plan)) {
         ++stats_.srt_walk_failures;
     }
     if (!first.srt_error.empty()) {
         ++stats_.srt_walk_failures; // a walker SecondSonPC cannot interpret: nothing past the registers resolved
         s.plan.flat.resize(16);
-        DecodeResources(r, start, fetch, user_data, addr, VertexSource{&memory, {}}, s.plan);
+        DecodeResources(r, start, fetch, user_data, addr, VertexSource{&rmem, {}}, s.plan);
     }
     stats_.srt_reads += s.plan.srt.reads;
     stats_.srt_faults += s.plan.srt.faults;
     for (size_t i = 0; i < s.plan.status_counts.size(); ++i) {
         stats_.resources[i] += s.plan.status_counts[i];
     }
+    u32 nused = nmiss ? UserDataUsed(r, s.plan, fetch) : 0; // (the key and the module depend on this plan too)
     const u64 tk = FineTicks();
     if (g_fine_timing || g_fine_now) {
         times_.resources.Add(TicksToNs(tk - tr));
@@ -722,12 +977,84 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
         // the specialization changed the resources (an FMask image, ...): the module's own reflection decides the
         // plan and the next stage's bindings
         ++stats_.layout_mismatch;
-        ResolveResources(mr, m->srt, start, fetch, user_data, addr, memory, s.plan);
+        ResolveResources(mr, m->srt, start, fetch, user_data, addr, rmem, s.plan);
         s.end = EndOf(start, s.plan);
+        if (nmiss) {
+            nused |= UserDataUsed(mr, s.plan, fetch);
+        }
     }
     ++m->uses;
     if (verify != 0 && StageFingerprint(s) == verify) {
         --stats_.memo_mismatches;
+    }
+    if (nhit != nullptr) {
+        ++stats_.native_verified;
+        if (!SameNative(s, *nhit->view)) {
+            ++stats_.native_mismatches;
+            if (stats_.native_mismatches <= 8) {
+                SSPC_LOG(GPU, Warning,
+                         "native frontend (verify): the cached preparation of a {} stage (program {:#x}, snapshot {} "
+                         "dwords) differs from its full preparation",
+                         hw == HwStage::Ps ? "PS" : "VS", addr, nkey.dwords);
+            }
+        }
+    } else if (nmiss) {
+        // the registers this preparation read: the shape's mask grows to them, the key is made again if it changed
+        const auto [mi, fresh] = native_masks_.try_emplace(nshape, nused);
+        if (!fresh && (mi->second | nused) != mi->second) {
+            mi->second |= nused;
+            ++stats_.native_mask_grew;
+        }
+        if (nkey.ud_mask != mi->second) {
+            NativeMask(nkey, user_data, nptrs, mi->second, nsnap, ninputs, nhash);
+        }
+        if (options_.native_stages == NativeStages::Verify) {
+            NativeMissWhy(nshape, ninputs, nkey, native_snap_[si]); // (under the mask the key ends up with)
+        }
+        // cached at the n-th sighting of these inputs
+        bool learn = options_.native_admit <= 1;
+        if (!learn) {
+            if (const auto seen = native_seen_.find(nhash); seen == native_seen_.end()) {
+                native_seen_.emplace(nhash, 1u);
+            } else if (++seen->second >= options_.native_admit) {
+                native_seen_.erase(seen);
+                learn = true;
+            }
+        }
+        if (!learn) {
+            ++stats_.native_first_seen; // (prepared as before, not cached)
+            nmiss = false;
+        }
+    }
+    if (nmiss) {
+        // cached only when everything read on the way was the snapshot's and none of the resources lies in it (and the
+        // walk left the registers' part of the flattened data alone: the executor writes the draw's own there)
+        const u32 why = recorder.Outside() || s.plan.srt.user_data_written          ? 0
+                        : PlanTouches(s.plan, nbase, nbase + u64{nkey.dwords} * 4) ? 1
+                        : s.plan.srt.faults != 0 || !s.plan.error.empty()          ? 2
+                                                                                    : 4;
+        if (why == 2) {
+            ++stats_.native_uncacheable; // (a failed read may succeed next time: nothing remembered)
+            ++stats_.native_uncacheable_by[2];
+        } else {
+            NativeEntry& e = native_[nhash];
+            e.key = nkey;
+            e.snapshot = native_snap_[si];
+            e.last_frame = native_frame_;
+            if (why == 4) {
+                auto v = std::make_shared<StageView>();
+                CopyView(*v, s);
+                v->status = StageStatus::Ready;
+                v->native_shared = true;
+                e.view = v;
+                shared_[si] = std::move(v); // (the record shares it too: no copy of the preparation)
+                ++stats_.native_learned;
+                stats_.native_keyed_registers += static_cast<u64>(std::popcount(nkey.ud_mask & ~nptrs & 0xFFFFu));
+            } else {
+                ++stats_.native_uncacheable;
+                ++stats_.native_uncacheable_by[why];
+            }
+        }
     }
     // (the generation after the reads: a read that waited for a GPU write saw it)
     memo.valid = true;
@@ -741,11 +1068,136 @@ StageStatus ShaderFrontend::PrepareStage(StageView& s, HwStage hw, SwStage sw, u
     return StageStatus::Ready;
 }
 
+bool ShaderFrontend::NativeKeyOf(HwStage hw, const Cp::EngineTable& t, std::span<const u32, 16> user_data,
+                                 GuestReader& memory, const StageView& s, const Module& first, const void* fetch,
+                                 u64 fetch_version, const BindingStart& start, NativeKey& key, u64& base, u64& shape,
+                                 u32& pointers, u64& snap_hash) {
+    key.address = s.address;
+    key.program = s.program;
+    key.first = &first;
+    key.fetch = fetch;
+    key.fetch_version = fetch_version;
+    key.start = start;
+    key.stage = static_cast<u32>(hw);
+    key.dwords = t.refs != 0 ? t.dwords : 0;
+    key.user_data = {};
+    key.ud_mask = 0;
+    key.reserved = 0;
+    // every pointer into the snapshot agrees on its start (the commit's layout: a pointer, `offset` dwords past it)
+    base = 0;
+    pointers = 0;
+    for (u32 i = 0; i < t.refs && i < t.sgpr.size(); ++i) {
+        const u32 sg = t.sgpr[i];
+        if (sg + 1 >= 16) {
+            ++stats_.native_unkeyed;
+            return false;
+        }
+        const u64 pointer = u64{user_data[sg]} | (u64{user_data[sg + 1] & 0xFFFF} << 32);
+        const u64 at = pointer - u64{t.offset[i]} * 4;
+        if (i != 0 && at != base) {
+            ++stats_.native_unkeyed;
+            return false;
+        }
+        base = at;
+        key.user_data[sg] = u32{t.offset[i]} * 4;
+        key.user_data[sg + 1] = user_data[sg + 1] & 0xFFFF0000u;
+        pointers |= 3u << sg;
+    }
+    std::vector<u32>& snap = native_snap_[static_cast<size_t>(hw)];
+    snap.resize(key.dwords);
+    if (key.dwords != 0 && (base == 0 || !memory.Read(base, snap.data(), u64{key.dwords} * 4))) {
+        ++stats_.native_unkeyed;
+        return false;
+    }
+    static_assert(std::has_unique_object_representations_v<NativeKey>, "NativeKey is hashed as bytes");
+    shape = XXH3_64bits(&key, sizeof(key));
+    snap_hash = XXH3_64bits(snap.data(), snap.size() * 4);
+    return true;
+}
+
+void ShaderFrontend::NativeMask(NativeKey& key, std::span<const u32, 16> user_data, u32 pointers, u32 mask,
+                                u64 snap_hash, u64& inputs, u64& hash) {
+    key.ud_mask = mask & 0xFFFFu;
+    for (u32 i = 0; i < 16; ++i) {
+        if (((pointers >> i) & 1) == 0) {
+            key.user_data[i] = ((mask >> i) & 1) != 0 ? user_data[i] : 0;
+        }
+    }
+    inputs = XXH3_64bits(&key, sizeof(key));
+    hash = XXH3_64bits_withSeed(&key, sizeof(key), snap_hash);
+}
+
+void ShaderFrontend::NativeMissWhy(u64 shape, u64 inputs, const NativeKey& key, const std::vector<u32>& snapshot) {
+    const auto [it, fresh] = native_last_snap_.try_emplace(inputs);
+    std::vector<u32>& last = it->second;
+    if (fresh) {
+        ++stats_.native_miss_new;
+        const auto [su, sfresh] = native_last_ud_.try_emplace(shape, key.user_data);
+        if (sfresh) {
+            ++stats_.native_miss_new_shape;
+        } else {
+            for (u32 i = 0; i < 16; ++i) {
+                if (su->second[i] != key.user_data[i]) {
+                    ++stats_.native_miss_ud[i];
+                }
+            }
+            su->second = key.user_data;
+        }
+    } else if (last == snapshot) {
+        ++stats_.native_miss_same; // (evicted, or not yet admitted)
+    } else {
+        ++stats_.native_miss_bytes;
+        u32 differ = 0;
+        bool word0 = true;
+        for (size_t i = 0; i < snapshot.size() && i < last.size(); ++i) {
+            if (last[i] != snapshot[i]) {
+                ++differ;
+                word0 = word0 && i % 4 == 0;
+            }
+        }
+        differ += static_cast<u32>(snapshot.size() > last.size() ? snapshot.size() - last.size()
+                                                                 : last.size() - snapshot.size());
+        ++stats_.native_miss_dwords[differ <= 1 ? 0 : differ == 2 ? 1 : differ <= 4 ? 2 : differ <= 8 ? 3 : 4];
+        if (word0 && snapshot.size() == last.size()) {
+            ++stats_.native_miss_word0;
+        }
+    }
+    last = snapshot;
+}
+
+void ShaderFrontend::NativeEvict() {
+    // the preparations no draw took lately go - in the last 30 frames, else 8, else 2; if even that is not enough,
+    // all of them (a scene change)
+    for (const u64 window : {u64{30}, u64{8}, u64{2}}) {
+        const u64 keep_from = native_frame_ > window ? native_frame_ - window : 0;
+        for (auto it = native_.begin(); it != native_.end();) {
+            if (it->second.last_frame < keep_from) {
+                it = native_.erase(it);
+                ++stats_.native_evicted;
+            } else {
+                ++it;
+            }
+        }
+        if (native_.size() <= options_.native_max_entries) {
+            return;
+        }
+    }
+    if (native_.size() > options_.native_max_entries) {
+        stats_.native_evicted += native_.size();
+        native_.clear();
+    }
+}
+
 const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, const Cp::RegisterFile& regs,
                                                    GuestReader& memory) {
     const u64 t0 = FineTicks();
     ++stats_.draws;
     prep_ = {};
+    shared_[static_cast<size_t>(HwStage::Ps)].reset();
+    shared_[static_cast<size_t>(HwStage::Vs)].reset();
+    // P5.3: the engine described the draw, in a pass the Native Render Frontend takes
+    const bool native = native_on_ && d.engine_pass != Cp::kNoEnginePass &&
+                        ((options_.native_passes >> Engine::Render::PassSlot(d.engine_pass)) & 1) != 0;
     if (DecodeStages(regs.Get(Reg::VgtShaderStagesEn)) != StageConfig::Vs) {
         ++stats_.unsupported;
         prep_.unsupported = true;
@@ -773,16 +1225,18 @@ const DrawPreparation& ShaderFrontend::PrepareDraw(const Cp::DrawDescriptor& d, 
         }
         const auto cpst = static_cast<size_t>(hw); // Cp::Stage has the graphics stages in HwStage's order
         const std::span<const u32, 16> ud(d.user_data[cpst]);
-        s.status = runtime_valid_[si] ? PrepareStage(s, hw, sw, d.shaders[cpst].address, ud, start, memory, ready)
-                                      : StageStatus::Unsupported;
+        const Cp::EngineTable* engine = !native ? nullptr : hw == HwStage::Ps ? &d.engine_ps : &d.engine_vs;
+        s.status = runtime_valid_[si]
+                       ? PrepareStage(s, hw, sw, d.shaders[cpst].address, ud, start, memory, ready, engine)
+                       : StageStatus::Unsupported;
         ++stats_.stage_status[static_cast<size_t>(s.status)];
         ready &= s.status == StageStatus::Ready;
-        start = s.end;
+        start = Stage(hw).end; // (the shared preparation's, when the native cache gave one)
     }
     if (ready) {
         const u64 tp = FineTicks();
-        const StageView& ps = stages_[static_cast<size_t>(HwStage::Ps)];
-        const StageView& vs = stages_[static_cast<size_t>(HwStage::Vs)];
+        const StageView& ps = Stage(HwStage::Ps);
+        const StageView& vs = Stage(HwStage::Vs);
         const u32 ps_id = ps.module->id, vs_id = vs.module->id;
         if (last_pipeline_ != 0 && ps_id == last_ps_ && vs_id == last_vs_ &&
             (d.changed & PipelineStateGroups()) == 0) {

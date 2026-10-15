@@ -242,10 +242,14 @@ const FetchCache::Entry& FetchCache::GetEntry(GuestReader& memory, u64 addr, u32
                 ++trust_mismatches; // (verify) the code changed without a tracked write
             }
         }
+        if (!e.ok || e.code != scratch_) {
+            ++e.version;
+        }
         e.code = scratch_;
         e.fetch = std::move(parsed);
         e.error.clear();
     } else {
+        e.version += e.ok ? 1 : 0;
         e.fetch = {};
         e.code.clear();
         e.error = std::move(error);

@@ -27,6 +27,7 @@ add_library(sspc_runtime STATIC
     src/engine/guest_hooks.cpp
     src/engine/guest_probe.cpp
     src/engine/job_system.cpp
+    src/engine/particles/smoke_quality.cpp
     src/engine/render/dcb_scan.cpp
     src/engine/render/frame_trace.cpp
     src/engine/render/native_draw.cpp
@@ -74,6 +75,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/shader/shader_cache.cpp
     src/runtime/gpu/shader/shader_capture.cpp
     src/runtime/gpu/shader/shader_disk_cache.cpp
+    src/runtime/gpu/shader/game_shader_index.cpp
     src/runtime/gpu/shader/shader_frontend.cpp
     src/runtime/gpu/shader/shader_resources.cpp
     src/runtime/gpu/shader/shader_translator.cpp
@@ -87,6 +89,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/vulkan/vk_pipelines.cpp
     src/runtime/gpu/vulkan/vk_precompile.cpp
     src/runtime/gpu/vulkan/vk_presenter.cpp
+    src/runtime/gpu/vulkan/vk_stability_tests.cpp
     src/runtime/gpu/vulkan/vk_resources.cpp
     src/runtime/gpu/host_shaders.cpp
     src/runtime/gpu/image_layout.cpp
@@ -156,7 +159,7 @@ sspc_attach_bootstrap(sspc_runtime)
 # one of them re-runs this configure step; a cache written by another generation is never read.
 file(GLOB _sspc_gen_inputs CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/gpu/shader/*.cpp
      ${CMAKE_SOURCE_DIR}/src/runtime/gpu/shader/*.h)
-list(FILTER _sspc_gen_inputs EXCLUDE REGEX "shader_(disk_cache|capture)\\.(cpp|h)$")
+list(FILTER _sspc_gen_inputs EXCLUDE REGEX "(shader_disk_cache|shader_capture|game_shader_index)\\.(cpp|h)$")
 list(APPEND _sspc_gen_inputs ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/shader_translator_host.cpp
      ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/shader_bridge_hooks.h)
 list(SORT _sspc_gen_inputs)
@@ -238,12 +241,13 @@ add_executable(sspc_engine_tests EXCLUDE_FROM_ALL
     src/engine/guest_hooks.cpp
     src/engine/guest_probe.cpp
     src/engine/job_system.cpp
+    src/engine/particles/smoke_quality.cpp
     src/engine/render/dcb_scan.cpp
     src/engine/render/native_draw.cpp
     src/engine/render/native_render_ops.cpp
+    src/engine/render/native_state.cpp
     src/engine/render/pass_graph.cpp
     src/runtime/gpu/pm4.cpp
-    src/engine/render/native_state.cpp
     src/base/log.cpp
 )
 target_include_directories(sspc_engine_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

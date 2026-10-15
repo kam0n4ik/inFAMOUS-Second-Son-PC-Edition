@@ -107,7 +107,8 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
         gw_bits_ = std::make_unique<u64[]>(kGwWords);
         rec_value_ = std::make_unique<std::atomic<u64>[]>(kRecRing);
     }
-    async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr;
+    fthread_mode_ = options.frontend_thread && frontend_ != nullptr;
+    async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr && !fthread_mode_;
 }
 
 ParallelCp::~ParallelCp() {
@@ -119,6 +120,11 @@ void ParallelCp::Attach(Cp::CommandProcessor& cp) {
     replica_ = cp.Registers(); // (the same registers, versions and hashes from here on, the journal keeps them so)
     replica_.SetSink(nullptr);
     replica_.SetMirror(nullptr);
+    if (fthread_mode_) {
+        freplica_ = cp.Registers(); // (the frontend thread's own copy, kept by the same journal)
+        freplica_.SetSink(nullptr);
+        freplica_.SetMirror(nullptr);
+    }
     cp.MutableRegisters().SetSink(this);
     exec_.SetRegisters(&replica_);
 }
@@ -131,6 +137,9 @@ void ParallelCp::Start() {
     if (StallTrace::Deep()) {
         push_tsc_ = std::make_unique<u64[]>(kRecRing);
     }
+    if (fthread_mode_) {
+        fthread_ = std::thread([this] { FrontLoop(); });
+    }
     thread_ = std::thread([this] { Loop(); });
 }
 
@@ -141,6 +150,9 @@ void ParallelCp::Stop() {
     Drain(DrainReason::Stop);
     BeginRecord(Kind::Stop);
     PushRecord();
+    if (fthread_.joinable()) {
+        fthread_.join(); // (it passes the stop record on to thread 2)
+    }
     if (thread_.joinable()) {
         thread_.join();
     }
@@ -160,6 +172,8 @@ ParallelCp::Record& ParallelCp::BeginRecord(Kind kind) {
     }
     Record& r = slots_[next_ & (kSlots - 1)];
     r.kind = kind;
+    r.front_memo = pending_front_memo_; // (frontend thread: told before it prepares this record)
+    pending_front_memo_ = false;
     r.memory_changed = pending_memory_changed_;
     if (pending_memory_changed_) {
         pending_memory_changed_ = false;
@@ -180,10 +194,11 @@ void ParallelCp::PushRecord() {
     }
     ++next_;
     tail_.store(next_, std::memory_order_seq_cst);
-    if (t2_waiting_.load(std::memory_order_seq_cst) != 0) {
+    // (tail_'s waiter: thread 2, or with the frontend thread that thread - thread 2 then waits on fhead_)
+    if ((fthread_mode_ ? f_waiting_ : t2_waiting_).load(std::memory_order_seq_cst) != 0) {
         tail_.notify_one();
     }
-    if (frontend_ != nullptr && (next_ & 63) == 0) {
+    if (frontend_ != nullptr && !fthread_mode_ && (next_ & 63) == 0) {
         RetireGpuWrites(); // (the GPU writes completed so far leave the list; the bits follow at the next hit)
     }
 }
@@ -237,11 +252,20 @@ void ParallelCp::ApplyPending() {
     }
     if (frontend_ != nullptr) {
         exec_.SetMemoBumps(true); // (calls made here tell the frontend themselves, in stream order)
-        // GPU writes whose completion value fell out of the ring: the executor decides now (rare)
-        while (!gw_.empty() && gw_.front().value == kLookup && gw_.front().record + kRecRing <= next_ &&
-               !exec_.FrontendReadPending(gw_.front().begin, gw_.front().end - gw_.front().begin)) {
-            gw_.pop_front();
-            gw_stale_ = true;
+        if (fthread_mode_) {
+            // the frontend thread is parked (every record prepared and executed): what it was not told yet
+            ApplyFrontEvents(~0ull);
+            if (pending_front_memo_) {
+                pending_front_memo_ = false;
+                frontend_->GuestMemoryChanged();
+            }
+        } else {
+            // GPU writes whose completion value fell out of the ring: the executor decides now (rare)
+            while (!gw_.empty() && gw_.front().value == kLookup && gw_.front().record + kRecRing <= next_ &&
+                   !exec_.FrontendReadPending(gw_.front().begin, gw_.front().end - gw_.front().begin)) {
+                gw_.pop_front();
+                gw_stale_ = true;
+            }
         }
     }
     queued_tw_.clear(); // (every queued timeline copy executed: they are the executor's own now)
@@ -278,7 +302,7 @@ void ParallelCp::Drain(DrainReason why) {
     // thread 2 is parked (it waits for the next record): what is not handed on yet is applied here
     ApplyPending();
     if (frontend_ != nullptr) {
-        RetireGpuWrites();
+        RetireGpuWrites(); // (frontend thread: parked too - the queue is empty, so it prepared everything)
     }
 }
 
@@ -301,6 +325,10 @@ bool ParallelCp::CopyQueuedOver(u64 addr, u64 bytes) const {
 }
 
 void ParallelCp::MemoryChanged() {
+    if (fthread_mode_) {
+        FrontMemoChanged(); // (with the next record, or at the next idle point)
+        return;
+    }
     if (frontend_ != nullptr) {
         frontend_->GuestMemoryChanged(); // (the frontend is here: at once, where the write is in the stream)
         return;
@@ -323,7 +351,10 @@ void ParallelCp::JournalReserve(u32 words) {
     const u64 idx = jtail_ & (kJournalWords - 1);
     const bool wrap = idx + words > kJournalWords;
     const u64 need = words + (wrap ? kJournalWords - idx : 0);
-    if (jtail_ + need - jhead_.load(std::memory_order_acquire) > kJournalWords) {
+    // (the frontend thread reads the journal too: its words are free once both replicas passed them)
+    const u64 read = fthread_mode_ ? std::min(jhead_.load(std::memory_order_acquire), fjhead_.load(std::memory_order_acquire))
+                                   : jhead_.load(std::memory_order_acquire);
+    if (jtail_ + need - read > kJournalWords) {
         // thread 2 replays the journal with records only: one that carries it so far, then wait until it ran
         BeginRecord(Kind::Journal);
         PushRecord();
@@ -371,11 +402,13 @@ void ParallelCp::AddGpuWrite(u64 begin, u64 end, u64 record, u64 value) {
         return;
     }
     gw_.push_back({begin, end, record, value});
-    ++t1_.gpu_writes;
+    Bump(fc_.gpu_writes);
     if (frontend_ != nullptr) {
         frontend_->GpuWrote(begin, end - begin); // (P5.2: trusted shader code under a GPU write is read again)
     }
-    t1_.gw_max = std::max<u64>(t1_.gw_max, gw_.size());
+    if (gw_.size() > fc_.gw_max.load(std::memory_order_relaxed)) {
+        fc_.gw_max.store(gw_.size(), std::memory_order_relaxed);
+    }
     const u64 b0 = begin >> kGwBlockBits, b1 = std::min((end - 1) >> kGwBlockBits, kGwWords * 64 - 1);
     for (u64 b = b0; b <= b1; ++b) {
         u64& word = gw_bits_[b >> 6];
@@ -430,7 +463,7 @@ void ParallelCp::RebuildGpuWriteBits() {
         }
     }
     gw_stale_ = false;
-    ++t1_.gw_rebuilds;
+    Bump(fc_.gw_rebuilds);
 }
 
 bool ParallelCp::MayBeGpuWritten(u64 addr, u64 bytes) {
@@ -449,7 +482,7 @@ bool ParallelCp::MayBeGpuWritten(u64 addr, u64 bytes) {
     if (!any_bit()) {
         return false;
     }
-    ++t1_.gw_block_hits;
+    Bump(fc_.gw_block_hits);
     RetireGpuWrites();
     if (gw_stale_) {
         RebuildGpuWriteBits();
@@ -477,10 +510,11 @@ void ParallelCp::NoteStageWrites(const GS::StageView& s, u64 record, bool& write
     }
 }
 
-void ParallelCp::PrepareDraw(Record& r) {
+void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs) {
     r.prepared = false;
+    r.stage_shared.reset();
+    r.ps_shared.reset();
     r.state = nullptr;
-    const Cp::RegisterFile& regs = cp_->Registers(); // (as they are at the draw's packet)
     if (Vk::Executor::DrawFiltered(regs, r.draw)) {
         return; // no preparation: thread 2 sees the same registers and skips it as filtered
     }
@@ -489,22 +523,31 @@ void ParallelCp::PrepareDraw(Record& r) {
         const GS::FineSample fine(front_fine_counter_);
         const GS::DrawPreparation& prep = frontend_->PrepareDraw(r.draw, regs, reader_);
         r.prep = prep;
-        CopyStage(r.stage, frontend_->Stage(GS::HwStage::Vs));
-        CopyStage(r.ps, frontend_->Stage(GS::HwStage::Ps));
+        // P5.3: a preparation the native cache shares is kept by reference (immutable), not copied
+        r.stage_shared = frontend_->SharedStage(GS::HwStage::Vs);
+        r.ps_shared = frontend_->SharedStage(GS::HwStage::Ps);
+        if (r.stage_shared == nullptr) {
+            CopyStage(r.stage, frontend_->Stage(GS::HwStage::Vs));
+        }
+        if (r.ps_shared == nullptr) {
+            CopyStage(r.ps, frontend_->Stage(GS::HwStage::Ps));
+        }
         r.state = prep.ready ? frontend_->Pipelines().Graphics(prep.pipeline) : nullptr;
     }
     r.prepared = true;
     bool writes = false;
-    NoteStageWrites(r.stage, next_, writes);
-    NoteStageWrites(r.ps, next_, writes);
+    NoteStageWrites(r.Vs(), index, writes);
+    NoteStageWrites(r.Ps(), index, writes);
     if (writes) {
         frontend_->GuestMemoryChanged(); // (Executor::MarkWrites after the draw: no memoized preparation past it)
     }
-    t1_.front_ticks += __rdtsc() - t0;
+    Bump(fc_.ticks, __rdtsc() - t0);
 }
 
-void ParallelCp::PrepareDispatch(Record& r) {
+void ParallelCp::PrepareDispatch(Record& r, u64 index) {
     r.prepared = false;
+    r.stage_shared.reset(); // (a compute stage is never shared: Execute takes r.stage)
+    r.ps_shared.reset();
     r.state = nullptr;
     if (!r.has_cs) {
         return;
@@ -517,22 +560,38 @@ void ParallelCp::PrepareDispatch(Record& r) {
     }
     r.prepared = true;
     bool writes = false;
-    NoteStageWrites(r.stage, next_, writes);
+    NoteStageWrites(r.stage, index, writes);
     if (writes) {
         frontend_->GuestMemoryChanged(); // (Executor::NoteAccesses after the dispatch)
     }
-    t1_.front_ticks += __rdtsc() - t0;
+    Bump(fc_.ticks, __rdtsc() - t0);
 }
 
 bool ParallelCp::FrontReader::Read(u64 addr, void* dst, u64 bytes) {
-    ++p_.t1_.front_reads;
-    if (p_.Idle()) {
+    Bump(p_.fc_.reads);
+    if (p_.fthread_mode_) {
+        // The frontend thread prepares record k: thread 2 runs only the records before it. With every one of them
+        // executed, thread 2 is parked on k and thread 1 does not use the executor (k is queued, the queue not empty):
+        // the executor decides exactly, as at thread 1's idle point. A possible pending GPU write otherwise: wait for
+        // thread 2 to get there first (not a drain of thread 1's later records).
+        const u64 k = p_.f_current_;
+        bool ask = p_.head_.load(std::memory_order_acquire) == k;
+        if (!ask && p_.MayBeGpuWritten(addr, bytes)) {
+            Bump(p_.fc_.read_hits);
+            p_.FrontWaitExecuted(k);
+            ask = true;
+        }
+        if (ask) {
+            p_.DropUnknownGpuWrites();
+            Bump(p_.fc_.syncs, p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0);
+        }
+    } else if (p_.Idle()) {
         p_.ApplyPending();
-        p_.t1_.front_syncs += p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0; // (exact: TimelineReader's check)
+        Bump(p_.fc_.syncs, p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0); // (exact: TimelineReader's check)
     } else if (p_.MayBeGpuWritten(addr, bytes)) {
-        ++p_.t1_.front_read_hits;
+        Bump(p_.fc_.read_hits);
         p_.Drain(DrainReason::FrontendRead);
-        p_.t1_.front_syncs += p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0;
+        Bump(p_.fc_.syncs, p_.exec_.SyncForFrontendRead(addr, bytes) ? 1 : 0);
     }
     // (TimelineReader's read: a run of the physical backing read before - its host view, what CopySparse copies)
     if (p_.map_gen_ != nullptr && GuestMemory::IsValidGpuMapping(addr, bytes)) {
@@ -603,6 +662,177 @@ void ParallelCp::ApplyDeferred(u64 before) {
     has_deferred_.store(!deferred_.empty(), std::memory_order_release);
 }
 
+// ---- P5.3D: the frontend thread (between thread 1 and thread 2)
+
+void ParallelCp::FrontApplyJournal(u64 end) {
+    u64 pos = fjhead_.load(std::memory_order_relaxed);
+    while (pos < end) {
+        const u32* w = JournalAt(pos);
+        const u32 op = w[0] >> 28;
+        if (op == kOpPad) {
+            pos = (pos + kJournalWords) & ~u64{kJournalWords - 1};
+            continue;
+        }
+        if (op == kOpWrite) {
+            const u32 count = w[0] & 0xFFFFFF;
+            freplica_.Write(static_cast<Cp::Space>((w[0] >> 24) & 0xF), w[1], w + 2, count);
+            pos += 2 + count;
+        } else if (op == kOpReset) {
+            freplica_.Reset();
+            pos += 1;
+        } else if (op == kOpLoad && (w[0] & 0xFFFFFF) == Cp::kNumRegs) {
+            freplica_.Load(std::span<const u32, Cp::kNumRegs>(w + 1, Cp::kNumRegs));
+            pos += 1 + Cp::kNumRegs;
+        } else {
+            Fail(fmt::format("parallel command processor: corrupt register journal at {} (word {:#x}, frontend thread)",
+                             pos, w[0]));
+            pos = end;
+        }
+    }
+    fjhead_.store(pos, std::memory_order_release);
+}
+
+void ParallelCp::FrontWaitExecuted(u64 index) {
+    u64 h = head_.load(std::memory_order_acquire);
+    if (h >= index) {
+        return;
+    }
+    const u64 t0 = __rdtsc();
+    while (h < index && __rdtsc() - t0 < spin_ticks_) {
+        _mm_pause();
+        h = head_.load(std::memory_order_acquire);
+    }
+    while (h < index) {
+        f_wait_target_.store(index, std::memory_order_seq_cst);
+        h = head_.load(std::memory_order_seq_cst);
+        if (h < index) {
+            head_.wait(h, std::memory_order_seq_cst);
+        }
+        f_wait_target_.store(0, std::memory_order_relaxed);
+        h = head_.load(std::memory_order_acquire);
+    }
+    Bump(fc_.waits);
+    Bump(fc_.wait_ticks, __rdtsc() - t0);
+}
+
+void ParallelCp::DropUnknownGpuWrites() {
+    // (thread 2 parked before f_current_: the executor may be asked)
+    while (!gw_.empty() && gw_.front().value == kLookup && gw_.front().record + kRecRing <= f_current_ &&
+           !exec_.FrontendReadPending(gw_.front().begin, gw_.front().end - gw_.front().begin)) {
+        gw_.pop_front();
+        gw_stale_ = true;
+    }
+}
+
+void ParallelCp::FrontEvent(u64 addr, u64 size, bool gpu) {
+    if (!fthread_mode_ || !started_ || Idle()) {
+        // the frontend thread (if any) parked: at once, after what is still queued for it (stream order)
+        ApplyFrontEvents(~0ull);
+        if (gpu) {
+            frontend_->GpuWrote(addr, size);
+        } else {
+            frontend_->Invalidate(addr, size);
+        }
+        return;
+    }
+    std::scoped_lock lock{fe_mutex_};
+    fe_.push_back({next_, addr, size, gpu});
+    has_fe_.store(true, std::memory_order_release);
+}
+
+void ParallelCp::ApplyFrontEvents(u64 upto) {
+    if (!has_fe_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::scoped_lock lock{fe_mutex_};
+    size_t n = 0;
+    while (n < fe_.size() && fe_[n].before <= upto) {
+        const FrontEventEntry& e = fe_[n];
+        if (e.gpu) {
+            frontend_->GpuWrote(e.addr, e.size);
+        } else {
+            frontend_->Invalidate(e.addr, e.size);
+        }
+        ++n;
+    }
+    fe_.erase(fe_.begin(), fe_.begin() + static_cast<std::ptrdiff_t>(n));
+    has_fe_.store(!fe_.empty(), std::memory_order_release);
+}
+
+void ParallelCp::FrontStep(Record& r, u64 index) {
+    f_current_ = index;
+    ApplyFrontEvents(index); // what thread 1 told the frontend before this record
+    if (r.front_memo) {
+        frontend_->GuestMemoryChanged(); // (a change thread 1 met before this record: stream order)
+    }
+    FrontApplyJournal(r.journal_end); // the registers as they were at the record's packet
+    switch (r.kind) {
+    case Kind::Draw:
+        PrepareDraw(r, index, freplica_);
+        break;
+    case Kind::Dispatch:
+        PrepareDispatch(r, index);
+        break;
+    case Kind::Copy:
+        AddGpuWrite(r.dst, r.dst + r.bytes, index, kLookup); // (until thread 2 recorded it: the frontend's reads wait)
+        break;
+    default:
+        break;
+    }
+    if ((index & 63) == 0) {
+        RetireGpuWrites();
+    }
+    fc_.gw_now.store(gw_.size(), std::memory_order_relaxed);
+}
+
+void ParallelCp::FrontLoop() {
+    SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuFrontend");
+    u64 k = fhead_.load(std::memory_order_relaxed);
+    for (;;) {
+        u64 t = tail_.load(std::memory_order_acquire);
+        if (t == k) {
+            const u64 w0 = __rdtsc();
+            while (t == k && __rdtsc() - w0 < spin_ticks_) {
+                _mm_pause();
+                t = tail_.load(std::memory_order_acquire);
+            }
+            while (t == k) {
+                f_waiting_.store(1, std::memory_order_seq_cst);
+                t = tail_.load(std::memory_order_seq_cst);
+                if (t == k) {
+                    tail_.wait(k, std::memory_order_seq_cst);
+                }
+                f_waiting_.store(0, std::memory_order_relaxed);
+                t = tail_.load(std::memory_order_acquire);
+            }
+            Bump(fc_.idle, __rdtsc() - w0);
+        }
+        const u64 b0 = __rdtsc();
+        Record& r = slots_[k & (kSlots - 1)];
+        const bool stop = r.kind == Kind::Stop;
+        if (!stop && !failed_.load(std::memory_order_relaxed)) {
+            try {
+                FrontStep(r, k);
+            } catch (const std::exception& e) {
+                r.prepared = false;
+                Fail(fmt::format("parallel command processor: the frontend thread threw: {}", e.what()));
+            } catch (...) {
+                r.prepared = false;
+                Fail("parallel command processor: the frontend thread threw");
+            }
+        }
+        Bump(fc_.busy, __rdtsc() - b0);
+        ++k;
+        fhead_.store(k, std::memory_order_seq_cst); // (the record's preparation published to thread 2)
+        if (t2_waiting_.load(std::memory_order_seq_cst) != 0) {
+            fhead_.notify_one();
+        }
+        if (stop) {
+            break;
+        }
+    }
+}
+
 // ---- thread 2
 
 void ParallelCp::Loop() {
@@ -611,23 +841,25 @@ void ParallelCp::Loop() {
     const bool trace_records = StallTrace::DeepRecords();
     u64 h = head_.load(std::memory_order_relaxed);
     const auto add = [](std::atomic<u64>& a, u64 v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); };
+    // (with the frontend thread, the records it prepared: fhead_)
+    std::atomic<u64>& source = fthread_mode_ ? fhead_ : tail_;
     for (;;) {
-        u64 t = tail_.load(std::memory_order_acquire);
+        u64 t = source.load(std::memory_order_acquire);
         if (t == h) {
             const u64 w0 = __rdtsc();
             while (t == h && __rdtsc() - w0 < spin_ticks_) {
                 _mm_pause();
-                t = tail_.load(std::memory_order_acquire);
+                t = source.load(std::memory_order_acquire);
             }
             while (t == h) {
                 t2_waiting_.store(1, std::memory_order_seq_cst);
-                t = tail_.load(std::memory_order_seq_cst);
+                t = source.load(std::memory_order_seq_cst);
                 if (t == h) {
                     add(t2_sleeps_, 1);
-                    tail_.wait(h, std::memory_order_seq_cst);
+                    source.wait(h, std::memory_order_seq_cst);
                 }
                 t2_waiting_.store(0, std::memory_order_relaxed);
-                t = tail_.load(std::memory_order_acquire);
+                t = source.load(std::memory_order_acquire);
             }
             const u64 w1 = __rdtsc();
             add(t2_idle_, w1 - w0);
@@ -639,6 +871,7 @@ void ParallelCp::Loop() {
         Record& r = slots_[h & (kSlots - 1)];
         const bool stop = r.kind == Kind::Stop;
         const u16 kind = static_cast<u16>(r.kind); // (before Execute: a record is not touched by thread 1 until head_ moves)
+        const u64 queue = r.kind == Kind::Dispatch ? r.dispatch.queue : 0; // (P5.4: the guest queue in the trace)
         if (!stop) {
             Execute(r, h);
             if (rec_value_ != nullptr) {
@@ -648,14 +881,15 @@ void ParallelCp::Loop() {
         const u64 b1 = __rdtsc();
         add(t2_busy_, b1 - b0);
         if (trace_records) {
-            StallTrace::Span(StallTrace::Ev::Record, b0, b1, 0, static_cast<u32>(h), kind);
+            StallTrace::Span(StallTrace::Ev::Record, b0, b1, queue, static_cast<u32>(h), kind);
         }
         add(t2_records_, 1);
         ++h;
         head_.store(h, std::memory_order_seq_cst);
         const u64 wt = t1_wait_target_.load(std::memory_order_seq_cst);
-        if (wt != 0 && h >= wt) {
-            head_.notify_one();
+        const u64 ft = f_wait_target_.load(std::memory_order_seq_cst);
+        if ((wt != 0 && h >= wt) || (ft != 0 && h >= ft)) {
+            head_.notify_all(); // (thread 1 and the frontend thread may both wait on it)
         }
         if (stop) {
             break;
@@ -719,7 +953,7 @@ void ParallelCp::Execute(Record& r, u64 index) {
             if (frontend_ != nullptr) {
                 Vk::PreparedCommand pc;
                 if (r.prepared) {
-                    pc = {&r.prep, &r.stage, &r.ps, r.state};
+                    pc = {&r.prep, &r.Vs(), &r.Ps(), r.state};
                 }
                 exec_.DrawPrepared(r.draw, pc);
             } else {
@@ -785,8 +1019,8 @@ void ParallelCp::Draw(const Cp::DrawDescriptor& draw) {
     if (verify_) {
         r.reg_hash = RegistersHash(cp_->Registers());
     }
-    if (frontend_ != nullptr) {
-        PrepareDraw(r);
+    if (frontend_ != nullptr && !fthread_mode_) {
+        PrepareDraw(r, next_, cp_->Registers()); // (as they are at the draw's packet)
     }
     ++t1_.draws;
     PushRecord();
@@ -803,8 +1037,8 @@ void ParallelCp::Dispatch(const Cp::DispatchDescriptor& dispatch) {
     if (verify_) {
         r.reg_hash = RegistersHash(cp_->Registers());
     }
-    if (frontend_ != nullptr) {
-        PrepareDispatch(r);
+    if (frontend_ != nullptr && !fthread_mode_) {
+        PrepareDispatch(r, next_);
     }
     ++t1_.dispatches;
     PushRecord();
@@ -918,8 +1152,8 @@ bool ParallelCp::CopyOnTimeline(u32 queue, u64 seq, u64 src, u64 dst, u64 bytes)
     queued_tw_.emplace_back(dst, dst + bytes);
     qtw_lo_ = std::min(qtw_lo_, dst);
     qtw_hi_ = std::max(qtw_hi_, dst + bytes);
-    if (frontend_ != nullptr) {
-        AddGpuWrite(dst, dst + bytes, next_, kLookup);
+    if (frontend_ != nullptr && !fthread_mode_) {
+        AddGpuWrite(dst, dst + bytes, next_, kLookup); // (the frontend thread notes it when it passes the record)
     }
     PushRecord();
     FrontMemoChanged(); // (the copy's NoteAccesses)
@@ -1003,7 +1237,20 @@ ParallelTotals ParallelCp::Totals() const {
     t.t2_records = t2_records_.load(std::memory_order_relaxed);
     t.copy_fallbacks = copy_fallbacks_.load(std::memory_order_relaxed);
     t.copy_failures = copy_failures_.load(std::memory_order_relaxed);
-    t.gw_now = gw_.size(); // (thread 1's: Totals is called there)
+    const auto get = [](const std::atomic<u64>& a) { return a.load(std::memory_order_relaxed); };
+    t.front_ticks = get(fc_.ticks);
+    t.front_reads = get(fc_.reads);
+    t.front_read_hits = get(fc_.read_hits);
+    t.front_syncs = get(fc_.syncs);
+    t.gpu_writes = get(fc_.gpu_writes);
+    t.gw_max = get(fc_.gw_max);
+    t.gw_block_hits = get(fc_.gw_block_hits);
+    t.gw_rebuilds = get(fc_.gw_rebuilds);
+    t.gw_now = fthread_mode_ ? get(fc_.gw_now) : gw_.size(); // (thread 1's own list without the frontend thread)
+    t.tf_busy_ticks = get(fc_.busy);
+    t.tf_idle_ticks = get(fc_.idle);
+    t.tf_wait_ticks = get(fc_.wait_ticks);
+    t.tf_waits = get(fc_.waits);
     return t;
 }
 
@@ -1023,7 +1270,9 @@ std::string ParallelCp::Report() const {
         "memory acquired {}/{}, timeline copies {}/{} (refused by shape {}, copied by the CPU after a refusal {}); "
         "processor reads drained for a pending timeline copy {}\n",
         async_ ? "queued" : "drained", async_copies_ ? "queued" : "drained",
-        frontend_ != nullptr ? "the processor's thread" : "the recording thread", t.records, t.draws, t.dispatches,
+        fthread_mode_ ? "its own thread (SSPC_P53_FRONTEND_THREAD=1)"
+        : frontend_ != nullptr ? "the processor's thread" : "the recording thread",
+        t.records, t.draws, t.dispatches,
         t.journal_records, t.t2_records,
         t.records != 0 ? static_cast<double>(t.depth_sum) / static_cast<double>(t.records) : 0.0, t.depth_max,
         t.journal_words, ms(t.t1_drain_ticks), t.drains, t.drains_empty, ms(t.t1_full_ticks), t.t1_full_waits,
@@ -1033,11 +1282,17 @@ std::string ParallelCp::Report() const {
         t.direct_by[kQAcquired], t.queued_by[kQCopy], t.direct_by[kQCopy], t.copies_refused, t.copy_fallbacks,
         t.timeline_read_drains);
     if (frontend_ != nullptr) {
-        out += fmt::format("  frontend on the processor's thread: {:.0f} ms; its reads {} (a GPU write possibly pending: "
-                           "{} - drained; the executor waited for the GPU {}); GPU write ranges noted {} (at most {} at "
-                           "once, {} now), block hits {}, bitmap rebuilds {}\n",
-                           ms(t.front_ticks), t.front_reads, t.front_read_hits, t.front_syncs, t.gpu_writes, t.gw_max,
-                           gw_.size(), t.gw_block_hits, t.gw_rebuilds);
+        out += fmt::format("  frontend on {}: {:.0f} ms; its reads {} (a GPU write possibly pending: {} - {}; the "
+                           "executor waited for the GPU {}); GPU write ranges noted {} (at most {} at once, {} now), "
+                           "block hits {}, bitmap rebuilds {}\n",
+                           fthread_mode_ ? "its own thread" : "the processor's thread", ms(t.front_ticks), t.front_reads,
+                           t.front_read_hits, fthread_mode_ ? "waited for thread 2" : "drained", t.front_syncs,
+                           t.gpu_writes, t.gw_max, t.gw_now, t.gw_block_hits, t.gw_rebuilds);
+    }
+    if (fthread_mode_) {
+        out += fmt::format("  frontend thread (P5.3D): preparing {:.0f} ms, waiting for records {:.0f} ms, waiting for "
+                           "thread 2 {:.0f} ms ({} times)\n",
+                           ms(t.tf_busy_ticks), ms(t.tf_idle_ticks), ms(t.tf_wait_ticks), t.tf_waits);
     }
     if (verify_) {
         out += fmt::format("  register replica verification (SSPC_P410_VERIFY=1): draws/dispatches compared {}, "

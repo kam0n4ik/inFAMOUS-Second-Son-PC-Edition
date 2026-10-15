@@ -34,6 +34,30 @@ namespace SecondSon::Gpu::Gnm {
 /// The game's libSceGnmDriver imports (group "gnm", experimental), keyed exactly like the game imports them.
 std::span<const Runtime::Export> GnmExports();
 
+/// P5.4 early frame submission (SSPC_P54_EARLY_SUBMIT=1, an experiment, off by default;
+/// docs/native-reconstruction/P54_FRAME_LIFECYCLE.md): the arguments the engine's SubmitFrame will pass to
+/// sceGnmSubmitAndFlipCommandBuffers once the previous frame's end-of-pipe label is written, read when that SubmitFrame
+/// calls sceGnmSubmitDone with the list complete. The arrays are the caller's, valid during the call only.
+struct EarlyFrame {
+    u32 count = 0;
+    u32* const* dcbs = nullptr;
+    const u32* dcb_sizes = nullptr;
+    u32 vo_handle = 0;
+    u32 buffer_index = 0;
+    u32 flip_mode = 0;
+    s64 flip_arg = 0;
+};
+
+/// Called inside sceGnmSubmitDone (under the driver's submission mutex) with the address of its return address: true
+/// and `out` filled when the caller is that step of SubmitFrame with a frame to flip.
+using EarlyFrameSource = bool (*)(const u64* return_slot, EarlyFrame& out);
+
+/// Installs the source (nullptr: off) before the guest runs. With a source, sceGnmSubmitDone hands that frame on (flip
+/// request and DCBs, as sceGnmSubmitAndFlipCommandBuffers would) and the game's own call with the same arguments returns
+/// its result without submitting again; any other call is handled as before. The submission lock is not taken: the
+/// engine itself waits for the previous frame's label before it reuses that frame's buffers.
+void SetEarlyFrameSource(EarlyFrameSource source);
+
 namespace Test {
 /// The driver as at start-up: no submission lock, the initialisation sequence pending, no compute queue mapped, no
 /// event registration, SDK version 0. Self-tests only: no host installed and no guest thread inside the driver.

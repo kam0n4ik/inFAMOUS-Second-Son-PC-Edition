@@ -17,6 +17,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -640,6 +641,10 @@ void TestSrt(TestGroup& g) {
                 ours[20] == 5,
             fmt::format("{} reads; flat[16..20] {:#x} {:#x} {:#x} {:#x} {}", stats.reads, ours[16], ours[17], ours[18],
                         ours[19], ours[20]));
+    g.Check("the walk names the user data registers it read (s[4:5] the pointer, s6 through the flattened copy) and "
+            "leaves the registers' part of the flattened data alone (P5.3)",
+            ran && stats.user_data_read == 0x70 && !stats.user_data_written,
+            fmt::format("read {:#x}, written {}", stats.user_data_read, stats.user_data_written));
     // a pointer to unreadable memory: zeros (the bridge's patched load), counted, no fault
     std::array<u32, 16> bad = ud;
     bad[4] = 0x1000; // a low unmapped address in the interpreter's eyes
@@ -943,6 +948,139 @@ void TestCache(TestGroup& g) {
         g.Check("stage memo: off unless the owner asks for it (it must report memory changes)",
                 nfe.Stats().memo_hits == 0, "");
     }
+    // P5.3 Native Render Frontend: stages of an engine-described draw keyed by their inputs and the snapshot's bytes
+    for (const GS::NativeStages mode : {GS::NativeStages::On, GS::NativeStages::Verify}) {
+        const bool verify = mode == GS::NativeStages::Verify;
+        const std::string tag = verify ? "native frontend (verify)" : "native frontend";
+        DrawSetup sx;
+        GS::ShaderFrontend xfe({.async = false,
+                                .profile = &profile,
+                                .native_stages = mode,
+                                .native_passes = 1u << 1,
+                                .native_admit = 1}); // (cached at once; the admission is checked below)
+        // the engine's tables: the VS snapshot through s[2:3] (its start) and s[6:7] (4 dwords in), the PS through s[4:5]
+        sx.d.engine_pass = 1;
+        sx.d.engine_vs = {.dwords = 8, .refs = 2, .sgpr = {2, 6}, .offset = {0, 4}};
+        sx.d.engine_ps = {.dwords = 4, .refs = 1, .sgpr = {4}, .offset = {0}};
+        const std::array<u32, 8> vs_snap{1, 2, 3, 4, 5, 6, 7, 8};
+        const std::array<u32, 4> ps_snap{9, 10, 11, 12};
+        const auto place = [&](u64 vs_at, u64 ps_at) {
+            sx.mem.Put(vs_at, vs_snap);
+            sx.mem.Put(ps_at, ps_snap);
+            auto& vu = sx.d.user_data[static_cast<size_t>(Cp::Stage::Vs)];
+            auto& pu = sx.d.user_data[static_cast<size_t>(Cp::Stage::Ps)];
+            vu[2] = static_cast<u32>(vs_at);
+            vu[3] = static_cast<u32>(vs_at >> 32);
+            vu[6] = static_cast<u32>(vs_at + 16);
+            vu[7] = static_cast<u32>((vs_at + 16) >> 32);
+            vu[9] = 0x77; // a plain user data value (no preparation reads it: not keyed)
+            pu[4] = static_cast<u32>(ps_at);
+            pu[5] = static_cast<u32>(ps_at >> 32);
+        };
+        place(0x10010000, 0x10010100);
+        const auto& x1 = xfe.PrepareDraw(sx.d, sx.regs, sx.mem);
+        const u32 xpipe = x1.pipeline;
+        g.Check(tag + ": the first engine draw - both stages prepared in full and cached",
+                x1.ready && xfe.Stats().native_lookups == 2 && xfe.Stats().native_learned == 2 &&
+                    xfe.Stats().native_hits == 0,
+                fmt::format("lookups {}, learned {}, not cacheable {}", xfe.Stats().native_lookups,
+                            xfe.Stats().native_learned, xfe.Stats().native_uncacheable));
+        sx.d.changed = 0;
+        place(0x10020000, 0x10020200); // the same bytes in a new snapshot (the next frame's allocation)
+        const auto& x2 = xfe.PrepareDraw(sx.d, sx.regs, sx.mem);
+        const GS::StageView& xv = xfe.Stage(GS::HwStage::Vs);
+        if (!verify) {
+            g.Check(tag + ": the same bytes elsewhere - both stages from the cache, shared (not copied), the pipeline kept",
+                    x2.ready && x2.pipeline == xpipe && xfe.Stats().native_hits == 2 && xv.native_shared &&
+                        xfe.SharedStage(GS::HwStage::Vs) != nullptr && xfe.SharedStage(GS::HwStage::Ps) != nullptr &&
+                        xv.plan.flat.size() >= 16 && xv.plan.flat[2] == 0x10010000u,
+                    fmt::format("hits {}, shared {}", xfe.Stats().native_hits, xv.native_shared));
+        } else {
+            g.Check(tag + ": the same bytes elsewhere - prepared in full anyway and equal to the cached ones",
+                    x2.ready && x2.pipeline == xpipe && xfe.Stats().native_verified == 2 &&
+                        xfe.Stats().native_mismatches == 0 && xfe.SharedStage(GS::HwStage::Vs) == nullptr,
+                    fmt::format("verified {}, mismatches {}", xfe.Stats().native_verified,
+                                xfe.Stats().native_mismatches));
+        }
+        // a register neither preparation read (no SRT walk, no descriptor in the registers): not keyed - the executor
+        // writes the draw's own registers into the flattened data
+        const u64 taken = verify ? xfe.Stats().native_verified : xfe.Stats().native_hits;
+        sx.d.user_data[static_cast<size_t>(Cp::Stage::Vs)][9] = 0x78;
+        sx.d.changed = 0;
+        xfe.PrepareDraw(sx.d, sx.regs, sx.mem);
+        g.Check(tag + ": a register no preparation read differs - both stages still from the cache",
+                (verify ? xfe.Stats().native_verified : xfe.Stats().native_hits) == taken + 2 &&
+                    xfe.Stats().native_mismatches == 0,
+                fmt::format("taken {} -> {}", taken, verify ? xfe.Stats().native_verified : xfe.Stats().native_hits));
+        sx.d.user_data[static_cast<size_t>(Cp::Stage::Vs)][9] = 0x77;
+        const u64 learned = xfe.Stats().native_learned;
+        sx.mem.Put(0x10020000 + 12, std::array<u32, 1>{99}); // one dword of the VS snapshot differs
+        xfe.PrepareDraw(sx.d, sx.regs, sx.mem);
+        g.Check(tag + ": one snapshot dword differs - the VS prepared anew and cached, the PS from the cache",
+                xfe.Stats().native_learned == learned + 1 && xfe.SharedStage(GS::HwStage::Vs) != nullptr, "");
+        const u64 lookups = xfe.Stats().native_lookups;
+        auto& vu = sx.d.user_data[static_cast<size_t>(Cp::Stage::Vs)];
+        vu[6] += 4; // the second pointer no longer agrees with the first on the snapshot's start
+        xfe.PrepareDraw(sx.d, sx.regs, sx.mem);
+        g.Check(tag + ": the snapshot pointers disagree - not looked up (prepared as before), counted",
+                xfe.Stats().native_unkeyed == 1 && xfe.Stats().native_lookups == lookups + 1, "");
+        vu[6] -= 4;
+        sx.d.engine_pass = Cp::kNoEnginePass;
+        const u64 before = xfe.Stats().native_lookups;
+        const auto& x3 = xfe.PrepareDraw(sx.d, sx.regs, sx.mem);
+        g.Check(tag + ": a draw the engine did not describe - no lookup, its own preparation",
+                x3.ready && xfe.Stats().native_lookups == before && xfe.SharedStage(GS::HwStage::Vs) == nullptr, "");
+        sx.d.engine_pass = 2; // a pass the frontend does not take
+        xfe.PrepareDraw(sx.d, sx.regs, sx.mem);
+        g.Check(tag + ": a pass outside native_passes - no lookup", xfe.Stats().native_lookups == before, "");
+    }
+    // ... cached at the second sighting of its inputs (native_admit, the game's default); verify names why a lookup
+    // missed
+    {
+        DrawSetup sa;
+        GS::ShaderFrontend afe({.async = false,
+                                .profile = &profile,
+                                .native_stages = GS::NativeStages::Verify,
+                                .native_passes = 1u << 1});
+        sa.d.engine_pass = 1;
+        sa.d.engine_vs = {.dwords = 8, .refs = 2, .sgpr = {2, 6}, .offset = {0, 4}};
+        sa.d.engine_ps = {.dwords = 4, .refs = 1, .sgpr = {4}, .offset = {0}};
+        constexpr u64 vs_at = 0x10030000, ps_at = 0x10030100;
+        sa.mem.Put(vs_at, std::array<u32, 8>{1, 2, 3, 4, 5, 6, 7, 8});
+        sa.mem.Put(ps_at, std::array<u32, 4>{9, 10, 11, 12});
+        auto& vu = sa.d.user_data[static_cast<size_t>(Cp::Stage::Vs)];
+        auto& pu = sa.d.user_data[static_cast<size_t>(Cp::Stage::Ps)];
+        vu[2] = static_cast<u32>(vs_at);
+        vu[3] = static_cast<u32>(vs_at >> 32);
+        vu[6] = static_cast<u32>(vs_at + 16);
+        vu[7] = static_cast<u32>((vs_at + 16) >> 32);
+        vu[9] = 0x77;
+        pu[4] = static_cast<u32>(ps_at);
+        pu[5] = static_cast<u32>(ps_at >> 32);
+        const GS::FrontendStats& as = afe.Stats();
+        const auto& a1 = afe.PrepareDraw(sa.d, sa.regs, sa.mem);
+        g.Check("native frontend (admission): a first sighting - prepared in full, not cached; verify: inputs never seen",
+                a1.ready && as.native_first_seen == 2 && as.native_learned == 0 && as.native_miss_new == 2,
+                fmt::format("first sightings {}, learned {}, new {}", as.native_first_seen, as.native_learned,
+                            as.native_miss_new));
+        sa.d.changed = 0;
+        afe.PrepareDraw(sa.d, sa.regs, sa.mem);
+        g.Check("native frontend (admission): the second sighting - cached; verify: the same inputs and bytes",
+                as.native_learned == 2 && as.native_miss_same == 2 && afe.SharedStage(GS::HwStage::Vs) != nullptr,
+                fmt::format("learned {}, same {}", as.native_learned, as.native_miss_same));
+        sa.d.changed = 0;
+        afe.PrepareDraw(sa.d, sa.regs, sa.mem);
+        g.Check("native frontend (admission): the third - a hit (verify: compared, equal)",
+                as.native_verified == 2 && as.native_mismatches == 0, "");
+        sa.mem.Put(vs_at, std::array<u32, 1>{0x55}); // the first dword of the VS snapshot differs (a descriptor's base)
+        sa.d.changed = 0;
+        afe.PrepareDraw(sa.d, sa.regs, sa.mem);
+        g.Check("native frontend (verify): a miss by other bytes - one dword, the first of its group",
+                as.native_miss_bytes == 1 && as.native_miss_dwords[0] == 1 && as.native_miss_word0 == 1 &&
+                    as.native_first_seen == 3,
+                fmt::format("other bytes {}, 1 dword {}, word0 {}, first sightings {}", as.native_miss_bytes,
+                            as.native_miss_dwords[0], as.native_miss_word0, as.native_first_seen));
+    }
     // the asynchronous worker: queued translations finish; the draw becomes ready
     DrawSetup s2;
     GS::ShaderFrontend async_fe({.async = true, .profile = &profile});
@@ -1174,6 +1312,47 @@ void TestDisk(TestGroup& g, const App::Config& cfg) {
     g.Check("the test's files removed", !std::filesystem::exists(dir, ec), "");
 }
 
+// P4.15A R4: overlap writer startup with setters, then require a published callback
+// to execute. This stress test complements (does not replace) the mutex happens-before proof.
+void TestPeriodic(TestGroup& g, const App::Config& cfg) {
+    const auto dir = cfg.logs_dir / "selftest_shader_periodic";
+    bool ok = true;
+    u64 callbacks = 0;
+    for (u32 round = 0; round < 32; ++round) {
+        GS::ShaderDiskCache disk;
+        std::string error;
+        const GS::DiskCacheOptions opt{.dir = dir / std::to_string(round), .generation = "periodic-test"};
+        if (!disk.Open(opt, error)) {
+            ok = false;
+            break;
+        }
+        std::atomic<u32> calls{0};
+        const auto fn = +[](void* p) { static_cast<std::atomic<u32>*>(p)->fetch_add(1); };
+        std::thread a([&] {
+            for (u32 i = 0; i < 10000; ++i) {
+                disk.SetPeriodic(fn, &calls, 100 + i % 3);
+            }
+        });
+        std::thread b([&] {
+            for (u32 i = 0; i < 10000; ++i) {
+                disk.SetPeriodic(nullptr, nullptr, i % 2);
+            }
+        });
+        a.join();
+        b.join();
+        disk.SetPeriodic(fn, &calls, 100);
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (calls.load() == 0 && std::chrono::steady_clock::now() < end) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        disk.Close(); // joins the callback before calls goes out of scope
+        ok &= calls.load() != 0 && disk.Stats().write_errors == 0;
+        callbacks += calls.load();
+    }
+    g.Check("periodic writer startup/setter stress: 32 opens, 640000 updates, callbacks joined before context dies",
+            ok, fmt::format("callbacks {}", callbacks));
+}
+
 } // namespace
 
 std::vector<TestGroup> TestShaderFrontend(const App::Config& cfg) {
@@ -1198,6 +1377,7 @@ std::vector<TestGroup> TestShaderFrontend(const App::Config& cfg) {
     TestCache(out[7]);
     TestCapture(out[8], cfg);
     TestDisk(out[9], cfg);
+    TestPeriodic(out[9], cfg);
     return out;
 }
 

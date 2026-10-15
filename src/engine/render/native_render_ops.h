@@ -34,6 +34,10 @@ enum class OpKind : u16 {
 enum OpFlags : u16 {
     kVerify = 1,
     kApply = 2,
+    /// P5.3 (draw markers): the engine's description of the game's draw packet that follows - nothing verified or
+    /// replaced; the processor hands the stage tables on with the draw (DrawDescriptor::engine_*) for the Native
+    /// Render Frontend. kApply and kVerify markers describe their draws as well.
+    kDescribe = 4,
 };
 
 /// Registers sceGnmSetVsShader / sceGnmSetPsShader350 write from the shader object's register block (gnm_driver.cpp
@@ -165,6 +169,8 @@ struct DrawCounters {
     std::atomic<u64> applied_draws{0};     ///< kApply draws executed from their operation (no draw packet)
     std::atomic<u64> applied_registers{0}; ///< register writes of native commits (no SET_*_REG packet)
     std::atomic<u64> applied_commits{0};
+    std::atomic<u64> described{0};          ///< P5.3: kDescribe-only markers (the game's draw packet followed)
+    std::atomic<u64> described_orphaned{0}; ///< ... a description that met no draw before the next marker
     std::atomic<u64> state_applied{0};       ///< P5.3D: kApply state operations written (no PM4 of the game)
     std::atomic<u64> state_applied_writes{0};
     std::atomic<u64> state_verified{0};      ///< kVerify state operations compared with the PM4 path's state
@@ -191,5 +197,118 @@ inline bool NativeActive() {
     const NativeControl& c = Control();
     return c.ab_frames == 0 || ((c.flips.load(std::memory_order_relaxed) / c.ab_frames) & 1) != 0;
 }
+
+// --- P5.3 direct path (SSPC_P53_DIRECT=1): the operations without PM4 markers ----------------------------------------
+//
+// The markers above carry every operation inside the game's DCB as a NOP the processor decodes: one packet more per
+// described draw (kDrawMarkerDwords), one per commit, state change and native draw. The direct path keeps what the DCB
+// is for - the one ordered stream: where an operation sits in it is where it runs relative to the game's packets, the
+// barriers and labels among them and the other contexts' buffers (in the game's submission order) - but serializes no
+// operation into it:
+//   * a draw's description rides in the NOP the driver already writes after the game's draw packet (sceGnmDrawIndex /
+//     DrawIndexAuto: the draw, then a 4-dword NOP whose body the hardware ignores and whose first dword the driver
+//     zeroes): kDescribeMagic, the pass and the ids of the VS/PS table shapes (InternShape, once per distinct layout).
+//     No packet and no dword more; the processor reads it when it takes the draw packet;
+//   * the operations of a native pass (commit registers, render state, draws) are written ready to run into the native
+//     stream (blocks of SecondSonPC's memory, one run of operations after another per context); the DCB gets one
+//     4-dword token per run - operations with no game packet between them share one - and the processor runs the run
+//     where it meets the token. No GPU flush and no CPU wait: the token's place is the order.
+// Verification (kVerify, SSPC_P53_NATIVE_VERIFY=1) keeps its markers: they are a check, not the hot path.
+
+/// A stage table's shape as the engine's layout gives it (StageTable without the content hash): where the user-data
+/// pointers sit and how large the table is.
+struct TableShape {
+    u16 dwords = 0;
+    u8 refs = 0;
+    u8 sgpr[7] = {};
+    u16 offset[7] = {};
+};
+inline constexpr u32 kMaxShapes = 1u << 16;
+/// The id of `shape` (the same shape, the same id: 1..kMaxShapes - 1). False when the table is full (counted): the
+/// draw goes undescribed. A shape without a table (refs or dwords 0) is id 0 and needs no call.
+bool InternShape(const TableShape& shape, u32& id);
+/// The shape of `id`; nullptr for 0 and for an id never given.
+const TableShape* ShapeOf(u32 id);
+
+inline constexpr u32 kDescribeMagic = 0x44505353u; ///< "SSPD": the first body dword of the draw's trailing NOP
+inline constexpr u32 kDrawNopHeader = 0xC0021000u; ///< that NOP: type 3, 3 body dwords
+/// The NOP's body: {kDescribeMagic, (pass + 64) & 0xFF | VS shape id << 8, PS shape id}.
+inline constexpr u32 DescribeWord(s32 pass, u32 vs_shape) {
+    return (static_cast<u32>(pass + 64) & 0xFF) | (vs_shape << 8);
+}
+inline constexpr s32 DescribedPass(u32 word) {
+    return static_cast<s32>(word & 0xFF) - 64;
+}
+
+/// Set (before the guest runs) when the engine side runs the direct path: the processor looks for descriptions in
+/// draws' trailing NOPs only then.
+void SetDirect(bool on);
+bool DirectOn();
+
+// The native stream. A run in a block: {state: its operations' words | kRunTaken, the block's generation}, then the
+// operations, each {kind | payload words << 8, payload}. Registers / State: {reg, value} pairs (State with the kState*
+// pseudo registers); Draw: pass, bits (1: indexed), index count, index base lo, hi, VS shape id, PS shape id.
+enum class StreamOp : u8 { Registers = 1, State = 2, Draw = 3 };
+inline constexpr u32 OpHeader(StreamOp kind, u32 payload_words) {
+    return static_cast<u32>(kind) | (payload_words << 8);
+}
+inline constexpr u32 kStreamDrawWords = 7;
+inline constexpr u32 kStreamMagic = 0x53505353u;    ///< "SSPS"
+inline constexpr u32 kStreamTokenDwords = 4;        ///< {NOP header (3 body dwords), magic, block | run << 16, generation}
+inline constexpr u32 kStreamTokenHeader = 0xC0021000u;
+inline constexpr u32 kStreamBlockWords = 4096;      ///< 16 KiB: a run never crosses a block
+inline constexpr u32 kStreamBlocks = 2048;          ///< 32 MiB in all
+inline constexpr u32 kStreamMaxOpWords = 1 + 2 * kMaxStateWrites;
+
+/// The engine side's place in the stream, one per context (its writer is the thread that records the context).
+struct StreamCursor {
+    s32 block = -1;
+    u32 generation = 0;
+    u32 used = 0;      ///< words of the block written
+    u32 run_at = 0;    ///< the open run's first word
+    u32 run_words = 0; ///< its operations' words
+    u64 token_end = 0; ///< the DCB address right after the open run's token; 0: no run to append to
+    bool append = false; ///< (StreamReserve -> StreamCommit)
+};
+/// Room for one operation of at most `max_words` (header included). `cmd_ptr`: the DCB's write pointer now (room for
+/// a token there already made). Appends to the open run when the DCB has not moved since its token, else starts a
+/// run (in a new block when this one is full). Null: no block free - the caller runs the game's path, nothing written.
+u32* StreamReserve(StreamCursor& c, u64 cmd_ptr, u32 max_words);
+/// The operation (`words` written at StreamReserve's pointer) published. True: it joined the open run (the DCB gets
+/// nothing). False: it starts a run - `token` holds the kStreamTokenDwords the DCB must carry at cmd_ptr; tell the
+/// cursor where they end (StreamTokenWritten).
+bool StreamCommit(StreamCursor& c, u32 words, u32* token);
+inline void StreamTokenWritten(StreamCursor& c, u64 token_end) {
+    c.token_end = token_end;
+}
+
+/// Processor side: the run a token names, taken (no operation joins it afterwards). False: not a well-formed token, or
+/// a stale one (its block reused, the run taken before) - counted by the caller.
+struct StreamRun {
+    const u32* words = nullptr;
+    u32 count = 0;
+    u32 block = 0;
+};
+bool StreamTake(std::span<const u32> token, StreamRun& run);
+/// After the processor ran it: its block may be reused once every run in it is done and the engine left it.
+void StreamDone(const StreamRun& run);
+
+struct DirectCounters {
+    std::atomic<u64> described{0};       ///< processor: draws whose trailing NOP carried a description
+    std::atomic<u64> described_bad{0};   ///< ... with a shape id never given
+    std::atomic<u64> runs{0};            ///< processor: run tokens met
+    std::atomic<u64> runs_stale{0};      ///< ... naming no run (a reused block, a run taken twice) or malformed
+    std::atomic<u64> ops{0};             ///< operations run
+    std::atomic<u64> draws{0};
+    std::atomic<u64> register_writes{0};
+    std::atomic<u64> state_writes{0};
+    std::atomic<u64> native_tsc{0};      ///< processor time in native operations (TSC, every 8th call timed, x8; the
+                                         ///< executor's part of their draws not in it) - markers and the direct path
+    std::atomic<u64> native_calls{0};
+    std::atomic<u64> shapes_full{0};     ///< engine: InternShape refused (the table full)
+    std::atomic<u64> stream_full{0};     ///< engine: no block free - the game's path ran
+    std::atomic<u64> blocks_in_use{0};
+};
+DirectCounters& Direct();
 
 } // namespace SecondSon::Engine::Render

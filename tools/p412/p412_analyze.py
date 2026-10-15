@@ -36,7 +36,13 @@ ROLES = ["CP", "Record", "Present", "Game", "Other"]
 EVENTS = ["PreRound", "Poll", "IdleEmpty", "IdleGpu", "IdleLabel", "IdleFlag", "Drain", "QueueFull", "JournalFull",
           "FlipMarker", "GpuCompleted", "RecordWait", "Record", "GpuSync", "RingWait", "BindWait", "QueueLock", "Submit",
           "PipelineCreate", "ShaderTranslate", "FlipAcquire", "CopyFallback", "VblankWait", "NotReady", "Present",
-          "PresentFence", "PresentAcquire", "PresentSubmit", "GameSubmitLock", "GameIdleWait", "GameSubmitFlip"]
+          "PresentFence", "PresentAcquire", "PresentSubmit", "GameSubmitLock", "GameIdleWait", "GameSubmitFlip",
+          # P5.4 frame lifecycle (SSPC_P54_FRAME_TRACE=1)
+          "GameSubmitFrame", "GameComputeWait", "GameSubmitDone", "GameDingDong", "FenceHeld", "FenceWrite",
+          # P5.4 early frame submission (SSPC_P54_EARLY_SUBMIT=1)
+          "GameEarlySubmit",
+          # P5.4 async compute analysis: thread 1's slice of one queue in a round
+          "CpQueueSlice"]
 EV = {n: i for i, n in enumerate(EVENTS)}
 DRAIN_REASONS = ["round end", "cache action", "fence", "dma report", "flip", "timeline write", "timeline copy",
                  "timeline gds", "memory wait", "wait met", "synchronize", "memory read", "memory write",

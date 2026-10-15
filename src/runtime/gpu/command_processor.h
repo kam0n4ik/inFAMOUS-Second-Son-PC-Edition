@@ -70,6 +70,18 @@ struct ShaderRef {
 enum class DrawKind : u8 { Index2, IndexOffset2, IndexAuto, IndexIndirect, Indirect };
 std::string_view DrawKindName(DrawKind kind);
 
+/// P5.3 Native Render Frontend: a stage's resource table as the engine describes it (its draw operation's
+/// StageTable, engine/render/native_render_ops.h) - the user-data SGPR pairs that point into the snapshot of the
+/// constant update engine's stage shadow, the dwords past its start each points at, and the snapshot's extent. Only
+/// where the pointers sit and how large the table is: its content is read from guest memory by the frontend itself.
+struct EngineTable {
+    u32 dwords = 0; ///< 0: no table (the stage reads nothing through one)
+    u8 refs = 0;
+    std::array<u8, 7> sgpr{};
+    std::array<u16, 7> offset{};
+};
+inline constexpr s32 kNoEnginePass = -100;
+
 /// A draw as the GPU will execute it: the draw packet's parameters and the state it sees. Built from the register file;
 /// the parts that cost more than a copy (the pipeline key) are rebuilt only when their groups changed.
 struct DrawDescriptor {
@@ -104,6 +116,11 @@ struct DrawDescriptor {
     GroupMask changed = 0;    ///< groups changed since the previous draw
     std::array<u32, 8> cb_extent{}; ///< the driver's size hints after a colour target's setup (0: none)
     u32 db_extent = 0;
+    /// P5.3: the engine described this draw (a draw marker of SecondSonPC before it, or the marker that replaced its
+    /// packet): its render pass (0..40, -2 pre, -3 post, -4 deformation) and its VS/PS resource tables.
+    /// kNoEnginePass: a draw of the game's PM4 alone.
+    s32 engine_pass = kNoEnginePass;
+    EngineTable engine_vs, engine_ps;
 };
 
 struct DispatchDescriptor {
@@ -454,7 +471,9 @@ private:
     StepStatus Fail(Queue& q, CpErrorKind kind, u64 addr, u8 opcode, u32 dwords, std::string detail);
     StepStatus Execute(Queue& q, Frame& f, u64 addr, std::span<const u32> p);
     StepStatus SetRegs(Queue& q, Frame& f, u64 addr, std::span<const u32> p, Space space);
-    StepStatus Draw(Queue& q, u64 addr, std::span<const u32> p, DrawKind kind);
+    /// `packet`: p is the queue's draw packet itself (its trailing NOP may carry the engine's description, P5.3 direct
+    /// path); false for a draw built from a native operation.
+    StepStatus Draw(Queue& q, u64 addr, std::span<const u32> p, DrawKind kind, bool packet = true);
     StepStatus Dispatch(Queue& q, u64 addr, std::span<const u32> p, bool indirect);
     StepStatus DmaData(Queue& q, u64 addr, std::span<const u32> p);
     StepStatus Fence(Queue& q, FenceOp& op);
@@ -465,7 +484,18 @@ private:
     void BuildDraw(DrawDescriptor& d);
     /// P5.3B: a SecondSonPC operation in the stream (engine/render/native_render_ops.h) / the draw it describes.
     StepStatus NativeMarker(Queue& q, u64 addr, std::span<const u32> p);
+    /// P5.3 direct path: a run token of the native stream - its operations run here, in their order.
+    StepStatus NativeRun(Queue& q, u64 addr, std::span<const u32> p);
+    /// ... a description from a draw's trailing NOP ({DescribeWord, PS shape id}) for the draw being built.
+    void DescribedDraw(Queue& q, u32 word, u32 ps_shape);
+    void ApplyNativeRegisters(const u32* pairs, u32 count);
+    bool ApplyNativeState(const u32* pairs, u32 count);
+    StepStatus NativeDrawOp(Queue& q, u64 addr, s32 pass, bool indexed, u32 count, u64 base, u32 vs_shape, u32 ps_shape);
     void VerifyNativeDraw(const DrawDescriptor& d);
+    /// The processor's time in native operations, every 8th call timed (DirectCounters::native_tsc); the executor's
+    /// part of their draws paused out (Draw).
+    void NativeTimeBegin();
+    void NativeTimeEnd();
     u32 PatchCommands(Queue& q, u64 dst, const u8* bytes_known, u32 bytes, u64 src_addr);
     /// [dst, dst + bytes) holds packets of this queue not processed yet.
     bool OverlapsPendingCommands(const Queue& q, u64 dst, u32 bytes) const;
@@ -488,7 +518,18 @@ private:
     std::array<u16, static_cast<size_t>(Stage::Count)> inline_sharps_{};
     std::unique_ptr<Engine::Render::DrawOp> native_expect_; ///< kVerify marker waiting for its draw (P5.3B)
     u32 native_expect_queue_ = 0;
+    /// P5.3: the engine's description of the next draw of a queue (any draw marker), handed on with it
+    struct EngineNext {
+        bool valid = false;
+        u32 queue = 0;
+        s32 pass = kNoEnginePass;
+        EngineTable vs, ps;
+    };
+    EngineNext engine_next_;
     u32 native_logged_ = 0;
+    u32 native_calls_ = 0;
+    u64 native_t0_ = 0;  ///< a timed native operation in progress: its start (or resume) TSC
+    u64 native_acc_ = 0; ///< ... its time so far
     /// P5.3D A/B image comparison: SSPC_P53_CAPTURE_PASSES=<pass>[,...] with SSPC_P53_CAPTURE_FLIPS=<first>+<n> (the
     /// processor's flip count): the targets those passes' draws wrote, captured where the next pass's draws begin.
     struct PassCapture {

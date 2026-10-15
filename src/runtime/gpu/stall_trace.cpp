@@ -174,7 +174,9 @@ ThreadLog* MakeLog(Role role) {
 
 ThreadLog* Log(Ev e) {
     if (t_log == nullptr) {
-        const bool game = e == Ev::GameSubmitLock || e == Ev::GameIdleWait || e == Ev::GameSubmitFlip;
+        const bool game = e == Ev::GameSubmitLock || e == Ev::GameIdleWait || e == Ev::GameSubmitFlip ||
+                          e == Ev::GameSubmitFrame || e == Ev::GameComputeWait || e == Ev::GameSubmitDone ||
+                          e == Ev::GameDingDong || e == Ev::GameEarlySubmit;
         t_log = MakeLog(game ? Role::Game : Role::Other);
     }
     return t_log;
@@ -438,6 +440,8 @@ const char* EvName(Ev e) {
         "FlipMarker", "GpuCompleted", "RecordWait", "Record", "GpuSync", "RingWait", "BindWait", "QueueLock", "Submit",
         "PipelineCreate", "ShaderTranslate", "FlipAcquire", "CopyFallback", "VblankWait", "NotReady", "Present",
         "PresentFence", "PresentAcquire", "PresentSubmit", "GameSubmitLock", "GameIdleWait", "GameSubmitFlip",
+        "GameSubmitFrame", "GameComputeWait", "GameSubmitDone", "GameDingDong", "FenceHeld", "FenceWrite",
+        "GameEarlySubmit", "CpQueueSlice",
     };
     static_assert(std::size(kNames) == kEvents);
     const size_t i = static_cast<size_t>(e);

@@ -93,6 +93,9 @@ public:
     void StopPrecompile();
     /// Pipelines created on demand so far (any thread: the periodic save of the pipeline cache looks at it).
     u64 CreatedOnDemand() const { return created_.load(std::memory_order_relaxed); }
+    /// The descriptions of every pipeline this run used (created, precompiled and taken, made again). After the
+    /// recording thread stopped.
+    std::vector<u64> UsedDescriptions() const;
 
     /// What a draw's / dispatch's pipeline is, without handles or ids.
     static GS::PipelineDesc DescribeGraphics(const GS::GraphicsPipelineState& state, const GS::Module* vs,

@@ -17,6 +17,12 @@ struct PcSettings {
     bool fsr = false;       // upscales the game's 1920x1080 frame to a larger window
     bool sharpening = true; // RCAS after FSR
     u32 sharpness = 88;     // 0..100 %; RCAS attenuation = 2 * (1 - sharpness / 100) (88 % = the bridge's 0.25)
+    // [Graphics] smoke: particles spawned by the game's smoke emitters (src/engine/particles/smoke_quality.h); both
+    // backends. "high" (the game's own) | "medium" 65 % | "low" 35 % | "verylow" 20 %
+    std::string smoke_quality = "high";
+    // [Graphics] the engine's own reduced-resolution path for its translucent particles (fire, smoke, dust): "auto"
+    // (the game's own adaptation) | "full" | "half" | "quarter"
+    std::string particle_resolution = "auto";
 
     // [Gamepad]: a real controller (DualShock 4 and others through SDL)
     u32 vibration = 100;             // % of the motor strength the game asks for; 0 = off

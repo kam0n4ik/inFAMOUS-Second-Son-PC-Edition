@@ -27,4 +27,18 @@ namespace SecondSon::Engine::Render::Trace {
 /// not be installed; nothing is changed then.
 bool InstallFromEnvironment(u64 eboot_base);
 
+/// P5.4 frame lifecycle (SSPC_P54_FRAME_TRACE=1; docs/native-reconstruction/P54_FRAME_LIFECYCLE.md): SubmitFrame's
+/// span and the engine's async compute waits (0x1695e0, replaced by the same loop) go to the stall trace
+/// (SSPC_P412_STALL_TRACE, runtime/gpu/stall_trace.h) as GameSubmitFrame / GameComputeWait. After
+/// InstallFromEnvironment (it shares the SubmitFrame probe); the same window before the guest runs.
+bool InstallLifecycleFromEnvironment(u64 eboot_base);
+
+/// P5.4 early frame submission (SSPC_P54_EARLY_SUBMIT=1, an experiment, off by default; the same document): SubmitFrame
+/// calls sceGnmSubmitDone (its step 4, mode 0) with its list of DCBs complete, then waits for the previous frame's label
+/// (step 5) before it passes that list to sceGnmSubmitAndFlipCommandBuffers (step 6). With the switch the driver
+/// (Gpu::Gnm::SetEarlyFrameSource) reads the list from SubmitFrame's stack frame at step 4 and hands the frame on there:
+/// the command processor records frame k while the GPU finishes frame k-1. The game's code is unchanged and still waits
+/// at step 5 before it returns and reuses frame k-1's buffers. The same window before the guest runs.
+bool InstallEarlySubmitFromEnvironment(u64 eboot_base);
+
 } // namespace SecondSon::Engine::Render::Trace

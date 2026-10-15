@@ -28,6 +28,7 @@ New-Item -ItemType Directory -Force $cap | Out-Null
 $scanout = "26c568000" # the flip's image (RENDER_ENGINE_PASSES.md: the post context's target)
 $press = "space@12,space@22,move:-3000:0@56:0.25,move:-3000:0@58:0.25,move:-3000:0@60:0.25,return@70"
 $envs = @(
+    "SSPC_P410_PARALLEL_CP=0", # (pass captures: the single-thread processor only)
     "SSPC_P53_NATIVE_DRAW=apply:$Passes",
     "SSPC_P53_NATIVE_STATE=apply",
     "SSPC_P53_NATIVE_AB=$Block",

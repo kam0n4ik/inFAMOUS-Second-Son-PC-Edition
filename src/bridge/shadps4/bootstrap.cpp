@@ -58,6 +58,7 @@
 #include "bridge/shadps4/track_diag.h"
 #include "engine/guest_hooks.h"
 #include "engine/job_system.h"
+#include "engine/particles/smoke_quality.h"
 #include "engine/render/frame_trace.h"
 #include "engine/render/native_draw.h"
 #include "loader/bindings.h"
@@ -712,6 +713,10 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     InstallHostShaders(); // P4.4: SecondSonPC's backend's tiling kernels (data only)
     const bool native_gpu = cfg.gpu_backend == App::Config::GpuBackend::Sspc;
     if (!cfg.selftest) {
+        // P5.3: the render mode's switches before the GPU backend reads them (legacy: none)
+        Engine::Render::NativeDraw::ApplyRenderMode(cfg.render_mode, native_gpu);
+    }
+    if (!cfg.selftest) {
         // one owner of the guest GPU, chosen once: the bridge's renderer, or SecondSonPC's backend (it claims every
         // resource itself when it starts, below); never both, never a switch while the game runs
         std::string gpu_error;
@@ -806,7 +811,18 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     Engine::SetGuestImage(linker.GetModule(eboot_index)->Base(), linker.GetModule(eboot_index)->aligned_base_size);
     Engine::Jobs::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
     Engine::Render::Trace::InstallFromEnvironment(linker.GetModule(eboot_index)->Base());
+    Engine::Render::Trace::InstallLifecycleFromEnvironment(linker.GetModule(eboot_index)->Base());
+    if (native_gpu) { // (SecondSonPC's Gnm driver hands the frame on: the bridge's has no such source)
+        Engine::Render::Trace::InstallEarlySubmitFromEnvironment(linker.GetModule(eboot_index)->Base());
+    } else if (char es[4] = {}; GetEnvironmentVariableA("SSPC_P54_EARLY_SUBMIT", es, sizeof(es)) == 1 && es[0] == '1') {
+        SSPC_LOG(Loader, Warning, "SSPC_P54_EARLY_SUBMIT=1 ignored: only SecondSonPC's GPU backend (--gpu-backend "
+                 "sspc) hands frames on early");
+    }
     Engine::Render::NativeDraw::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), native_gpu);
+    // Smoke Quality and Particle Resolution (both backends): the game's own unless [Graphics] smokeQuality /
+    // particleResolution (SSPC_SMOKE_QUALITY / SSPC_PARTICLE_RES).
+    Engine::Particles::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.smoke_quality,
+                               cfg.pc.particle_resolution);
     SSPC_LOG(Loader, Info, "loaded {} (SecondSonPC Loader), starting guest", guest_eboot_path);
     linker.Execute({guest_eboot_path}, [] { Runtime::Sysmodule::PreloadForLibkernel(); }, {});
 }
