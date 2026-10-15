@@ -14,6 +14,19 @@ option(SSPC_SHADPS4_BRIDGE "Temporary bootstrap on the shadPS4 core" ON)
 if(NOT SSPC_SHADPS4_BRIDGE)
     message(FATAL_ERROR "A build without the shadPS4 bridge is the Phase 6 goal and not available yet")
 endif()
+# Port of uncharted_pc gpu/CMakeLists.txt (BB_LTO, on there): link-time optimization of the whole executable - the
+# bridge's core and its static libraries as well as SecondSonPC's own code. Off by default until measured.
+option(SSPC_LTO "Link-time optimization (ThinLTO) of the executable and its static libraries" OFF)
+if(SSPC_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT _sspc_ipo_ok OUTPUT _sspc_ipo_error LANGUAGES C CXX)
+    if(_sspc_ipo_ok)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+        message(STATUS "SecondSonPC: link-time optimization on")
+    else()
+        message(WARNING "SecondSonPC: link-time optimization unavailable: ${_sspc_ipo_error}")
+    endif()
+endif()
 include(cmake/shadps4_bootstrap.cmake) # provides fmt::fmt, toml11::toml11 and the bridge target
 
 # Own code. Rule: nothing outside src/bridge/ may include shadPS4 headers.
@@ -81,6 +94,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/shader/shader_translator.cpp
     src/runtime/gpu/vulkan/vk_buffer_cache.cpp
     src/runtime/gpu/vulkan/vk_device_context.cpp
+    src/runtime/gpu/vulkan/vk_deferred_record.cpp
     src/runtime/gpu/vulkan/vk_diagnostics.cpp
     src/runtime/gpu/vulkan/vk_executor.cpp
     src/runtime/gpu/vulkan/vk_formats.cpp

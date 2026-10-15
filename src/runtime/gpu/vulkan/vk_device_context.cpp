@@ -2,6 +2,7 @@
 #include <windows.h>
 
 #include "runtime/gpu/vulkan/vk_device_context.h"
+#include "runtime/gpu/vulkan/vk_deferred_record.h"
 
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
 
@@ -83,6 +84,10 @@ constexpr const char* kWantedExtensions[] = {
 } // namespace
 
 Api& Fn() {
+    // (SSPC_PORT_VK_RECORDER: the threads recording the executor's command buffers defer their commands)
+    if (Api* t = Deferred::ThreadTable()) {
+        return *t;
+    }
     return g_api;
 }
 
@@ -613,6 +618,7 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
              ctx->name_, ctx->driver_version_, ctx->family_, caps.external_memory_host,
              caps.min_imported_host_alignment, caps.vertex_input_dynamic, caps.color_write_mask_dynamic,
              caps.max_push_descriptors, caps.validation ? "on" : "off", list);
+    Deferred::Configure(); // (SSPC_PORT_VK_RECORDER=1: the recorder thread, now that the table is filled)
     return ctx;
 }
 

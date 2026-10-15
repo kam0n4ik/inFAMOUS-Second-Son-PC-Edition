@@ -36,6 +36,7 @@
 #include "runtime/gpu/shader/shader_disk_cache.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_translator.h"
+#include "runtime/gpu/vulkan/vk_deferred_record.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
@@ -890,6 +891,7 @@ bool Backend::CpuCopy(u64 src, u64 dst, u64 bytes) {
 void Backend::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuNative");
     StallTrace::RegisterThread(StallTrace::Role::Cp);
+    const Vk::Deferred::ThreadScope deferred; // (SSPC_PORT_VK_RECORDER: this thread records the executor's commands)
     std::deque<Submission> local;
     auto rate_t0 = std::chrono::steady_clock::now();
     u64 rate_flips = 0, rate_draws = 0, rate_record = 0, rate_wait = 0, rate_tw = 0, rate_gpu = 0, rate_submit = 0;
@@ -1344,6 +1346,7 @@ void Backend::Stop() {
     if (parallel_) {
         parallel_->Stop(); // (its queue was drained by the loop's last round)
     }
+    Vk::Deferred::Shutdown(); // (SSPC_PORT_VK_RECORDER: both recording threads have ended)
     if (pipelines_) {
         pipelines_->StopPrecompile(); // (P4.14: its workers; the pipelines they built stay until the factory goes)
     }

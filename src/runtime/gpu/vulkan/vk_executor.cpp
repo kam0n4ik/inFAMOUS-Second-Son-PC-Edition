@@ -5,6 +5,7 @@
 // SecondSonPC — the backend's executor (P4.4). See vk_executor.h. The per-draw state (viewports, scissors, depth,
 // stencil, bias, binding conventions) follows shadPS4's renderer_vulkan/vk_rasterizer.cpp (GPL-2.0-or-later): the
 // translated SPIR-V is the bridge's, so its bindings and push constants are filled the same way.
+#include "runtime/gpu/vulkan/vk_deferred_record.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
 
 #include <algorithm>
@@ -1469,9 +1470,20 @@ bool Executor::GuestRangeImpl(u64 addr, u64 size, bool write, u64 align, VkBuffe
             const bool allocated = ring_.Allocate(size, std::max<u64>(align, 4), cur_.value, sl) == StreamRing::Status::Ok;
             stats_.t_alloc += GS::FineTicks() - tt;
             tt = GS::FineTicks();
+            // (SSPC_PORT_VK_RECORDER: the copy of a backing view runs on the recorder thread in order with the commands,
+            // before the submission - uncharted_pc PoolSmallCopies; not when a diagnostic reads the slice back here)
+            static const bool stream_diag = [] { // (the diagnostics below that read the copied slice)
+                char v[32] = {};
+                return GetEnvironmentVariableA("SSPC_DIAG_WATCH_DUMP", v, sizeof(v)) > 0 ||
+                       GetEnvironmentVariableA("SSPC_DIAG_STREAM_STATS", v, sizeof(v)) > 0;
+            }();
+            const bool defer_copy = Deferred::Enabled() && !stream_verify_ && !race_.on && !stream_diag &&
+                                    g_watch_page.load(std::memory_order_relaxed) == 0;
             const bool copied =
-                allocated &&
-                (host != nullptr ? (std::memcpy(sl.data, host, size), true) : GS::GameMemory().Read(addr, sl.data, size));
+                allocated && (host != nullptr ? ((defer_copy ? Deferred::HostCopy(sl.data, host, size)
+                                                             : static_cast<void>(std::memcpy(sl.data, host, size))),
+                                                 true)
+                                              : GS::GameMemory().Read(addr, sl.data, size));
             stats_.t_copy += GS::FineTicks() - tt;
             if (copied) {
                 buffer = sl.buffer;
