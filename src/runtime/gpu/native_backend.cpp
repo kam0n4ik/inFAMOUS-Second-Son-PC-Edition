@@ -957,10 +957,22 @@ void Backend::Loop() {
             if (q != Cp::kGraphicsQueue && !mapped_[q]) {
                 continue;
             }
+            // SSPC_PORT_ROUND_PACKETS=<n>: the packets a queue runs per round (4096; P4.12: every round ends with a
+            // drain of the parallel processor's queue - uncharted_pc's processor has no rounds, its queues yield)
+            static const u32 round_limit = [] {
+                char v[16] = {};
+                const u32 n = GetEnvironmentVariableA("SSPC_PORT_ROUND_PACKETS", v, sizeof(v)) > 0
+                                  ? static_cast<u32>(std::strtoul(v, nullptr, 10))
+                                  : 4096u;
+                if (n != 4096) {
+                    SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_PORT_ROUND_PACKETS={} - packets per queue and round", n);
+                }
+                return std::max(n, 64u);
+            }();
             u32 i = 0;
             const u64 slice_t0 = StallTrace::On() ? StallTrace::Now() : 0; // (P5.4: the queue's slice of the round)
             u16 slice_stop = 0;
-            for (; i < 4096; ++i) {
+            for (; i < round_limit; ++i) {
                 const Cp::StepStatus st = cp_->Step(q);
                 if (st == Cp::StepStatus::Packet) {
                     progress = true;
@@ -983,11 +995,11 @@ void Backend::Loop() {
             }
             if (slice_t0 != 0 && (i != 0 || slice_stop == 1)) {
                 StallTrace::Span(StallTrace::Ev::CpQueueSlice, slice_t0, StallTrace::Now(), q, i,
-                                 i == 4096 ? u16{2} : slice_stop);
+                                 i == round_limit ? u16{2} : slice_stop);
             }
             round_packets += i; // (P4.12: the round's packets; a queue that stopped at the limit)
-            round_capped += i == 4096 ? 1 : 0;
-            graphics_capped |= i == 4096 && q == Cp::kGraphicsQueue;
+            round_capped += i == round_limit ? 1 : 0;
+            graphics_capped |= i == round_limit && q == Cp::kGraphicsQueue;
             pending |= cp_->PendingSubmissions(q) != 0;
         }
         if (parallel_) {

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -134,6 +135,12 @@ struct State {
 };
 State g;
 thread_local Api* t_table = nullptr;
+u32 g_spin_us = 20;
+
+/// A counter only the producer writes (no lock-prefixed read-modify-write per command; read for the report).
+inline void Add(std::atomic<u64>& a, u64 v) {
+    a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed);
+}
 
 std::unique_ptr<Chunk> AcquireChunk() {
     std::scoped_lock lk{g.m};
@@ -166,7 +173,7 @@ void Kick(bool force) {
         g.queued.store(g.queue.size(), std::memory_order_release);
     }
     g.full.clear();
-    g.kicks.fetch_add(1, std::memory_order_relaxed);
+    Add(g.kicks, 1);
     if (wake) { // (a busy recorder takes new chunks by itself: a wake-up is a system call)
         g.cv.notify_one();
     }
@@ -196,8 +203,9 @@ void RecorderLoop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:VkRecorder");
     while (true) {
         // a short spin before sleeping: the next chunk usually follows within microseconds, and a sleeping recorder
-        // costs the producer a wake-up per kick (uncharted_pc: 200 us with >= 12 hardware threads, else 20 us)
-        const auto spin = std::chrono::microseconds(std::thread::hardware_concurrency() >= 12 ? 200 : 20);
+        // costs the producer a wake-up per kick (uncharted_pc: 200 us with >= 12 hardware threads, else 20 us; here
+        // 20 us by default - with 6 cores / 12 threads the spin took the processor thread's SMT sibling, measured)
+        const auto spin = std::chrono::microseconds(g_spin_us);
         const auto until = Clock::now() + spin;
         for (u32 spins = 1; g.queued.load(std::memory_order_acquire) == 0; ++spins) {
             _mm_pause();
@@ -237,7 +245,7 @@ void RecorderLoop() {
 
 template <typename Func>
 void Push(Func&& func) {
-    g.commands.fetch_add(1, std::memory_order_relaxed);
+    Add(g.commands, 1);
     if (!g.cur->Push(func)) {
         g.full.push_back(std::move(g.cur));
         g.cur = AcquireChunk();
@@ -267,7 +275,7 @@ T* Copy(const T* src, u32 count) {
     }
     auto* dst = static_cast<T*>(g.cur->Allocate(sizeof(T) * count, alignof(T)));
     std::memcpy(dst, src, sizeof(T) * count);
-    g.data_bytes.fetch_add(sizeof(T) * count, std::memory_order_relaxed);
+    Add(g.data_bytes, sizeof(T) * count);
     return dst;
 }
 
@@ -574,6 +582,9 @@ void Configure() {
         return;
     }
     g.real = &Fn(); // (the calling thread is not attached: the process's table)
+    if (char s[16] = {}; GetEnvironmentVariableA("SSPC_PORT_VK_RECORDER_SPIN_US", s, sizeof(s)) > 0) {
+        g_spin_us = static_cast<u32>(std::strtoul(s, nullptr, 10));
+    }
     Api& t = g.table;
     t = *g.real;
     // functions that wait until every deferred command is recorded
@@ -707,8 +718,8 @@ void HostCopy(void* dst, const void* src, size_t bytes) {
         std::memcpy(dst, src, bytes);
         return;
     }
-    g.host_copies.fetch_add(1, std::memory_order_relaxed);
-    g.host_copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    Add(g.host_copies, 1);
+    Add(g.host_copy_bytes, bytes);
     Push([dst, src, bytes] { std::memcpy(dst, src, bytes); });
 }
 

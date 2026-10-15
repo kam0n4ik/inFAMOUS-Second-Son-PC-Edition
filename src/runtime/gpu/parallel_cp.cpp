@@ -109,7 +109,9 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
         rec_value_ = std::make_unique<std::atomic<u64>[]>(kRecRing);
     }
     fthread_mode_ = options.frontend_thread && frontend_ != nullptr;
-    async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr && !fthread_mode_;
+    // (port of uncharted_pc PendingFenceWaits: also with the frontend thread - the acquire hook's frontend
+    // invalidations reach it as front events, in stream order; GuestSync's memo change with the next record)
+    async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr;
 }
 
 ParallelCp::~ParallelCp() {
