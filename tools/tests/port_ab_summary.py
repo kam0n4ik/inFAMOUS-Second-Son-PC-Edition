@@ -38,6 +38,7 @@ FIELDS = [
     ("mean_draws", "draws / frame"),
     ("mean_dispatches", "dispatches / frame"),
     ("mean_par_drains", "recording queue drains / frame"),
+    ("gpu_load_pct", "GPU load (busy / frame), %"),
     ("cpu_pct", "process CPU, % of one core"),
     ("ws_max_mib", "RAM working set max, MiB"),
     ("vram_mib", "VRAM (last sample), MiB"),
@@ -108,6 +109,8 @@ def main(series):
             total = sum(bins.values()) or 0
             if total:
                 s["v1_pct"] = 100.0 * bins.get("<=1v", 0) / total
+            if s.get("mean_gpu_busy_ms") and s.get("ft_mean_ms"):
+                s["gpu_load_pct"] = 100.0 * s["mean_gpu_busy_ms"] / s["ft_mean_ms"]
             t0, t1 = WINDOWS.get(scene, (62, 88))
             s["cpu_pct"], s["ws_max_mib"] = cpu_mem(os.path.join(run, "cpu_mem.csv"), t0, t1)
             s["vram_mib"] = vram(os.path.join(run, "SecondSonPC.log"))
@@ -125,7 +128,9 @@ def main(series):
     order = [c for c in declared if c in order] + [c for c in order if c not in declared]
     base = order[0] if order else None
     out = {"series": series, "base": base, "scenes": {}}
-    lines = [f"# Port A/B: {series}", "", f"baseline: `{base}`; values: mean ± sd [min..max] (n); Δ vs baseline, Welch t", ""]
+    lines = [f"# Port A/B: {series}", "",
+             f"baseline: `{base}`; values: median [min..max] (n), mean ± sd; Δ: the medians' difference vs the baseline "
+             f"(%), Welch t of the means (|t| < 2: not a measured change)", ""]
     for scene in sorted(data):
         w = WINDOWS.get(scene, (62, 88))
         lines += [f"## {scene} (window {w[0]}..{w[1]} s)", ""]
@@ -141,14 +146,16 @@ def main(series):
                     cells.append("—")
                     continue
                 mu = statistics.mean(v)
+                med = statistics.median(v)
                 sd = statistics.stdev(v) if len(v) > 1 else 0.0
-                cell = f"{mu:.2f} ± {sd:.2f} [{min(v):.2f}..{max(v):.2f}] ({len(v)})"
-                entry = {"mean": mu, "sd": sd, "n": len(v), "values": v}
+                cell = f"{med:.2f} [{min(v):.2f}..{max(v):.2f}] ({len(v)}), {mu:.2f} ± {sd:.2f}"
+                entry = {"median": med, "mean": mu, "sd": sd, "n": len(v), "values": v}
                 if c != base and data[scene][base].get(k):
                     b = data[scene][base][k]
-                    d = mu - statistics.mean(b)
+                    bmed = statistics.median(b)
+                    d = med - bmed
                     t = welch(b, v)
-                    pct = 100.0 * d / statistics.mean(b) if statistics.mean(b) else float("nan")
+                    pct = 100.0 * d / bmed if bmed else float("nan")
                     cell += f"<br>Δ {d:+.2f} ({pct:+.1f} %)" + (f", t {t:+.1f}" if t is not None else "")
                     entry.update({"delta": d, "delta_pct": pct, "t": t})
                 out["scenes"][scene].setdefault(c, {})[k] = entry

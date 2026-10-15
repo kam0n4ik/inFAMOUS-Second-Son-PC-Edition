@@ -14,7 +14,8 @@ param(
     [string]$Scenes = "user1022,beach",
     [int]$Repeats = 5,
     [int]$Seconds = 90,
-    [string]$ExtraArgs = ""
+    [string]$ExtraArgs = "",
+    [string]$Commit = "" # the source commit every exe was built from (recorded in series.txt)
 )
 $ErrorActionPreference = "Stop"
 $root = "E:\SecondSonPC"
@@ -31,7 +32,12 @@ foreach ($c in ($Configs -split ',' | Where-Object { $_ })) {
 $out = "$root\logs\port\$Tag"
 New-Item -ItemType Directory -Force $out | Out-Null
 "port A/B '$Tag': scenes $Scenes, repeats $Repeats, $Seconds s, extra '$ExtraArgs'" | Out-File "$out\series.txt" -Encoding utf8
-foreach ($n in $defs.Keys) { "  $n = $($defs[$n].exe) | $($defs[$n].env)" | Out-File "$out\series.txt" -Encoding utf8 -Append }
+if ($Commit) { "commit $Commit" | Out-File "$out\series.txt" -Encoding utf8 -Append }
+foreach ($n in $defs.Keys) {
+    $sha = (Get-FileHash $defs[$n].exe -Algorithm SHA256).Hash
+    "  $n = $($defs[$n].exe) | $($defs[$n].env)" | Out-File "$out\series.txt" -Encoding utf8 -Append
+    "    sha256 $sha" | Out-File "$out\series.txt" -Encoding utf8 -Append
+}
 $names = @($defs.Keys)
 $reversed = @($names); [array]::Reverse($reversed)
 for ($rep = 1; $rep -le $Repeats; $rep++) {
