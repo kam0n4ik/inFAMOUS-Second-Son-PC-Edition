@@ -117,6 +117,7 @@
 #include "core/debug_state.h"
 #include "core/guest_memory.h"
 #include "core/signals.h"
+#include "bridge/shadps4/bbport_host.h"
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "input/controller.h"
@@ -706,7 +707,27 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     Loader::BindingOptions options;
     options.import_counter = cfg.import_counter && !cfg.selftest;
     options.bridged_groups = cfg.bridged_groups;
-    if (!bindings.Build(SelectExports(cfg, false), BridgeExports(), options)) {
+    // experiment/bbport-gpu: bbport's GPU library serves GnmDriver, VideoOut and the event queues (its exports first:
+    // the first entry for an import key wins); SSPC_FLIP_LOG=1 times every flip call with either backend
+    const bool bbport = cfg.gpu_backend == App::Config::GpuBackend::Bbport;
+    Bbport::SetFlipLogDir(cfg.logs_dir.string());
+    std::vector<Runtime::Export> natives;
+    if (bbport && !cfg.selftest) {
+        std::string bb_error;
+        if (!Bbport::Start(cfg, std::string(Common::ElfInfo::Instance().Title()), serial,
+                           static_cast<u32>(Core::ReadCompiledSdkVersion(guest_eboot_path)), psf_attributes,
+                           &bb_error)) {
+            Fatal("--gpu-backend bbport: " + bb_error);
+        }
+        natives = Bbport::Exports();
+    }
+    for (Runtime::Export e : SelectExports(cfg, false)) {
+        if (e.original == nullptr) {
+            e.function = Bbport::WrapFlip(e.nid, e.function);
+        }
+        natives.push_back(e);
+    }
+    if (!bindings.Build(natives, BridgeExports(), options)) {
         Fatal("binding table is inconsistent, see SecondSonPC.log");
     }
     // The direct memory functions and the bridge's accounting of mapped direct memory switch
@@ -722,6 +743,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     InstallShaderTranslatorAdapter();
     InstallHostShaders(); // P4.4: SecondSonPC's backend's tiling kernels (data only)
     const bool native_gpu = cfg.gpu_backend == App::Config::GpuBackend::Sspc;
+    const bool bbport_gpu = cfg.gpu_backend == App::Config::GpuBackend::Bbport; // (experiment/bbport-gpu)
     if (!cfg.selftest) {
         // P5.3: the render mode's switches before the GPU backend reads them (legacy: none)
         Engine::Render::NativeDraw::ApplyRenderMode(cfg.render_mode, native_gpu);
@@ -732,12 +754,16 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         // one owner of the guest GPU, chosen once: the bridge's renderer, or SecondSonPC's backend (it claims every
         // resource itself when it starts, below); never both, never a switch while the game runs
         std::string gpu_error;
-        bool gpu_ok = Gpu::SelectBackend(native_gpu ? Gpu::BackendKind::Sspc : Gpu::BackendKind::Bridge, &gpu_error);
-        for (u8 r = 0; gpu_ok && !native_gpu && r < static_cast<u8>(Gpu::Resource::Count); ++r) {
+        bool gpu_ok = Gpu::SelectBackend(native_gpu || bbport_gpu ? Gpu::BackendKind::Sspc : Gpu::BackendKind::Bridge,
+                                         &gpu_error);
+        for (u8 r = 0; gpu_ok && !native_gpu && !bbport_gpu && r < static_cast<u8>(Gpu::Resource::Count); ++r) {
             gpu_ok = Gpu::Claim(static_cast<Gpu::Resource>(r), Gpu::BackendKind::Bridge, &gpu_error);
         }
         if (!gpu_ok) {
             Fatal("the guest GPU's owner: " + gpu_error);
+        }
+        if (bbport_gpu && !Bbport::Attach(&gpu_error)) {
+            Fatal("--gpu-backend bbport: " + gpu_error);
         }
     }
     StartBridgeLibraries(bindings, cfg.selftest);

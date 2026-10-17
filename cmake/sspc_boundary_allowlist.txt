@@ -51,3 +51,4 @@ bridge -> runtime/gpu/pm4_stats.h | diagnostics (P4.1.2) | PM4 command statistic
 bridge -> runtime/gpu/frame_pacing.h | diagnostics (P4.2, SSPC-015) | the flip timeline of GnmDriver, Liverpool and VideoOut, --frame-pacing (patch 0029)
 bridge -> bridge/shadps4/shader_bridge_hooks.h | validation (P4.3) | the bridge's translations and pipelines to SecondSonPC's shader frontend, --gpu-shader-capture and --gpu-shaders (patch 0031)
 bridge -> runtime/gpu/cp_shadow.h | validation (P4.2) | SecondSonPC's command processor in the shadow of Liverpool: submissions and packets with Liverpool's state, --gpu-shadow and --gpu-trace (patch 0028)
+src/bridge/shadps4/bbport_host.cpp | gpu (experiment/bbport-gpu) | bbport's GPU library (bbgpu-sspc.dll) as the game's GPU backend: its page tracking first in the bridge's access violation dispatch | core/signals.h

@@ -238,8 +238,10 @@ int main(int argc, char* argv[]) {
                 config->gpu_backend = App::Config::GpuBackend::Bridge;
             } else if (backend == "sspc") {
                 config->gpu_backend = App::Config::GpuBackend::Sspc;
+            } else if (backend == "bbport") {
+                config->gpu_backend = App::Config::GpuBackend::Bbport;
             } else {
-                return Fail("--gpu-backend must be bridge|sspc");
+                return Fail("--gpu-backend must be bridge|sspc|bbport");
             }
         } else if (arg == "--render-mode" && has_value) {
             const std::string_view mode = argv[++i];
@@ -406,6 +408,13 @@ int main(int argc, char* argv[]) {
     }
     if (config->cpu_emulate_sse4a && !native("cpu") && !native("fs-patch")) {
         return Fail("--cpu-emulate sse4a is a mode of SecondSonPC's CPU patcher: it needs --native cpu");
+    }
+    // experiment/bbport-gpu: SSPC_GPU_BACKEND=bbport for test runs (as --gpu-backend bbport / [Graphics] backend)
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_GPU_BACKEND", v, sizeof(v)) == 6 && std::string_view(v) == "bbport") {
+        config->gpu_backend = App::Config::GpuBackend::Bbport;
+    }
+    if (config->gpu_backend == App::Config::GpuBackend::Bbport && !native("memory")) {
+        return Fail("--gpu-backend bbport needs SecondSonPC's memory manager (--native memory)");
     }
     if (config->gpu_backend == App::Config::GpuBackend::Sspc) {
         // P4.4: SecondSonPC's GnmDriver and VideoOut switch together with the backend (one owner of the GPU); the

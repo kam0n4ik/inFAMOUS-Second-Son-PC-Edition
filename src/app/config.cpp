@@ -218,6 +218,17 @@ std::optional<Config> LoadConfig(const std::filesystem::path& root, std::vector<
     r.UInt("Display", "width", c.window_width, 640, 7680);
     r.UInt("Display", "height", c.window_height, 360, 4320);
     r.Bool("Display", "fullscreen", c.fullscreen);
+    // experiment/bbport-gpu: [Graphics] backend = "native" (SecondSonPC's own, the default) | "bbport" (read at
+    // start-up only: the backend owns the Vulkan device and the guest GPU for the whole run)
+    {
+        std::string backend;
+        r.String("Graphics", "backend", backend);
+        if (backend == "bbport") {
+            c.gpu_backend = Config::GpuBackend::Bbport;
+        } else if (!backend.empty() && backend != "native") {
+            r.Error("[Graphics] backend must be \"native\" or \"bbport\"");
+        }
+    }
     r.UInt("Display", "vblankFrequency", c.vblank_hz, 30, 360);
     std::string present = "mailbox";
     r.String("Display", "presentMode", present);

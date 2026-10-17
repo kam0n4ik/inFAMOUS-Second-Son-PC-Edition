@@ -101,7 +101,9 @@ struct Config {
     bool gpu_stats = false;                  // --gpu-stats: PM4 command statistics, a diagnostic capture (P4.1.2)
     // P4.1 (docs/PHASE4_P41_GPU_FOUNDATION.md): the game's GPU backend, chosen once at start. Only the bridge's
     // (shadPS4's Vulkan renderer) runs the game; SecondSonPC's Vulkan foundation is checked on its own (--gpu-probe).
-    enum class GpuBackend : u8 { Bridge, Sspc };
+    /// Bbport (experiment/bbport-gpu): bbport's GPU library (bbgpu-sspc.dll: shadPS4's video core as bbport ships it)
+    /// runs the game's GnmDriver, VideoOut and event queues; SecondSonPC's GPU backend is not started.
+    enum class GpuBackend : u8 { Bridge, Sspc, Bbport };
     // --gpu-backend sspc|bridge: SecondSonPC's own Vulkan backend is the PC Edition's (default); the shadPS4 bridge's
     // presenter only when asked for (comparisons, diagnostics)
     GpuBackend gpu_backend = GpuBackend::Sspc;
