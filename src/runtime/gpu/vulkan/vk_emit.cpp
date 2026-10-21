@@ -36,7 +36,6 @@ Api g_real; ///< the driver's functions (the table as loaded)
 bool g_on = false;
 u8* g_ring = nullptr;
 thread_local bool t_producer = false;
-thread_local u64 t_last = 0; ///< the end of this producer's last entry
 
 alignas(64) std::atomic_flag g_lock;      ///< the producers' ring (two of them may record at once)
 alignas(64) u64 g_wlocal = 0;             ///< under g_lock
@@ -94,8 +93,7 @@ u8* Begin(ReplayFn fn, u64 payload) {
 }
 
 void Commit() {
-    t_last = g_wlocal;
-    g_w.store(t_last, std::memory_order_seq_cst);
+    g_w.store(g_wlocal, std::memory_order_seq_cst);
     g_lock.clear(std::memory_order_release);
     if (g_sleeping.load(std::memory_order_seq_cst) != 0) {
         g_w.notify_one();
@@ -141,7 +139,7 @@ void Loop() {
     }
 }
 
-// ---- thunks (a non-producer's command goes to the driver at once: its command buffers are its own)
+// ---- thunks (a non-producer's command goes to the driver itself, after the ring)
 
 /// Deferred: a command whose arguments are all values.
 template <auto M, class Sig>
@@ -154,6 +152,7 @@ struct Scalar<M, void(VKAPI_PTR*)(A...)> {
     }
     static void VKAPI_CALL Call(A... a) {
         if (!t_producer) {
+            FullSync();
             (g_real.*M)(a...);
             return;
         }
@@ -162,7 +161,7 @@ struct Scalar<M, void(VKAPI_PTR*)(A...)> {
     }
 };
 
-/// Ordered with the producer's commands: its entries passed on first.
+/// Ordered with the deferred commands: the ring passed on first (any thread).
 template <auto M, class Sig>
 struct Synced;
 template <auto M, class R, class... A>
@@ -179,7 +178,7 @@ struct Ordered;
 template <auto M, class R, class... A>
 struct Ordered<M, R(VKAPI_PTR*)(A...)> {
     static R VKAPI_CALL Call(A... a) {
-        t_producer ? Sync() : FullSync();
+        Sync();
         return (g_real.*M)(a...);
     }
 };
@@ -234,6 +233,7 @@ void ReplayPushConstants(const u8* p) {
 void VKAPI_CALL PushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags stages, u32 offset,
                               u32 size, const void* values) {
     if (!t_producer) {
+        FullSync();
         g_real.vkCmdPushConstants(cb, layout, stages, offset, size, values);
         return;
     }
@@ -255,6 +255,7 @@ void ReplayBindVertexBuffers(const u8* p) {
 void VKAPI_CALL BindVertexBuffers(VkCommandBuffer cb, u32 first, u32 n, const VkBuffer* buffers,
                                   const VkDeviceSize* offsets) {
     if (!t_producer) {
+        FullSync();
         g_real.vkCmdBindVertexBuffers(cb, first, n, buffers, offsets);
         return;
     }
@@ -279,6 +280,7 @@ void ReplayBindDescriptorSets(const u8* p) {
 void VKAPI_CALL BindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, u32 first,
                                    u32 n, const VkDescriptorSet* sets, u32 nd, const u32* dyn) {
     if (!t_producer) {
+        FullSync();
         g_real.vkCmdBindDescriptorSets(cb, bp, layout, first, n, sets, nd, dyn);
         return;
     }
@@ -300,6 +302,7 @@ void ReplayCountArray(const u8* p) {
 template <class T, auto M>
 void VKAPI_CALL CountArray(VkCommandBuffer cb, u32 n, const T* a) {
     if (!t_producer) {
+        FullSync();
         (g_real.*M)(cb, n, a);
         return;
     }
@@ -318,6 +321,7 @@ void ReplayColorWriteMask(const u8* p) {
 }
 void VKAPI_CALL ColorWriteMask(VkCommandBuffer cb, u32 first, u32 n, const VkColorComponentFlags* masks) {
     if (!t_producer) {
+        FullSync();
         g_real.vkCmdSetColorWriteMaskEXT(cb, first, n, masks);
         return;
     }
@@ -334,6 +338,7 @@ void ReplayBlendConstants(const u8* p) {
 }
 void VKAPI_CALL BlendConstants(VkCommandBuffer cb, const float c[4]) {
     if (!t_producer) {
+        FullSync();
         g_real.vkCmdSetBlendConstants(cb, c);
         return;
     }
@@ -354,6 +359,7 @@ void ReplayVertexInput(const u8* p) {
 void VKAPI_CALL VertexInput(VkCommandBuffer cb, u32 nb, const VkVertexInputBindingDescription2EXT* b, u32 na,
                             const VkVertexInputAttributeDescription2EXT* a) {
     if (!t_producer) {
+        FullSync();
         g_real.vkCmdSetVertexInputEXT(cb, nb, b, na, a);
         return;
     }
@@ -392,6 +398,7 @@ void ReplayMultiIndexed(const u8* p) {
 void VKAPI_CALL MultiIndexed(VkCommandBuffer cb, u32 n, const VkMultiDrawIndexedInfoEXT* infos, u32 instances,
                              u32 first, u32 stride, const s32* vertex_offset) {
     if (!t_producer) {
+        FullSync();
         g_real.vkCmdDrawMultiIndexedEXT(cb, n, infos, instances, first, stride, vertex_offset);
         return;
     }
@@ -470,6 +477,7 @@ void ReplayPushDescriptors(const u8* p) {
 void VKAPI_CALL PushDescriptors(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, u32 set, u32 n,
                                 const VkWriteDescriptorSet* w) {
     if (!t_producer) {
+        FullSync();
         g_real.vkCmdPushDescriptorSetKHR(cb, bp, layout, set, n, w);
         return;
     }
@@ -508,11 +516,13 @@ void VKAPI_CALL PushDescriptors(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPi
 } // namespace
 
 void Sync() {
-    if (!g_on || !t_producer) {
+    if (!g_on) {
         return;
     }
+    // every producer's entries, not only this thread's: the two producers hand their command buffers to each other
+    // (and to the submissions) - what the other one put in the ring goes before this call
     Bump(g_syncs);
-    WaitEmitted(t_last);
+    WaitEmitted(g_w.load(std::memory_order_acquire));
 }
 
 void SetProducerThread() {
