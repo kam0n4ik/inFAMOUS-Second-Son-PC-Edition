@@ -579,6 +579,9 @@ private:
     /// CP-8 fallback (SSPC_CP_RPTR_EVERY_PACKET=1): a compute ring's read pointer written after every packet, as before
     bool rptr_every_packet_ = false;
     bool engine_runs_ = false; ///< CITY-OPT Phase 5: draws' run tags read (SSPC_CITY_ENGINE_OPT)
+    GroupMask potato_changed_ = 0; ///< potato mode: the dropped draws' changed groups, the next draw's too
+    bool potato_material_ = false;
+    u64 potato_dropped_ = 0;
     bool run_ahead_ = false;   ///< ... RunAhead (SSPC_CITY_ENGINE_AHEAD=1 or SSPC_CITY_ENGINE_OPT=ahead)
     bool in_run_ahead_ = false;
     /// R7: the run hint of the native draw being built (Draw without a packet: no trailing NOP to read it from) - the

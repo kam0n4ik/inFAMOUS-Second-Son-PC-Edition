@@ -81,6 +81,12 @@ constexpr Choice kParticleResolutions[] = {
     {"half", "Half", "Половина"},
     {"quarter", "Quarter", "Четверть"},
 };
+constexpr Choice kPotatoModes[] = {
+    {"off", "Off", "Выключено"},
+    {"1", "1: no headlight and street lamp shadows", "1: без теней от фар и фонарей"},
+    {"2", "2: + no distant sun shadows", "2: + без дальних теней от солнца"},
+    {"3", "3: + no shadows of small objects", "3: + без теней мелких объектов"},
+};
 constexpr Choice kUpscalers[] = {
     {"off", "Off (native 1920x1080)", "Выключено (нативные 1920×1080)"},
     {"dlss", "NVIDIA DLSS", "NVIDIA DLSS"},
@@ -349,6 +355,21 @@ void Build(Registry& r) {
                    "мягче. «Авто» — выбор самой игры.",
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.particle_resolution; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.particle_resolution = std::get<std::string>(x); },
+    });
+    v.push_back(Desc{
+        .id = "graphics.potatoMode", .table = "Graphics", .key = "potatoMode", .category = Category::Graphics,
+        .type = Type::Choice, .apply = Apply::Live, .choices = kPotatoModes, .en = "Potato mode (weak PCs)",
+        .ru = "Режим для слабых ПК",
+        .help_en = "Fewer draws for the processor: the game's shadow passes are partly skipped. 1: lights of cars and "
+                   "street lamps cast no shadows. 2: also no sun shadows far away. 3: also small objects cast no "
+                   "shadows. Raises the frame rate in the city where the processor holds the frame; the picture "
+                   "loses those shadows. Changes at once.",
+        .help_ru = "Меньше draw для процессора: часть теневых проходов игры не рисуется. 1: фары машин и фонари не "
+                   "отбрасывают теней. 2: ещё нет теней от солнца вдали. 3: ещё мелкие объекты не отбрасывают теней. "
+                   "Поднимает FPS в городе, где кадр держит процессор; на картинке пропадают эти тени. Меняется "
+                   "сразу.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.potato_mode; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.potato_mode = std::get<std::string>(x); },
     });
     // ------------------------------------------------------------------ Upscaling & frame generation
     v.push_back(Desc{

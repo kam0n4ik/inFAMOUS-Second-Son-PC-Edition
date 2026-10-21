@@ -15,6 +15,7 @@
 #include "base/log.h"
 #include "engine/render/draw_runs.h"
 #include "runtime/gpu/cp_r6_opt.h"
+#include "runtime/gpu/potato.h"
 #include "runtime/gpu/stall_trace.h"
 
 // Descriptors and fence records are filled naming only the fields a packet sets.
@@ -639,6 +640,7 @@ StepStatus CommandProcessor::Execute(Queue& q, Frame& f, u64 addr, std::span<con
         if (m == Pm4::NopMarker::PatchedFlip) {
             ++stats_.flips;
             Engine::Render::Control().flips.fetch_add(1, std::memory_order_relaxed); // (the A/B schedule's clock)
+            Potato::NewFrame();
             options_.work->Flip(FlipMarker{.queue = q.id, .packet_addr = addr, .after_seq = q.work_seq});
         } else if (m == Pm4::NopMarker::SetVsharpInUdata || m == Pm4::NopMarker::SetTsharpInUdata ||
                    m == Pm4::NopMarker::SetSsharpInUdata) {
@@ -1122,6 +1124,17 @@ StepStatus CommandProcessor::Draw(Queue& q, u64 addr, std::span<const u32> p, Dr
         d.engine_ps = engine_next_.ps;
         engine_next_.valid = false;
     }
+    if (Potato::Drop(regs_, d)) {
+        // potato mode (potato.h): no record; what changed since the draw before is the next draw's change too
+        potato_changed_ |= d.changed;
+        potato_material_ |= d.engine_material;
+        ++potato_dropped_;
+        return StepStatus::Packet;
+    }
+    d.changed |= potato_changed_;
+    d.engine_material |= potato_material_;
+    potato_changed_ = 0;
+    potato_material_ = false;
     d.seq = ++q.work_seq;
     ++stats_.draws;
     if (native_t0_ != 0) { // (a timed native operation: the executor's part is not the transport's)

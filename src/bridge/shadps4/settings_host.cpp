@@ -18,6 +18,7 @@
 #include "engine/particles/smoke_quality.h"
 #include "engine/render/render_resolution.h"
 #include "runtime/gpu/native_backend.h"
+#include "runtime/gpu/potato.h"
 #include "runtime/gpu/upscale/upscale_settings.h"
 #include "settings/settings_service.h"
 #include "ui/menu_controller.h"
@@ -145,6 +146,8 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
                 Engine::Particles::SetSmokeQuality(c.pc.smoke_quality); // the game's emitters, either backend
             } else if (d->id == "graphics.particleResolution") {
                 Engine::Particles::SetParticleResolution(c.pc.particle_resolution);
+            } else if (d->id == "graphics.potatoMode") {
+                Gpu::Potato::SetLevel(c.pc.potato_mode); // the command processor reads it at every draw
             } else if (d->id == "upscaling.sharpness" || d->id == "upscaling.frameGenMultiplier" ||
                        d->id == "upscaling.reflex") {
                 // read by the GPU's recording / present threads every frame
@@ -178,6 +181,7 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
             }
         }
     });
+    Gpu::Potato::SetLevel(cfg.pc.potato_mode); // (the native backend's processor; the bridge's has no use for it)
     Ui::Menu().Install({.window = window,
                         .test_mode = test_mode,
                         .capabilities = caps,

@@ -459,6 +459,8 @@ void SettingsMenu::RebuildRows() {
         AddHeader("Fire and smoke", "Огонь и дым");
         setting("graphics.smokeQuality");
         setting("graphics.particleResolution");
+        AddHeader("Weak PCs", "Слабые ПК");
+        setting("graphics.potatoMode");
         const size_t before = rows_.size();
         AddHeader("The bridge's frame (shadPS4)", "Кадр моста (shadPS4)");
         setting("graphics.fsr");
