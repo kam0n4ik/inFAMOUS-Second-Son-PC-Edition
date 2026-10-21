@@ -30,6 +30,7 @@
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/vulkan/vk_capture.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
+#include "runtime/gpu/vulkan/vk_emit.h"
 #include "runtime/gpu/vulkan/vk_image_cache.h"
 #include "runtime/gpu/vulkan/vk_presenter.h"
 #include "engine/guest_hooks.h"
@@ -635,6 +636,7 @@ void Executor::UpscaleDisplayDraw(const std::array<CachedImage*, 8>& color,
     in.depth_inverted = u.depth_inverted;
     in.frame_ms = static_cast<float>(std::clamp(since, 1.0, 100.0));
     in.sharpness = std::clamp(s.sharpness, 0.0f, 1.0f);
+    Emit::Sync(); // the SDKs record with their own Vulkan functions: the emitter's commands first
     const bool ok = use_dlss ? u.dlss->Evaluate(cb, in) : u.fsr->Evaluate(cb, in);
     InvalidateBoundState(); // the SDK recorded its own pipelines, descriptors and push constants
     if (u.queries != VK_NULL_HANDLE) {

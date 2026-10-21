@@ -19,6 +19,7 @@
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
+#include "runtime/gpu/vulkan/vk_emit.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
 #include "runtime/kernel/clock.h"
@@ -1563,6 +1564,7 @@ void ParallelCp::FrontLoop() {
 void ParallelCp::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuRecord");
     StallTrace::RegisterThread(StallTrace::Role::Record);
+    Vk::Emit::SetProducerThread();
     const bool trace_records = StallTrace::DeepRecords();
     u64 h = head_.load(std::memory_order_relaxed);
     const auto add = [](std::atomic<u64>& a, u64 v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); };

@@ -5,6 +5,7 @@
 #include "runtime/gpu/upscale/upscalers.h"
 
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
+#include "runtime/gpu/vulkan/vk_emit.h"
 
 #include <algorithm>
 #include <atomic>
@@ -816,6 +817,7 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     if (!error.empty()) {
         return nullptr;
     }
+    Emit::Install(f);
     if (caps.external_memory_host && f.vkGetMemoryHostPointerPropertiesEXT == nullptr) {
         caps.external_memory_host = false;
     }

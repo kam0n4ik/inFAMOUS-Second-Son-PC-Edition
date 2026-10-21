@@ -103,6 +103,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/static/static_predictor.cpp
     src/runtime/gpu/vulkan/vk_buffer_cache.cpp
     src/runtime/gpu/vulkan/vk_device_context.cpp
+    src/runtime/gpu/vulkan/vk_emit.cpp
     src/runtime/gpu/vulkan/vk_diagnostics.cpp
     src/runtime/gpu/vulkan/vk_executor.cpp
     src/runtime/gpu/vulkan/vk_instancing.cpp

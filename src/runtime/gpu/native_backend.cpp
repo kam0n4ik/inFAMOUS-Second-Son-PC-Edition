@@ -49,6 +49,7 @@
 #include "runtime/gpu/static/static_predictor.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
+#include "runtime/gpu/vulkan/vk_emit.h"
 #include "runtime/gpu/vulkan/vk_executor.h"
 #include "runtime/gpu/vulkan/vk_image_cache.h"
 #include "runtime/gpu/vulkan/vk_pipelines.h"
@@ -1170,6 +1171,7 @@ bool Backend::CpuCopy(u64 src, u64 dst, u64 bytes) {
 void Backend::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuNative");
     StallTrace::RegisterThread(StallTrace::Role::Cp);
+    Vk::Emit::SetProducerThread();
     loop_tid_.store(GetCurrentThreadId(), std::memory_order_relaxed);
     std::deque<Submission> local;
     auto rate_t0 = std::chrono::steady_clock::now();
