@@ -14,6 +14,7 @@
 #include <windows.h> // GetEnvironmentVariableA
 
 #include "base/log.h"
+#include "engine/render/draw_runs.h"
 #include "runtime/gpu/command_processor.h"
 
 namespace SecondSon::Gpu::Potato {
@@ -34,7 +35,7 @@ bool g_in_sun = false;                   ///< the draw before went to it
 int EnvLevel() {
     static const int v = [] {
         char e[8] = {};
-        return GetEnvironmentVariableA("SSPC_POTATO", e, sizeof(e)) > 0 ? std::clamp(std::atoi(e), 0, 3) : -1;
+        return GetEnvironmentVariableA("SSPC_POTATO", e, sizeof(e)) > 0 ? std::clamp(std::atoi(e), 0, 4) : -1;
     }();
     return v;
 }
@@ -123,7 +124,7 @@ void Census(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& d, bool dept
 } // namespace
 
 void SetLevel(std::string_view choice) {
-    const u32 level = choice == "1" ? 1 : choice == "2" ? 2 : choice == "3" ? 3 : 0;
+    const u32 level = choice == "1" ? 1 : choice == "2" ? 2 : choice == "3" ? 3 : choice == "4" ? 4 : 0;
     const int env = EnvLevel();
     g_level.store(env >= 0 ? static_cast<u32>(env) : level, std::memory_order_relaxed);
     SSPC_LOG(GPU, Info, "potato mode: level {}{}", g_level.load(std::memory_order_relaxed),
@@ -157,8 +158,17 @@ bool Drop(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& d) {
         ++g_sun_runs;
     }
     g_in_sun = sun;
-    if (level == 0 || !depth_only) {
+    if (level == 0) {
         return false;
+    }
+    if (!depth_only) {
+        // level 4: the world's small objects themselves - the engine's mesh draws (tagged: G-buffer and the other
+        // mesh passes; no full-screen pass is tagged) under 256 indices in all their instances. The main view has no
+        // depth pre-pass (no 1920-wide depth-only target), so nothing else needs the dropped draw.
+        const auto tag = static_cast<Engine::Render::DrawRuns::Source>(d.engine_run);
+        return level >= 4 && !d.indirect &&
+               (tag == Engine::Render::DrawRuns::Source::Mesh || tag == Engine::Render::DrawRuns::Source::GBuffer) &&
+               u64{d.index_count} * std::max<u32>(d.instance_count, 1) < 256;
     }
     if (width == 1024) {
         return true; // level 1: the spot light shadow atlases

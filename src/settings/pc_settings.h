@@ -27,8 +27,8 @@ struct PcSettings {
     // [Graphics] the engine's own reduced-resolution path for its translucent particles (fire, smoke, dust): "auto"
     // (the game's own adaptation) | "full" | "half" | "quarter"
     std::string particle_resolution = "auto";
-    // [Graphics] potato mode for weak PCs (native backend, src/runtime/gpu/potato.h): "off" | "1" | "2" | "3" - the
-    // shadow draws the command processor drops
+    // [Graphics] potato mode for weak PCs (native backend, src/runtime/gpu/potato.h): "off" | "1" | "2" | "3" | "4" -
+    // the shadow draws (4: and small objects' draws) the command processor drops
     std::string potato_mode = "off";
     // [Graphics] upscaling and frame generation (native backend; docs/UPSCALING_FRAME_GENERATION.md)
     std::string upscaler = "off";            // "off" | "dlss" | "fsr"

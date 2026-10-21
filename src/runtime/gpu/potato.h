@@ -4,7 +4,8 @@
 //   1 - the spot light shadow atlas (headlights, street lamps: the 1024x1024 depth-only target, ~1 100 draws a frame
 //       in the city; docs/LIGHTING_PROFILE.md: 34 -> 38 FPS);
 //   2 - 1 + the sun's far shadow cascade;
-//   3 - 2 + the shadows of small objects (shadow casters' draws with few indices).
+//   3 - 2 + the shadows of small objects (shadow casters' draws with few indices);
+//   4 - 3 + the small objects themselves (the engine's mesh draws with few indices).
 // The level is live ([Graphics] potatoMode, the F1 menu): read for every draw. SSPC_POTATO=0..3 overrides the setting
 // (measurement stand). SSPC_DIAG_POTATO_CENSUS=1 logs the depth-only draws by target and viewport (what the levels
 // are chosen from).
