@@ -31,6 +31,7 @@ constexpr u64 kMemcpyRva = 0x9843a0;     ///< memcpy (dst, src, n)
 constexpr u64 kSetPointerRva = 0x626400; ///< setPointerInUserData (dcb, stage, sgpr, pointer)
 constexpr u64 kSetRegionRva = 0x626520;  ///< setUserDataRegion (dcb, stage, sgpr, values, count)
 
+constexpr u64 kCueAllocCursor = 0x20; ///< u64: the snapshot allocator's next free dword (0x123d0 moves it, 0x12390 resets it)
 constexpr u64 kCueShadow = 0x90;
 constexpr u64 kCueShadowStride = 0x1800;
 constexpr u64 kCueLayout = 0xc180;
@@ -76,6 +77,10 @@ struct StageState {
 struct CueState {
     std::atomic<u64> key{0};
     StageState stage[kStages];
+    // R8 NR2 (A4's CUE audit): what Fill vouches for besides the versions
+    u64 epoch = 0;          ///< resets seen (0x12390 / 0x13d20, Forget): the snapshot ring may have turned since
+    u64 alloc_end = 0;      ///< the snapshot allocator's cursor (CUE + 0x20) at the last observed commit's end
+    bool alloc_known = false;
 };
 
 constexpr u32 kCues = 1024; // 254 pool slots + pre / post + 5 deformation contexts, and room
@@ -253,8 +258,8 @@ SSPC_SYSV_ABI u64 ObserveCopy(u64 dst, u64 src, u64 n, u64, u64, u64) {
     return dst;
 }
 
-SSPC_SYSV_ABI u64 ObserveSetPointer(u64 dcb, u64 stage, u64 sgpr, u64 pointer, u64 a4, u64 a5) {
-    const u32 st = static_cast<u32>(stage), sg = static_cast<u32>(sgpr);
+/// setPointerInUserData's pointer into the capture (the game's commit through its observer, the layer's directly).
+void CapturePointer(u32 st, u32 sg, u64 pointer) {
     if (st < kStages && sg + 1 < kUserData) {
         const u64 snap = t_cap.snap[st];
         if (snap != 0 && pointer >= snap && pointer < snap + u64{t_cap.snap_dwords[st]} * 4) {
@@ -273,6 +278,19 @@ SSPC_SYSV_ABI u64 ObserveSetPointer(u64 dcb, u64 stage, u64 sgpr, u64 pointer, u
             t_cap.written[st][sg + 1] = static_cast<u32>(pointer >> 32);
         }
     }
+}
+
+/// One user-data value of setUserDataRegion into the capture.
+void CaptureValue(u32 st, u32 sg, u32 value) {
+    if (st < kStages && sg < kUserData) {
+        t_cap.written_mask[st] |= 1u << sg;
+        t_cap.pointer_mask[st] &= ~(1u << sg);
+        t_cap.written[st][sg] = value;
+    }
+}
+
+SSPC_SYSV_ABI u64 ObserveSetPointer(u64 dcb, u64 stage, u64 sgpr, u64 pointer, u64 a4, u64 a5) {
+    CapturePointer(static_cast<u32>(stage), static_cast<u32>(sgpr), pointer);
     return g_set_pointer(dcb, stage, sgpr, pointer, a4, a5);
 }
 
@@ -280,9 +298,7 @@ SSPC_SYSV_ABI u64 ObserveSetRegion(u64 dcb, u64 stage, u64 sgpr, u64 values, u64
     const u32 st = static_cast<u32>(stage), sg = static_cast<u32>(sgpr), n = static_cast<u32>(count);
     if (st < kStages) {
         for (u32 j = 0; j < n && sg + j < kUserData; ++j) {
-            t_cap.written_mask[st] |= 1u << (sg + j);
-            t_cap.pointer_mask[st] &= ~(1u << (sg + j));
-            t_cap.written[st][sg + j] = At<u32>(values + 4ull * j);
+            CaptureValue(st, sg + j, At<u32>(values + 4ull * j));
         }
     }
     return g_set_region(dcb, stage, sgpr, values, count, a5);
@@ -302,6 +318,9 @@ SSPC_SYSV_ABI u64 AllocResetProbe(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5
     OnReset(a0); // also called by 0x13270 for another object: OnReset ignores pointers that are no tracked CUE
     return g_alloc_reset(a0, a1, a2, a3, a4, a5);
 }
+
+/// R8-A3 NR2: R7::ResourceHooks for the Native Render Layer's own commits (defined with the commit, below).
+void RegisterHooks(bool on);
 
 void Reporter() {
     const auto t0 = std::chrono::steady_clock::now();
@@ -349,10 +368,13 @@ void Forget(u64 cue) {
             s.copy = copy;
             s.cv = NextVersion();
         }
+        cs->epoch++;
+        cs->alloc_known = false;
     }
 }
 
 void Deactivate() {
+    RegisterHooks(false);
     CSB::SetObserver(nullptr);
     g_active = false;
     g_mode = StateMode::Off;
@@ -379,6 +401,7 @@ bool Prepare(u64 module_base, void (*redirect)(u64 from, u64 to), std::string& e
     if (g_probes) {
         CSB::SetObserver(&BeforeSetter);
         g_active = true;
+        RegisterHooks(true);
         return true;
     }
     void* a = Engine::InstallEntryProbe(module_base, kResetShadersSite,
@@ -403,6 +426,7 @@ bool Prepare(u64 module_base, void (*redirect)(u64 from, u64 to), std::string& e
     }
     CSB::SetObserver(&BeforeSetter);
     g_active = true;
+    RegisterHooks(true); // (R8 NR2: the layer's native commits and draws)
     if (!g_assume_tracking) { // (the game; tests read Totals themselves)
         std::thread(Reporter).detach();
     }
@@ -488,13 +512,14 @@ void OnReset(u64 cue) {
         s.current = false;
         ClearDirect(s);
     }
+    cs->epoch++;
+    cs->alloc_known = false;
 }
 
-void Commit(SSPC_SYSV_ABI void (*impl)(u64), u64 cue) {
-    if (!g_active) {
-        impl(cue);
-        return;
-    }
+namespace {
+
+/// A commit's start (Commit, ExternalBegin): the counters, verify's shadow check, the capture reset.
+CueState* CommitBegin(u64 cue) {
     Stats& c = C();
     c.commits++;
     CueState* cs = Find(cue, true);
@@ -512,18 +537,19 @@ void Commit(SSPC_SYSV_ABI void (*impl)(u64), u64 cue) {
             }
         }
     }
-    const bool rings = (At<u32>(cue + kCueModeFlags) & 0x21) != 0;
     t_cap = Capture{};
     t_cap.cue = cue;
-    g_redirect(g_base + kAllocRva, reinterpret_cast<u64>(&ObserveAlloc));
-    g_redirect(g_base + kMemcpyRva, reinterpret_cast<u64>(&ObserveCopy));
-    g_redirect(g_base + kSetPointerRva, reinterpret_cast<u64>(&ObserveSetPointer));
-    g_redirect(g_base + kSetRegionRva, reinterpret_cast<u64>(&ObserveSetRegion));
-    impl(cue);
-    g_redirect(0, 0);
+    return cs;
+}
+
+/// A commit's end: the captured snapshots and user data into the stages' bindings (`rings`: the CUE's ES/GS or LS/HS
+/// mode as the commit found it).
+void CommitEnd(CueState* cs, u64 cue, bool rings) {
     if (cs == nullptr) {
         return;
     }
+    Stats& c = C();
+    const bool verify = g_mode == StateMode::Verify;
     for (u32 st = 0; st < kStages; ++st) {
         StageState& s = cs->stage[st];
         if (rings && (st == 3 || st == 4)) {
@@ -618,6 +644,8 @@ void Commit(SSPC_SYSV_ABI void (*impl)(u64), u64 cue) {
     if (t_cap.ref_overflow != 0) {
         c.shape_mismatch += t_cap.ref_overflow;
     }
+    cs->alloc_end = At<u64>(cue + kCueAllocCursor);
+    cs->alloc_known = true;
     if (verify) { // the draw that follows: what Fill hands it equals the CUE's shadow now
         NativeResourceBindings b;
         Fill(cue, b);
@@ -633,6 +661,74 @@ void Commit(SSPC_SYSV_ABI void (*impl)(u64), u64 cue) {
     }
 }
 
+// R8-A3 NR2: the Native Render Layer's own commit (native_draw.cpp NativeCommit), told through R7::ResourceHooks
+thread_local bool t_external = false;
+thread_local CueState* t_external_cue = nullptr;
+thread_local bool t_external_rings = false;
+
+constexpr Engine::Render::R7::ResourceHooks kHooks{&ExternalBegin, &ExternalSnapshot, &ExternalPointer,
+                                                   &ExternalValue, &ExternalEnd,      &Fill};
+
+void RegisterHooks(bool on) {
+    Engine::Render::R7::SetResourceHooks(on ? &kHooks : nullptr);
+}
+
+} // namespace
+
+void Commit(SSPC_SYSV_ABI void (*impl)(u64), u64 cue) {
+    if (!g_active) {
+        impl(cue);
+        return;
+    }
+    const bool rings = (At<u32>(cue + kCueModeFlags) & 0x21) != 0;
+    CueState* cs = CommitBegin(cue);
+    g_redirect(g_base + kAllocRva, reinterpret_cast<u64>(&ObserveAlloc));
+    g_redirect(g_base + kMemcpyRva, reinterpret_cast<u64>(&ObserveCopy));
+    g_redirect(g_base + kSetPointerRva, reinterpret_cast<u64>(&ObserveSetPointer));
+    g_redirect(g_base + kSetRegionRva, reinterpret_cast<u64>(&ObserveSetRegion));
+    impl(cue);
+    g_redirect(0, 0);
+    CommitEnd(cs, cue, rings);
+}
+
+void ExternalBegin(u64 cue) {
+    t_external = g_active;
+    if (!t_external) {
+        return;
+    }
+    C().external_commits++;
+    t_external_rings = (At<u32>(cue + kCueModeFlags) & 0x21) != 0;
+    t_external_cue = CommitBegin(cue);
+}
+
+void ExternalSnapshot(u32 cue_stage, u64 snapshot, u32 dwords) {
+    if (t_external && cue_stage < kStages && snapshot != 0) {
+        t_cap.snap[cue_stage] = snapshot;
+        t_cap.snap_dwords[cue_stage] = dwords;
+    }
+}
+
+void ExternalPointer(u32 cue_stage, u32 sgpr, u64 value) {
+    if (t_external) {
+        CapturePointer(cue_stage, sgpr, value);
+    }
+}
+
+void ExternalValue(u32 cue_stage, u32 sgpr, u32 value) {
+    if (t_external) {
+        CaptureValue(cue_stage, sgpr, value);
+    }
+}
+
+void ExternalEnd(u64 cue) {
+    if (!t_external) {
+        return;
+    }
+    t_external = false;
+    CommitEnd(t_external_cue, cue, t_external_rings);
+    t_external_cue = nullptr;
+}
+
 bool Fill(u64 cue, NativeResourceBindings& out) {
     out = NativeResourceBindings{};
     out.cue = cue;
@@ -642,8 +738,18 @@ bool Fill(u64 cue, NativeResourceBindings& out) {
     if (cs == nullptr) {
         return false;
     }
+    if (!cs->alloc_known || At<u64>(cue + kCueAllocCursor) != cs->alloc_end) {
+        // the snapshot allocator moved since the last observed commit's end: a commit not observed (0x140d0 changes
+        // user data without changing a shadow) may have pointed the GPU elsewhere - nothing is vouched for
+        c.fills_moved++;
+        return true;
+    }
     const bool valid = TrackingValid();
     static constexpr u32 kCueStage[Engine::Render::kDrawStages] = {kCueStageVs, kCueStagePs};
+    // the stage's shader program by value: the code address of the register block the commit sets (sceGnmSetVsShader /
+    // SetPsShader350 at shader object + 8, PGM_HI written 0); 0 when the commit sets the stage another way
+    static constexpr u64 kCueShader[Engine::Render::kDrawStages] = {0xC0B0, 0xC0A8};
+    static constexpr u64 kCueAltPath[Engine::Render::kDrawStages] = {0xC1DA, 0xC1D9};
     for (u32 d = 0; d < Engine::Render::kDrawStages; ++d) {
         const u32 st = kCueStage[d];
         const StageState& s = cs->stage[st];
@@ -666,6 +772,9 @@ bool Fill(u64 cue, NativeResourceBindings& out) {
         r.direct_mask = s.direct_mask;
         std::memcpy(r.direct, s.direct, sizeof(r.direct));
         r.version = valid ? s.bind_version : 0;
+        r.epoch = cs->epoch;
+        const u64 shader = At<u64>(cue + kCueShader[d]);
+        r.program = shader != 0 && At<u8>(cue + kCueAltPath[d]) == 0 ? u64{At<u32>(shader + 8)} << 8 : 0;
         c.fills_present++;
         if (r.version != 0) {
             c.fills_versioned++;
@@ -720,7 +829,8 @@ std::string Report(const Stats& s, double seconds) {
         "outside {}, untracked {}; redundant/calls by kind:{}); commits {}, snapshots {} (binding kept {} = {:.1f} %, "
         "new {}; kept/snapshots by stage:{}), changed dwords {} = {:.2f} % of {} ({} snapshots with a delta), shape checked {} mismatched {}, other "
         "copies {}, resets {}; fills {} present {} versioned {} stale {}; verify: same-version {} violations {}, new "
-        "version with equal bytes {}, shadow checked {} violations {}, fill checked {} mismatches {}",
+        "version with equal bytes {}, shadow checked {} violations {}, fill checked {} mismatches {}; external commits {}, "
+        "fills refused (allocator moved) {}",
         seconds, Mode() == StateMode::Verify ? "verify" : "on", TrackingValid() ? "valid" : "NOT VALID", s.setter_calls,
         s.setter_changing, s.setter_redundant, pct(s.setter_redundant, s.setter_calls), s.setter_slots,
         s.setter_slots_same, s.setter_direct, s.setter_outside, s.setter_untracked, kinds, s.commits, s.snapshots,
@@ -729,7 +839,7 @@ std::string Report(const Stats& s, double seconds) {
         s.table_dwords, s.delta_known, s.shape_checked, s.shape_mismatch, s.other_copies, s.resets, s.fills,
         s.fills_present, s.fills_versioned, s.fills_stale, s.verify_same_version, s.verify_violations,
         s.verify_new_same_bytes, s.verify_shadow_checked, s.verify_shadow_violations, s.verify_fill_checked,
-        s.verify_fill_mismatch);
+        s.verify_fill_mismatch, s.external_commits, s.fills_moved);
 }
 
 } // namespace SecondSon::NativeEngine::R7::Resources

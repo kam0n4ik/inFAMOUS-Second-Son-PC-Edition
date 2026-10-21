@@ -61,6 +61,16 @@ void BeforeSetter(u32 kind, u64 cue, u32 stage, u32 slot, u32 count, u64 src);
 /// One commit of `cue` by `impl` (the recompiled 0x14ad0) with its snapshot and user-data calls observed.
 void Commit(SSPC_SYSV_ABI void (*impl)(u64), u64 cue);
 
+/// R8-A3 NR2: a commit SecondSonPC's Native Render Layer made itself instead of 0x14ad0 (native_draw.cpp NativeCommit,
+/// SSPC_R8_RENDER_RESOURCES): the same events Commit observes, told directly - begin, the stage snapshots (allocated and
+/// copied from the shadow), the pointers and single values written into user data in 0x14ad0's order, end. On the
+/// committing thread; Prepare registers them as Engine::Render::R7::ResourceHooks (with Fill), Deactivate clears them.
+void ExternalBegin(u64 cue);
+void ExternalSnapshot(u32 cue_stage, u64 snapshot, u32 dwords);
+void ExternalPointer(u32 cue_stage, u32 sgpr, u64 value);
+void ExternalValue(u32 cue_stage, u32 sgpr, u32 value);
+void ExternalEnd(u64 cue);
+
 /// A CUE reset (0x13d20 / 0x12390 probes; tests call it directly).
 void OnReset(u64 cue);
 
@@ -108,6 +118,10 @@ struct Stats {
     u64 verify_shadow_violations = 0; ///< ... different (a shadow writer not observed; must stay 0)
     u64 verify_fill_checked = 0;      ///< after each commit: Fill's present VS / PS bindings, snapshot vs shadow
     u64 verify_fill_mismatch = 0;     ///< ... different (must stay 0)
+    u64 external_commits = 0;         ///< R8 NR2: of the commits, the Native Render Layer's own (ExternalBegin)
+    /// R8 NR2: fills refused because the snapshot allocator (CUE + 0x20) moved since the last observed commit's end
+    /// (an unobserved commit such as 0x140d0, or a CS commit 0x13ec0 / 0x132b0 in between: conservative)
+    u64 fills_moved = 0;
 };
 Stats Totals();
 std::string Report(const Stats& s, double seconds);
