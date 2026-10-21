@@ -30,6 +30,39 @@ Mode ReadMode() {
 bool g_gbuffer_path = false;
 thread_local DrawScope t_scope;
 
+/// SSPC_R8_RENDER_PATHS: a comma list of mesh, shadow (unknown words logged and ignored).
+u32 ReadPaths() {
+    char v[64] = {};
+    const DWORD n = GetEnvironmentVariableA("SSPC_R8_RENDER_PATHS", v, sizeof(v));
+    if (n == 0 || n >= sizeof(v)) {
+        return 0;
+    }
+    u32 bits = 0;
+    const char* p = v;
+    while (*p != 0) {
+        const char* e = p;
+        while (*e != 0 && *e != ',') {
+            ++e;
+        }
+        const size_t len = static_cast<size_t>(e - p);
+        if (len == 4 && std::strncmp(p, "mesh", 4) == 0) {
+            bits |= kPathMesh;
+        } else if (len == 6 && std::strncmp(p, "shadow", 6) == 0) {
+            bits |= kPathShadow;
+        } else if (len != 0) {
+            SSPC_LOG(Engine, Error, "SSPC_R8_RENDER_PATHS={}: want mesh and/or shadow", v);
+        }
+        p = *e == ',' ? e + 1 : e;
+    }
+    return bits;
+}
+
+bool ReadOn(const char* name) {
+    char v[8] = {};
+    const DWORD n = GetEnvironmentVariableA(name, v, sizeof(v));
+    return n > 0 && n < sizeof(v) && v[0] != '0';
+}
+
 constexpr u64 kFnvBasis = 0xcbf29ce484222325ull;
 constexpr u64 kFnvPrime = 0x100000001b3ull;
 
@@ -68,9 +101,32 @@ ScopeCounters& ScopeStats() {
     return c;
 }
 
-DrawScope OpenScope(u64 r, u32 tag) {
+u32 R8Paths() {
+    static const u32 paths = ReadPaths();
+    return paths;
+}
+
+bool Carries(EngineFn fn) {
+    switch (fn) {
+    case EngineFn::GBufferInstanced:
+        return Enabled();
+    case EngineFn::GBufferMesh:
+        return Enabled() && (R8Paths() & kPathMesh) != 0;
+    case EngineFn::ShadowInstanced:
+        return Enabled() && (R8Paths() & kPathShadow) != 0;
+    default:
+        return false;
+    }
+}
+
+bool ResourcesOn() {
+    static const bool on = ReadOn("SSPC_R8_RENDER_RESOURCES");
+    return on;
+}
+
+DrawScope OpenScope(u64 r, u32 tag, EngineFn fn) {
     const DrawScope outer = t_scope;
-    t_scope = DrawScope{r, tag, 0};
+    t_scope = DrawScope{r, tag, 0, fn};
     ScopeStats().scopes.fetch_add(1, std::memory_order_relaxed);
     return outer;
 }
@@ -95,6 +151,14 @@ bool InScope(u64 r, u32& tag) {
     return true;
 }
 
+bool InScope(u64 r, u32& tag, EngineFn& fn) {
+    if (!InScope(r, tag)) {
+        return false;
+    }
+    fn = t_scope.fn;
+    return true;
+}
+
 void ScopeNative() {
     ++t_scope.native;
 }
@@ -106,8 +170,8 @@ SubmitResult Submit(const NativeRenderContext& ctx, const NativeDrawCommand& cmd
     if (!Enabled()) {
         return SubmitResult::Off;
     }
-    // C3 carries the G-buffer's instanced draw only (the scope its probe opened: DrawRuns::GBufferScope)
-    if (cmd.fn == EngineFn::GBufferInstanced && NativeDraw::EmitNativeDraw(ctx, cmd, GetMode() == Mode::GBufferVerify)) {
+    // C3: the G-buffer's instanced draw (the scope its probe opened); R8 NR5: the mesh / shadow draws with their switch
+    if (Carries(cmd.fn) && NativeDraw::EmitNativeDraw(ctx, cmd, GetMode() == Mode::GBufferVerify)) {
         c.native[p].fetch_add(1, std::memory_order_relaxed);
         return SubmitResult::Native;
     }

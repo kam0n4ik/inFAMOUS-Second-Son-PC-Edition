@@ -12,6 +12,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include <fmt/format.h>
 #include <windows.h>
 
 #include "base/log.h"
@@ -130,6 +131,131 @@ void DiagReporter() {
     }
 }
 
+// --- R8-A3: SSPC_R8_RENDER_BINDINGS=1 - what the CUE's binding versions could save the processor ------------------------
+//
+// (E:\research\r8\render\INTERFACE.md §4; needs SSPC_R7_RES_STATE: R7::ResourceHooks::fill.) After each probed call the
+// CUE's VS / PS bindings: a stage whose snapshot is new since the context's previous probed draw makes the processor's
+// stage memo (P4.7) miss today (other user data: the new snapshot's address); its binding version and program equal to
+// the stage's previous ones (hit1) or to one of its last four (hit4) is a draw whose stage plan the version could keep.
+// An upper bound for a consumer in the processor (it still checks memory and the other user data), per source.
+constexpr u32 kBindHistory = 4;
+struct BindStage {
+    u64 snapshot = 0;
+    u64 version[kBindHistory] = {};
+    u64 program[kBindHistory] = {};
+    u32 next = 0;
+};
+struct BindCue {
+    std::atomic<u64> key{0};
+    BindStage stage[kDrawStages];
+};
+constexpr u32 kBindCues = 1024;
+BindCue* g_bind = nullptr;
+struct BindCounters {
+    std::atomic<u64> calls{0}, filled{0};
+    std::atomic<u64> present[kDrawStages] = {}, versioned[kDrawStages] = {}, fresh[kDrawStages] = {};
+    std::atomic<u64> hit1[kDrawStages] = {}, hit4[kDrawStages] = {};
+};
+BindCounters g_bind_stats[4]; ///< by Source (1 mesh, 2 shadow, 3 G-buffer)
+
+BindCue* BindFind(u64 cue) {
+    u32 h = static_cast<u32>(((cue >> 4) * 0x9E3779B97F4A7C15ull) >> 40) & (kBindCues - 1);
+    for (u32 n = 0; n < kBindCues; ++n, h = (h + 1) & (kBindCues - 1)) {
+        u64 k = g_bind[h].key.load(std::memory_order_acquire);
+        if (k == cue) {
+            return &g_bind[h];
+        }
+        if (k == 0 && (g_bind[h].key.compare_exchange_strong(k, cue, std::memory_order_acq_rel) || k == cue)) {
+            return &g_bind[h];
+        }
+    }
+    return nullptr;
+}
+
+void BindNote(u32 src, u64 r) {
+    const R7::ResourceHooks* hooks = R7::GetResourceHooks();
+    BindCounters& s = g_bind_stats[src];
+    s.calls.fetch_add(1, std::memory_order_relaxed);
+    const u64 cue = r + L::kContextCue;
+    R7::NativeResourceBindings b;
+    BindCue* bc = nullptr;
+    if (hooks == nullptr || !hooks->fill(cue, b) || (bc = BindFind(cue)) == nullptr) {
+        return;
+    }
+    s.filled.fetch_add(1, std::memory_order_relaxed);
+    const auto at32 = [](u64 a) {
+        u32 v;
+        std::memcpy(&v, reinterpret_cast<const void*>(a), 4);
+        return v;
+    };
+    for (u32 d = 0; d < kDrawStages; ++d) {
+        const R7::NativeStageResources& st = b.stage[d];
+        if (!st.present) {
+            continue;
+        }
+        // the consumer's key (INTERFACE.md v3): version within the CUE's reset epoch, the program by value (the VS with
+        // its RSRC modifier, native_draw.cpp kCueVsModifier)
+        const u64 program_key = (st.program | (d == 0 ? u64{at32(cue + 0xC168)} << 40 : 0)) ^
+                                (st.epoch * 0x9E3779B97F4A7C15ull);
+        BindStage& h = bc->stage[d];
+        s.present[d].fetch_add(1, std::memory_order_relaxed);
+        if (st.version != 0) {
+            s.versioned[d].fetch_add(1, std::memory_order_relaxed);
+        }
+        const bool fresh = st.snapshot != h.snapshot;
+        h.snapshot = st.snapshot;
+        if (!fresh) {
+            continue;
+        }
+        s.fresh[d].fetch_add(1, std::memory_order_relaxed);
+        if (st.version == 0) {
+            continue;
+        }
+        const u32 newest = (h.next + kBindHistory - 1) % kBindHistory;
+        bool found = false;
+        for (u32 i = 0; i < kBindHistory && !found; ++i) {
+            found = h.version[i] == st.version && h.program[i] == program_key;
+        }
+        if (h.version[newest] == st.version && h.program[newest] == program_key) {
+            s.hit1[d].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (found) {
+                s.hit4[d].fetch_add(1, std::memory_order_relaxed);
+            }
+            h.version[h.next] = st.version;
+            h.program[h.next] = program_key;
+            h.next = (h.next + 1) % kBindHistory;
+        }
+    }
+}
+
+void BindReporter() {
+    u64 flips0 = Gpu::VideoOut::NextFlipId();
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        const u64 flips1 = Gpu::VideoOut::NextFlipId();
+        const double frames = static_cast<double>(std::max<u64>(flips1 - flips0, 1));
+        flips0 = flips1;
+        std::string line;
+        static constexpr const char* kName[4] = {"", "mesh 0x1a1960", "shadow 0x43d480", "G-buffer 0x1a1770"};
+        for (u32 src = 1; src < 4; ++src) {
+            BindCounters& s = g_bind_stats[src];
+            const auto take = [frames](std::atomic<u64>& v) { return static_cast<double>(v.exchange(0)) / frames; };
+            const double calls = take(s.calls), filled = take(s.filled);
+            line += fmt::format(" | {}: calls {:.0f}, filled {:.0f}", kName[src], calls, filled);
+            static constexpr const char* kStage[kDrawStages] = {"VS", "PS"};
+            for (u32 d = 0; d < kDrawStages; ++d) {
+                const double present = take(s.present[d]), versioned = take(s.versioned[d]), fresh = take(s.fresh[d]);
+                const double hit1 = take(s.hit1[d]), hit4 = take(s.hit4[d]);
+                line += fmt::format("; {} present {:.0f} versioned {:.0f} new snapshot {:.0f} same version+program "
+                                    "{:.0f} (last) + {:.0f} (last 4)",
+                                    kStage[d], present, versioned, fresh, hit1, hit4);
+            }
+        }
+        SSPC_LOG(Engine, Info, "R8 render bindings per frame ({:.0f} flips){}", frames, line);
+    }
+}
+
 template <u32 I>
 SSPC_SYSV_ABI void Probe(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
     // the context's DCB (G = R + 8): the chunk's start and the write pointer before and after the engine's draw
@@ -152,9 +278,19 @@ SSPC_SYSV_ABI void Probe(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
             outer = R7::OpenScope(r, tag);
             scoped = true;
         }
+    } else {
+        // R8 NR5: the mesh pass's single draw / the shadow casters' draw through the layer too (SSPC_R8_RENDER_PATHS)
+        constexpr R7::EngineFn fn = I == 0 ? R7::EngineFn::GBufferMesh : R7::EngineFn::ShadowInstanced;
+        if (R7::GBufferPath() && R7::Carries(fn)) {
+            outer = R7::OpenScope(r, tag, fn);
+            scoped = true;
+        }
     }
     g_orig[I](a, r, c, d, e, f);
     const u32 native = scoped ? R7::CloseScope(outer) : 0;
+    if (g_bind != nullptr) {
+        BindNote(src, r);
+    }
     if (g_diag) {
         // 0x1a1960: the instance (c) -> its mesh **(c + 0x18); 0x43d480, 0x1a1770: the mesh (e), d instances
         DiagNote(I, r, I == 0 ? **reinterpret_cast<const u64* const*>(c + 0x18) : e, I == 0 ? 1 : static_cast<u32>(d));
@@ -260,6 +396,13 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
         SSPC_LOG(Engine, Error, "SSPC_R7_NATIVE_RENDER: the G-buffer path needs 0x1a1770's probe "
                                 "(SSPC_CITY_ENGINE_GBUFFER_RUNS=1) - its draws stay the game's");
         R7::SetGBufferPath(false);
+    }
+    if (env_on("SSPC_R8_RENDER_BINDINGS")) {
+        g_bind = new BindCue[kBindCues];
+        std::thread(BindReporter).detach();
+        SSPC_LOG(Engine, Warning, "DIAGNOSTICS: SSPC_R8_RENDER_BINDINGS=1 - per probed draw the CUE's VS / PS binding "
+                                  "versions against the context's previous ones (what a processor stage memo keyed by "
+                                  "them could keep; needs SSPC_R7_RES_STATE)");
     }
     if (char dv[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_ENGINE_RUNS", dv, sizeof(dv)) == 1 && dv[0] == '1') {
         g_diag = true;

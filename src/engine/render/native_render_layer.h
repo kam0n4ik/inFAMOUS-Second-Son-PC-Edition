@@ -47,6 +47,12 @@ struct NativeStageResources {
     /// R7-R: changes whenever anything of the stage's resources changes (setters, material, commit); equal versions of
     /// one CUE and stage mean equal resources. 0: not tracked - nothing may be reused by it.
     u64 version = 0;
+    /// R8 (A4's CUE audit): the CUE's reset epoch (0x12390 / 0x13d20 each frame turn the snapshot ring, so a snapshot
+    /// address can come back with other bytes while the version holds) - a consumer keys on (version, epoch), never on
+    /// the snapshot address, and compares the user data by value (0x16fb0 writes SGPRs past the shadow)
+    u64 epoch = 0;
+    /// the stage's shader program by value: code address (SPI_SHADER_PGM_LO << 8) as the commit sets it; 0: unknown
+    u64 program = 0;
 };
 
 struct NativeResourceBindings {
@@ -134,15 +140,17 @@ struct DrawScope {
     u64 r = 0;
     u32 tag = 0;
     u32 native = 0; ///< its draws that went to the native stream
+    EngineFn fn = EngineFn::Other; ///< the engine function whose call it is
 };
 void SetGBufferPath(bool on);
 bool GBufferPath();
-/// A scope for a call on `r`; returns the one it replaces (CloseScope restores it).
-DrawScope OpenScope(u64 r, u32 tag);
+/// A scope for a call of `fn` on `r`; returns the one it replaces (CloseScope restores it).
+DrawScope OpenScope(u64 r, u32 tag, EngineFn fn = EngineFn::GBufferInstanced);
 /// The scope closed, `outer` restored; its native draws.
 u32 CloseScope(const DrawScope& outer);
-/// The thread is inside a scope on `r`: its tag.
+/// The thread is inside a scope on `r`: its tag (and the function whose call it is).
 bool InScope(u64 r, u32& tag);
+bool InScope(u64 r, u32& tag, EngineFn& fn);
 /// A draw of the open scope went to the native stream.
 void ScopeNative();
 
@@ -152,5 +160,40 @@ struct ScopeCounters {
     std::atomic<u64> native_draws{0};
 };
 ScopeCounters& ScopeStats();
+
+// --- R8-A3 (docs/NATIVE_ENGINE_R8_RENDER_LAYER.md): the layer as a working path ----------------------------------------
+//
+// NR5. SSPC_R8_RENDER_PATHS=mesh,shadow (with SSPC_R7_NATIVE_RENDER=gbuffer*; off by default): the scope and the native
+// commit / draw of 0x1a1770 also for the mesh pass's single draw 0x1a1960 (mesh) and the shadow casters' instanced draw
+// 0x43d480 (shadow), each its own switch; their probes (draw_runs.cpp, Phase 5) open the scope with the Phase 5 tag.
+enum PathBits : u32 { kPathMesh = 1, kPathShadow = 2 };
+u32 R8Paths();
+/// The layer carries `fn`'s draws now (0x1a1770 with the layer on; the others with their R8 switch too).
+bool Carries(EngineFn fn);
+
+// NR2. The Native Resource State's view of the layer's own commits. The native commit (native_draw.cpp NativeCommit)
+// makes the snapshot and the user data the game's commit 0x14ad0 would make; the state (native_engine/r7/resources)
+// learns a commit by watching 0x14ad0's calls - for the native one the commit reports the same events itself through
+// these hooks, so a stage's binding and version stay the GPU's. All on the committing thread, between begin and end, in
+// 0x14ad0's order. Fill: the CUE's resources for a draw (R7::Resources::Fill), copied by value.
+// The state registers them (R7::Resources::Prepare); header-only storage, so neither side links the other.
+struct ResourceHooks {
+    void (*begin)(u64 cue) = nullptr;
+    void (*snapshot)(u32 cue_stage, u64 snapshot, u32 dwords) = nullptr; ///< allocated and copied from the shadow
+    void (*pointer)(u32 cue_stage, u32 sgpr, u64 value) = nullptr;       ///< setPointerInUserData's
+    void (*value)(u32 cue_stage, u32 sgpr, u32 value) = nullptr;         ///< setUserDataRegion(.., 1)'s
+    void (*end)(u64 cue) = nullptr;
+    bool (*fill)(u64 cue, NativeResourceBindings& out) = nullptr;
+};
+inline std::atomic<const ResourceHooks*> g_resource_hooks{nullptr};
+inline void SetResourceHooks(const ResourceHooks* hooks) {
+    g_resource_hooks.store(hooks, std::memory_order_release);
+}
+inline const ResourceHooks* GetResourceHooks() {
+    return g_resource_hooks.load(std::memory_order_acquire);
+}
+/// SSPC_R8_RENDER_RESOURCES=1 (off by default): the layer's native commits are reported through the hooks and its
+/// commands carry the CUE's resources (NativeDrawCommand::resources, by value) - needs SSPC_R7_RES_STATE (the hooks).
+bool ResourcesOn();
 
 } // namespace SecondSon::Engine::Render::R7

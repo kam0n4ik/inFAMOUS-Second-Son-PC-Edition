@@ -133,6 +133,13 @@ struct EngineCounters {
     std::atomic<u64> r7_commit_fallbacks{0}; ///< the game's commit ran (CheckNativeCommit, no stream room)
     std::atomic<u64> r7_draw_fallbacks{0};   ///< the game's wrapper ran (predication, flags, no stream room)
     std::atomic<u64> r7_verify_ops{0};       ///< StreamOp::Verify written (gbuffer-verify)
+    // R8-A3
+    std::atomic<u64> r8_commits_reported{0}; ///< NR2: native commits told to the Native Resource State
+    std::atomic<u64> r8_fills{0};            ///< NR2: native draws that carry the CUE's resources (Fill)
+    std::atomic<u64> r8_fills_versioned{0};  ///< ... with a version for VS and PS (or the stage absent)
+    std::atomic<u64> commit_probe_calls{0};  ///< NR4: calls of 0x14ad0 through the probe (with the layer on)
+    std::atomic<u64> commit_probe_game{0};   ///< ... handed on below it (the game's commit / a reconstruction's)
+    std::atomic<u64> r8_draws[3] = {};       ///< NR5: native draws by function (0x1a1770, 0x1a1960, 0x43d480)
 };
 EngineCounters g_engine;
 
@@ -448,7 +455,8 @@ R7Path R7Draw(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags) {
     R7::NativeRenderContext ctx;
     ctx.r = cb - L::kContextGfx;
     u32 tag = 0;
-    if (!R7::InScope(ctx.r, tag) || !NativeActive()) {
+    R7::EngineFn fn = R7::EngineFn::Other;
+    if (!R7::InScope(ctx.r, tag, fn) || !NativeActive()) {
         return R7Path::None;
     }
     ctx.cue = ctx.r + L::kContextCue;
@@ -460,18 +468,30 @@ R7Path R7Draw(u8* dcb, bool indexed, u32 count, u64 indices, u32 flags) {
         return R7Path::Game;
     }
     R7::NativeDrawCommand cmd;
-    cmd.producer = R7::Producer::GBuffer;
-    cmd.fn = R7::EngineFn::GBufferInstanced;
+    cmd.producer = fn == R7::EngineFn::ShadowInstanced ? R7::Producer::Shadows : R7::Producer::GBuffer;
+    cmd.fn = fn;
     cmd.indexed = indexed;
     cmd.index_count = count;
     cmd.index_base = indexed ? indices : 0;
     cmd.run_tag = tag;
     cmd.state.pass = ctx.pass;
     cmd.state.sub = ctx.sub;
+    // R8 NR2: the CUE's resources as the Native Resource State holds them after this call's commit (a copy)
+    if (R7::ResourcesOn()) {
+        if (const R7::ResourceHooks* hooks = R7::GetResourceHooks(); hooks != nullptr && hooks->fill(ctx.cue, cmd.resources)) {
+            g_engine.r8_fills.fetch_add(1, std::memory_order_relaxed);
+            const auto versioned = [](const R7::NativeStageResources& s) { return !s.present || s.version != 0; };
+            if (versioned(cmd.resources.stage[kStageVs]) && versioned(cmd.resources.stage[kStagePs])) {
+                g_engine.r8_fills_versioned.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     if (R7::Submit(ctx, cmd) != R7::SubmitResult::Native) {
         g_engine.r7_draw_fallbacks.fetch_add(1, std::memory_order_relaxed);
         return R7Path::Game;
     }
+    g_engine.r8_draws[fn == R7::EngineFn::GBufferMesh ? 1 : fn == R7::EngineFn::ShadowInstanced ? 2 : 0].fetch_add(
+        1, std::memory_order_relaxed);
     R7::ScopeNative();
     return R7Path::Native;
 }
@@ -494,9 +514,14 @@ R7Path R7Commit(u8* cue_ptr) {
         g_engine.r7_commit_fallbacks.fetch_add(1, std::memory_order_relaxed);
         return R7Path::Game;
     }
+    // R8 NR2: the commit told to the Native Resource State as it is told the game's (R7::ResourceHooks)
+    CommitEnv env = g_env;
+    if (R7::ResourcesOn()) {
+        env.hooks = R7::GetResourceHooks();
+    }
     const bool emitted = EmitDirect(reinterpret_cast<u8*>(r + L::kContextGfx), 1 + 2 * kMaxRegWrites, [&](u32* op) {
         RegWrite writes[kMaxRegWrites];
-        const u32 n = NativeCommit(cue, g_env, writes);
+        const u32 n = NativeCommit(cue, env, writes);
         op[0] = OpHeader(StreamOp::Registers, 2 * n);
         std::memcpy(op + 1, writes, sizeof(RegWrite) * n);
         return n == 0 ? 0u : 1 + 2 * n;
@@ -506,6 +531,9 @@ R7Path R7Commit(u8* cue_ptr) {
         return R7Path::Game;
     }
     g_engine.r7_commits.fetch_add(1, std::memory_order_relaxed);
+    if (env.hooks != nullptr) {
+        g_engine.r8_commits_reported.fetch_add(1, std::memory_order_relaxed);
+    }
     return R7Path::Native;
 }
 
@@ -548,11 +576,15 @@ SSPC_SYSV_ABI void DrawAutoProbe(u8* dcb, u32 count, u32 flags) {
 /// Apply mode: the CUE commit of a listed pass's context runs natively (CheckNativeCommit), otherwise the game's.
 SSPC_SYSV_ABI void CommitProbe(u8* cue_ptr) {
     if (g_r7 != R7::Mode::Off) {
+        // R8 NR4: one entry - the native commit here, or g_commit: the game's code, or the Native Engine's cue_commit
+        // installed below this probe (the registry's dispatcher: recomp_14ad0, verify / guarded); never both
+        g_engine.commit_probe_calls.fetch_add(1, std::memory_order_relaxed);
         const R7Path path = R7Commit(cue_ptr);
         if (path == R7Path::Native) {
             return;
         }
         if (path == R7Path::Game || g_apply_passes == 0) {
+            g_engine.commit_probe_game.fetch_add(1, std::memory_order_relaxed);
             g_commit(cue_ptr);
             return;
         }
@@ -959,6 +991,14 @@ void Reporter(u32 seconds) {
                      g_engine.r7_draw_fallbacks.load(), g_engine.r7_verify_ops.load(), l.submitted[g].load(),
                      l.native[g].load(), l.fallback[g].load(), c.verified.load(), c.matched.load(), c.mismatched.load(),
                      fields.empty() ? std::string() : " (fields:" + fields + ")");
+            SSPC_LOG(Engine, Info,
+                     "R8 native render: commit probe calls {}, handed below {} (native {}); commits reported to the "
+                     "resource state {}; draws with resources {} (versioned {}); native draws 0x1a1770 {}, 0x1a1960 {}, "
+                     "0x43d480 {}; paths {:#x}, resources {}",
+                     g_engine.commit_probe_calls.load(), g_engine.commit_probe_game.load(), g_engine.r7_commits.load(),
+                     g_engine.r8_commits_reported.load(), g_engine.r8_fills.load(), g_engine.r8_fills_versioned.load(),
+                     g_engine.r8_draws[0].load(), g_engine.r8_draws[1].load(), g_engine.r8_draws[2].load(),
+                     R7::R8Paths(), R7::ResourcesOn() ? (R7::GetResourceHooks() != nullptr ? "on" : "NO HOOKS") : "off");
             if (g_r7_only) {
                 continue; // (the P5.3 lines below: nothing of theirs runs)
             }
@@ -1063,10 +1103,26 @@ void CommitStage(u64 cue, u32 stage, u32 user_data, const CommitEnv& env, Writer
     const u64 snapshot = env.alloc(cue, dwords);
     std::memcpy(reinterpret_cast<void*>(snapshot),
                 reinterpret_cast<const void*>(cue + L::kCueShadow + u64{stage} * L::kCueShadowStride), u64{dwords} * 4);
+    const R7::ResourceHooks* hooks = env.hooks;
+    if (hooks != nullptr) {
+        hooks->snapshot(stage, snapshot, dwords);
+    }
+    const auto pointer = [&](u8 sgpr, u64 value) { // setPointerInUserData
+        w.Pointer(user_data, sgpr, value);
+        if (hooks != nullptr) {
+            hooks->pointer(stage, sgpr, value);
+        }
+    };
+    const auto value = [&](u8 sgpr, u32 v) { // setUserDataRegion(.., 1): one dword
+        w.Reg(user_data + sgpr, v);
+        if (hooks != nullptr) {
+            hooks->value(stage, sgpr, v);
+        }
+    };
     const auto byte = [&](u32 at) { return At<u8>(layout + at); };
     const auto table = [&](u32 sgpr_at, u32 offset_at) {
         if (const u8 sgpr = byte(sgpr_at); sgpr != 0xFF) {
-            w.Pointer(user_data, sgpr, snapshot + (offset_at == 0 ? 0 : u64{At<u16>(layout + offset_at)} * 4));
+            pointer(sgpr, snapshot + (offset_at == 0 ? 0 : u64{At<u16>(layout + offset_at)} * 4));
         }
     };
     table(7, 0);
@@ -1075,26 +1131,26 @@ void CommitStage(u64 cue, u32 stage, u32 user_data, const CommitEnv& env, Writer
     table(0xA, 0x1C);
     table(0xB, 0x1E);
     if (const u8 sgpr = byte(0xC); sgpr != 0xFF) {
-        w.Pointer(user_data, sgpr, At<u64>(cue + kCueGlobalTable));
+        pointer(sgpr, At<u64>(cue + kCueGlobalTable));
     }
     const bool vertex = stage == kCueStageVs;
-    if (const u8 sgpr = byte(0xD); sgpr != 0xFF) { // setUserDataRegion(.., 1): one dword
-        w.Reg(user_data + sgpr, At<u32>(cue + (vertex ? 0xC0E8 : 0xC0E4)));
+    if (const u8 sgpr = byte(0xD); sgpr != 0xFF) {
+        value(sgpr, At<u32>(cue + (vertex ? 0xC0E8 : 0xC0E4)));
     }
     if (const u8 sgpr = byte(0xE); sgpr != 0xFF) {
-        w.Reg(user_data + sgpr, At<u32>(cue + (vertex ? 0xC108 : 0xC104)));
+        value(sgpr, At<u32>(cue + (vertex ? 0xC108 : 0xC104)));
     }
     if (!vertex) {
         return;
     }
     if (const u8 sgpr = byte(4); sgpr != 0xFF) {
-        w.Pointer(user_data, sgpr, At<u64>(cue + 0xC130));
+        pointer(sgpr, At<u64>(cue + 0xC130));
     }
     table(5, 0x18);
     table(6, 0x20);
     if (const u8 sgpr = byte(0xF); sgpr != 0xFF) {
         const u32 v = At<u32>(cue + 0xC6E8);
-        w.Reg(user_data + sgpr, (v >> 16) * (v & 0xFFFF));
+        value(sgpr, (v >> 16) * (v & 0xFFFF));
     }
 }
 
@@ -1116,6 +1172,9 @@ CommitCheck CheckNativeCommit(u64 cue) {
 }
 
 u32 NativeCommit(u64 cue, const CommitEnv& env, RegWrite* out) {
+    if (env.hooks != nullptr) {
+        env.hooks->begin(cue);
+    }
     Writer w{out};
     const bool vs_dirty = At<u8>(cue + kCueVsDirty) != 0;
     const bool ps_dirty = At<u8>(cue + kCuePsDirty) != 0;
@@ -1183,6 +1242,9 @@ u32 NativeCommit(u64 cue, const CommitEnv& env, RegWrite* out) {
     }
     for (const u64 flag : {kCuePsTableDirty, kCuePsDirty, kCuePsAltPath, kCueVsTableDirty, kCueVsDirty, kCueVsAltPath}) {
         *reinterpret_cast<u8*>(cue + flag) = 0;
+    }
+    if (env.hooks != nullptr) {
+        env.hooks->end(cue); // (after the dirty bytes: the state's verify mode reads Fill as the draw will)
     }
     return w.n;
 }
@@ -1300,7 +1362,9 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
     if (g_apply_passes != 0 || r7 != R7::Mode::Off) {
         g_env.alloc = reinterpret_cast<AllocFn>(eboot_base + 0x123d0);
         g_env.ps_inputs = reinterpret_cast<PsInputsFn>(eboot_base + 0x638540);
-        void* commit = InstallEntryProbe(eboot_base, kCommitSite, reinterpret_cast<const void*>(&CommitProbe), error);
+        // (the slot: the Native Engine's cue_commit goes in below the probe - guest_probe.h; R8 NR4)
+        void* commit = InstallEntryProbe(eboot_base, kCommitSite, reinterpret_cast<const void*>(&CommitProbe), error,
+                                         reinterpret_cast<void**>(&g_commit));
         if (commit == nullptr) {
             SSPC_LOG(Engine, Critical, "native draw: {}", error);
             std::abort();
@@ -1320,6 +1384,18 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
                                                  "description (StreamOp::Verify)"
                                                : "",
                  p53 ? fmt::format(" (with SSPC_P53_NATIVE_DRAW={})", mode) : std::string());
+        if (R7::R8Paths() != 0 || R7::ResourcesOn()) {
+            SSPC_LOG(Engine, Warning,
+                     "EXPERIMENT: R8 Native Render Layer -{}{}{}",
+                     (R7::R8Paths() & R7::kPathMesh) != 0 ? " SSPC_R8_RENDER_PATHS mesh: 0x1a1960's commit and draw too;"
+                                                          : "",
+                     (R7::R8Paths() & R7::kPathShadow) != 0
+                         ? " SSPC_R8_RENDER_PATHS shadow: 0x43d480's commit and draw too;"
+                         : "",
+                     R7::ResourcesOn() ? " SSPC_R8_RENDER_RESOURCES=1: the native commits reported to the Native "
+                                         "Resource State, the draws carry the CUE's resources (needs SSPC_R7_RES_STATE)"
+                                       : "");
+        }
     }
     if (g_apply_passes != 0) {
         std::string passes;

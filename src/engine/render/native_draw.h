@@ -50,6 +50,8 @@ using PsInputsFn = SSPC_SYSV_ABI void (*)(u32* out, u64 vs_semantics, u32 vs_cou
 struct CommitEnv {
     AllocFn alloc = nullptr;
     PsInputsFn ps_inputs = nullptr;
+    /// R8 NR2: the commit's snapshots and user data reported to the Native Resource State (null: not reported)
+    const R7::ResourceHooks* hooks = nullptr;
 };
 
 enum class CommitCheck : u8 {
@@ -63,6 +65,7 @@ CommitCheck CheckNativeCommit(u64 cue);
 /// What 0x14ad0 does in the VS/PS case, without a command buffer: the dirty stages' snapshots are allocated and copied
 /// with the game's allocator, the register writes the game's packets would make are returned in the same order (at
 /// most kMaxRegWrites), the CUE's dirty flags are cleared as the commit clears them. Call after CheckNativeCommit.
+/// With env.hooks the snapshots, pointers and single values go to the hooks too (begin ... end around the commit).
 u32 NativeCommit(u64 cue, const CommitEnv& env, RegWrite* out);
 
 // --- R7-Core C3: the Native Render Layer's writer (SSPC_R7_NATIVE_RENDER=gbuffer*, native_render_layer.h) -------------
