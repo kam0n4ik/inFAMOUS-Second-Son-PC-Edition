@@ -86,7 +86,7 @@ constexpr Choice kPotatoModes[] = {
     {"1", "1: no headlight and street lamp shadows", "1: без теней от фар и фонарей"},
     {"2", "2: + no distant sun shadows", "2: + без дальних теней от солнца"},
     {"3", "3: + no shadows of small objects", "3: + без теней мелких объектов"},
-    {"4", "4: + no small objects at all", "4: + без мелких объектов вообще"},
+    {"4", "4: + no small repeated objects", "4: + без мелких повторяющихся объектов"},
 };
 constexpr Choice kUpscalers[] = {
     {"off", "Off (native 1920x1080)", "Выключено (нативные 1920×1080)"},
@@ -363,11 +363,11 @@ void Build(Registry& r) {
         .ru = "Режим для слабых ПК",
         .help_en = "Fewer draws for the processor: the game's shadow passes are partly skipped. 1: lights of cars and "
                    "street lamps cast no shadows. 2: also no sun shadows far away. 3: also small objects cast no "
-                   "shadows. 4: small objects (debris, small props, decals) are not drawn at all. Raises the frame rate in the city where the processor holds the frame; the picture "
+                   "shadows. 4: small objects the game draws many at once (debris, props, plants) are not drawn. Raises the frame rate in the city where the processor holds the frame; the picture "
                    "loses those shadows. Changes at once.",
         .help_ru = "Меньше draw для процессора: часть теневых проходов игры не рисуется. 1: фары машин и фонари не "
                    "отбрасывают теней. 2: ещё нет теней от солнца вдали. 3: ещё мелкие объекты не отбрасывают теней. "
-                   "4: мелкие объекты (мусор, мелкие предметы, декали) не рисуются совсем. "
+                   "4: мелкие объекты, которые игра рисует пачками (мусор, мелкие предметы, растения), не рисуются. "
                    "Поднимает FPS в городе, где кадр держит процессор; на картинке пропадают эти тени. Меняется "
                    "сразу.",
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.potato_mode; },

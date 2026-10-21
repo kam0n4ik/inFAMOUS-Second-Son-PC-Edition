@@ -22,7 +22,7 @@ namespace SecondSon::Gpu::Potato {
 namespace {
 
 constexpr u32 kDbDepthView = 0xA002, kDbZInfo = 0xA010, kDbZWriteBase = 0xA014, kDbDepthSize = 0xA016;
-constexpr u32 kCbTargetMask = 0xA08E, kCbColor0Info = 0xA31C;
+constexpr u32 kCbTargetMask = 0xA08E, kCbColor0Info = 0xA31C, kCbBlend0Control = 0xA1E0;
 constexpr u32 kViewport0 = 0xA10F; ///< XSCALE, XOFFSET, YSCALE, YOFFSET
 
 std::atomic<u32> g_level{0};
@@ -162,13 +162,22 @@ bool Drop(const Cp::RegisterFile& regs, const Cp::DrawDescriptor& d) {
         return false;
     }
     if (!depth_only) {
-        // level 4: the world's small objects themselves - the engine's mesh draws (tagged: G-buffer and the other
-        // mesh passes; no full-screen pass is tagged) under 256 indices in all their instances. The main view has no
-        // depth pre-pass (no 1920-wide depth-only target), so nothing else needs the dropped draw.
-        const auto tag = static_cast<Engine::Render::DrawRuns::Source>(d.engine_run);
-        return level >= 4 && !d.indirect &&
-               (tag == Engine::Render::DrawRuns::Source::Mesh || tag == Engine::Render::DrawRuns::Source::GBuffer) &&
-               u64{d.index_count} * std::max<u32>(d.instance_count, 1) < 256;
+        // level 4: the world's small repeated objects themselves - only the G-buffer pass's instanced draws (tag
+        // GBuffer: debris, props, plants drawn many at once), into the G-buffer (3+ colour targets, the HUD and map
+        // draw into one), opaque (decals blend: kept), each instance under 64 triangles. A single low-poly mesh may be
+        // a large wall or sign: those are not instanced and stay. The main view has no depth pre-pass, so nothing
+        // else needs the dropped draw.
+        if (level < 4 || d.indirect || d.instance_count < 2 ||
+            static_cast<Engine::Render::DrawRuns::Source>(d.engine_run) != Engine::Render::DrawRuns::Source::GBuffer ||
+            d.index_count >= 192 || (regs.Get(kCbBlend0Control) & (1u << 30)) != 0) {
+            return false;
+        }
+        const u32 mask = regs.Get(kCbTargetMask);
+        u32 targets = 0;
+        for (u32 i = 0; i < 8; ++i) {
+            targets += ((mask >> (i * 4)) & 0xF) != 0 ? 1 : 0;
+        }
+        return targets >= 3;
     }
     if (width == 1024) {
         return true; // level 1: the spot light shadow atlases
