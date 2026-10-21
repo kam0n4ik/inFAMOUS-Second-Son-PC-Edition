@@ -282,6 +282,12 @@ private:
         bool hook_done = false, applied = false; ///< MemoryAcquired with P4.11's async_acquire (applied: writes found)
         bool prepared = false; ///< stage 2: the frontend's preparation below (a filtered draw has none)
         bool front_memo = false; ///< frontend thread: a guest memory change (memo) before this record
+        /// frontend thread: a processor write's deferred invalidation is due before this record (it never joins a run
+        /// held before it: the run's draws are recorded at its first draw, before the invalidation)
+        bool run_barrier = false;
+        /// front mode: a draw the frontend thread joined to the run before it (a journal record now) - thread 2 takes
+        /// it with the run's first draw (its registers after the run's draws)
+        bool joined = false;
         /// FrameBreak FB-6: the draw's VS / PS view was not copied - the same as the last copied one (thread 2 keeps it)
         bool vs_same = false, ps_same = false;
         u64 journal_end = 0;   ///< the journal applied up to here before it executes
@@ -314,7 +320,8 @@ private:
         const GS::StageView& Vs() const { return stage_shared != nullptr ? *stage_shared : stage; }
         const GS::StageView& Ps() const { return ps_shared != nullptr ? *ps_shared : ps; }
     };
-    static constexpr u32 kSlots = 1024; ///< records (power of two)
+    /// records (power of two; front mode: a run's every draw is a record too)
+    static constexpr u32 kSlots = 8192;
     static constexpr u32 kJournalWords = 1u << 22; ///< 16 MiB of register writes (power of two)
     enum JournalOp : u32 { kOpWrite = 1, kOpReset = 2, kOpLoad = 3, kOpPad = 15 };
 
@@ -511,7 +518,28 @@ private:
     /// The record can lead a run (prepared, VS+PS, a VS without an SRT walk taking its vertices from fetch tables, no
     /// memory writes); the draw `d` can join the held run (the reason it cannot, counted, otherwise).
     bool RunLeaderOk(const Record& r) const;
-    bool JoinRun(const Cp::DrawDescriptor& d);
+    /// The draw is tagged by an engine draw function whose runs are on (Phase 6: 0x1a1770 with GBUFFER_RUNS only)
+    bool RunTagged(const Cp::DrawDescriptor& d) const;
+    /// `regs`: the registers at the joining draw's packet (the processor's, or the frontend thread's replica)
+    bool JoinRun(const Cp::DrawDescriptor& d, const Cp::RegisterFile& regs);
+    /// The held run's first draw and whether one is held - thread 1's, or with the frontend thread that thread's
+    Record& RunLead() { return slots_[(fthread_mode_ ? f_run_lead_ : next_) & (kSlots - 1)]; }
+    bool RunHeld() const { return fthread_mode_ ? f_run_open_ : run_open_; }
+    // Fork port (front mode: SSPC_P53_FRONTEND_THREAD=1 with SSPC_CITY_ENGINE_OPT): thread 1 only parses the packets and
+    // publishes every draw; the frontend thread prepares them (GEOFAST included) and builds the runs - a held run's
+    // first draw is not published (fhead_ stays at it) while the draws after it join; a joined draw's record becomes a
+    // journal record (thread 2 replays its registers, its draw is recorded with the run's first).
+    bool f_run_open_ = false; ///< the frontend thread holds a run
+    u64 f_run_lead_ = 0;      ///< ... its first draw's record
+    bool pending_run_barrier_ = false; ///< thread 1: Record::run_barrier of the next record
+    /// 1 while thread 1 waits for thread 2 (a drain, backpressure: written by thread 1 only) - a held run is published
+    alignas(64) std::atomic<u32> f_flush_{0};
+    u64 f_hold_ticks_ = 0; ///< how long the frontend thread keeps a run held with no record to join (then publishes)
+    std::atomic<u64> f_run_joined_{0}, f_run_closed_idle_{0}, f_run_closed_flush_{0};
+    /// The frontend thread: record `index` (its registers applied) joins the held run - true: it is a journal record now
+    bool FrontTryJoin(Record& r, u64 index);
+    /// The frontend thread: the held run is complete - every record before `upto` published to thread 2
+    void FrontCloseRun(u64 upto);
     GS::ResourceBindingPlan run_plan_; ///< a joining draw's VS plan decoded again (its own constant buffers)
     std::atomic<u64> run_count_{0}, run_members_{0}, run_leaders_{0}, run_verified_{0}, run_mismatches_{0};
     std::array<std::atomic<u64>, 17> run_refused_{};
