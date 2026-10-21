@@ -2053,8 +2053,7 @@ void Executor::OcclusionResetSlots(const std::vector<u32>& slots) {
     }
 }
 
-bool Executor::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 stride) {
-    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb);
+bool Executor::ZpassShapeOk(u64 dst, u32 db_mask, u32 stride) {
     // SSPC_OCCLUSION=off: the earlier behaviour (every query reads as visible), for A/B
     static const bool off = [] {
         char v[16] = {};
@@ -2062,8 +2061,14 @@ bool Executor::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 str
     }();
     // 16-byte DB records {begin, end} for DBs 0..n-1 (the game: 8 or 16), in guest memory
     const u32 dbs = static_cast<u32>(std::popcount(db_mask));
-    if (off || stride != 16 || dbs == 0 || dbs > 16 || db_mask != (1u << dbs) - 1u || (dst & 7) != 0 ||
-        dst >= (1ull << 40)) {
+    return !off && stride == 16 && dbs != 0 && dbs <= 16 && db_mask == (1u << dbs) - 1u && (dst & 7) == 0 &&
+           dst < (1ull << 40);
+}
+
+bool Executor::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 stride) {
+    const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb);
+    const u32 dbs = static_cast<u32>(std::popcount(db_mask));
+    if (!ZpassShapeOk(dst, db_mask, stride)) {
         ++occ_refused_;
         return false;
     }

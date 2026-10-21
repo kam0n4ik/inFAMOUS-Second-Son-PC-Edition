@@ -273,7 +273,7 @@ public:
 
 private:
     enum class Kind : u8 { Draw, Dispatch, Journal, Stop, CacheAction, Fence, Dma, WaitMet, MemoryAcquired, Copy, Flip,
-                           RoundEnd, Write, Gds };
+                           RoundEnd, Write, Gds, Zpass };
     struct Record {
         Kind kind = Kind::Journal;
         bool memory_changed = false; ///< a guest memory change reported before it
@@ -303,7 +303,7 @@ private:
         u32 queue = 0;                       ///< WaitMet, MemoryAcquired, Copy
         std::vector<u8> payload;             ///< CP-9 Write: the data (capacity reused)
         Cp::DmaKind gds_kind{};              ///< CP-9 Gds (memory in src)
-        u32 gds_offset = 0, pattern = 0;
+        u32 gds_offset = 0, pattern = 0;     ///< Gds; Zpass: the DB mask, the stride
         u64 seq = 0, src = 0, dst = 0, bytes = 0; ///< Copy; MemoryAcquired: dst = the poll address, seq = met (TSC)
         // stage 2: the frontend's preparation, copied at the packet (the frontend's own state is the next command's)
         GS::DrawPreparation prep;
@@ -567,6 +567,8 @@ private:
     void* write_ctx_ = nullptr;
     void RunWrite(const Record& r);
     void RunGds(const Record& r);
+    void RunZpass(const Record& r);
+    u64 zpass_fallback_count_ = 0; ///< thread 2: the counts a refused queued query's DB records get (only growing)
     u64 writes_queued_ = 0;
     bool flush_at_fence_ = false;
     std::atomic<u64> write_fallbacks_{0};

@@ -363,6 +363,8 @@ public:
     static bool TimelineWriteShapeOk(u64 dst, u64 bytes) {
         return bytes != 0 && bytes <= 65536 && (dst & 3) == 0 && (bytes & 3) == 0 && dst < (1ull << 40);
     }
+    /// ... and what ZpassOnTimeline refuses so (SSPC_OCCLUSION=off, the DB records' layout)
+    static bool ZpassShapeOk(u64 dst, u32 db_mask, u32 stride);
     bool GdsShapeOk(Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes) const {
         return bytes != 0 && (gds_offset & 3) == 0 && (bytes & 3) == 0 && gds_.buffer != VK_NULL_HANDLE &&
                u64{gds_offset} + bytes <= gds_.size && (kind == Cp::DmaKind::DataToGds || memory < (1ull << 40)) &&

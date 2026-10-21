@@ -6,6 +6,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <exception>
 
@@ -1474,6 +1475,7 @@ void ParallelCp::FrontStep(Record& r, u64 index) {
         break;
     case Kind::Copy:
     case Kind::Write:
+    case Kind::Zpass:
         AddGpuWrite(r.dst, r.dst + r.bytes, index, kLookup); // (until thread 2 recorded it: the frontend's reads wait)
         break;
     case Kind::Gds:
@@ -1675,6 +1677,32 @@ void ParallelCp::RunGds(const Record& r) {
     exec_.CompleteRefusedWork(r.queue, r.seq);
 }
 
+void ParallelCp::RunZpass(const Record& r) {
+    const u32 db_mask = r.gds_offset, stride = r.pattern;
+    if (exec_.ZpassOnTimeline(r.queue, r.seq, r.dst, db_mask, stride)) {
+        return;
+    }
+    // refused when it ran (an import): what the processor does after a refusal - every DB record gets a count that
+    // only grows (the query reads as visible), here in stream order
+    exec_.Synchronize(r.queue);
+    zpass_fallback_count_ += 0x10000;
+    const u64 value = zpass_fallback_count_ | (1ull << 63);
+    bool ok = write_fallback_ != nullptr;
+    for (u32 db = 0; db < 16 && ok; ++db) {
+        if ((db_mask >> db & 1) != 0) {
+            ok = write_fallback_(write_ctx_, r.dst + u64{db} * stride, &value, sizeof(value));
+        }
+    }
+    if (!ok) {
+        SSPC_LOG(GPU, Error, "parallel command processor: a queued occlusion query's counts at {:#x} could be neither "
+                             "recorded nor written by the CPU (its work completes)", r.dst);
+    } else {
+        exec_.GuestMemoryChanged();
+    }
+    write_fallbacks_.store(write_fallbacks_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    exec_.CompleteRefusedWork(r.queue, r.seq);
+}
+
 void ParallelCp::RunCopy(const Record& r) {
     const u32 every = ForcedCopyFallbackEvery();
     const bool forced = every != 0 && ++forced_fallback_n_ % every == 0;
@@ -1851,6 +1879,9 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
             break;
         case Kind::Gds:
             RunGds(r);
+            break;
+        case Kind::Zpass:
+            RunZpass(r);
             break;
         case Kind::RoundEnd:
             // CP-9: what the loop does after a drained round end - a held fence's batch submitted, completed batches
@@ -2544,6 +2575,31 @@ bool ParallelCp::WriteOnTimeline(u32 queue, u64 seq, u64 dst, const void* data, 
 }
 
 bool ParallelCp::ZpassOnTimeline(u32 queue, u64 seq, u64 dst, u32 db_mask, u32 stride) {
+    if (async_writes_ && !async_gds_only_ && started_ && !Idle()) {
+        // CP-9 (SSPC_CP_ASYNC_WRITES=1): after the draws queued before it (the query's own draw among them) in stream
+        // order, as a queued timeline write (RunZpass: the CPU writes the counts there after a refusal)
+        if (!Vk::Executor::ZpassShapeOk(dst, db_mask, stride)) {
+            return false; // (the processor writes its counts, draining first - as the executor's refusal)
+        }
+        const u64 bytes = u64(std::popcount(db_mask)) * 16; // (the end's counts: within the begin's DB records)
+        Record& r = BeginRecord(Kind::Zpass);
+        r.queue = queue;
+        r.seq = seq;
+        r.dst = dst;
+        r.bytes = bytes;
+        r.gds_offset = db_mask;
+        r.pattern = stride;
+        ++writes_queued_;
+        queued_tw_.emplace_back(dst, dst + bytes);
+        qtw_lo_ = std::min(qtw_lo_, dst);
+        qtw_hi_ = std::max(qtw_hi_, dst + bytes);
+        if (frontend_ != nullptr && !fthread_mode_) {
+            AddGpuWrite(dst, dst + bytes, next_, kLookup);
+        }
+        PushRecord();
+        FrontMemoChanged();
+        return true;
+    }
     // after the draws queued before it (the query's own draw among them), as the executor records it
     Drain(DrainReason::TimelineWrite);
     const bool ok = exec_.ZpassOnTimeline(queue, seq, dst, db_mask, stride);
