@@ -262,7 +262,8 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
     // Backend::FrontendInvalidate - in stream order)
     async_acquire_ = options.async_acquire && async_ && frontend_ != nullptr;
     journal_changes_only_ = options.journal_changes_only;
-    async_flip_ = options.async_flip && frontend_ != nullptr && !fthread_mode_;
+    // (front mode: the frontend thread begins the frontend's frame when it passes the flip record - FrontStep)
+    async_flip_ = options.async_flip && frontend_ != nullptr;
     if (char v[16] = {}; frontend_ != nullptr && !fthread_mode_ &&
                          GetEnvironmentVariableA("SSPC_FB_STAGE_REUSE", v, sizeof(v)) > 0) {
         stage_reuse_ = std::string_view(v) == "verify" ? 2 : v[0] == '1' ? 1 : 0;
@@ -1483,6 +1484,9 @@ void ParallelCp::FrontStep(Record& r, u64 index) {
             AddGpuWrite(r.src, r.src + r.bytes, index, kLookup); // (SSPC_CP_ASYNC_WRITES: as a queued copy)
         }
         break;
+    case Kind::Flip:
+        frontend_->NewFrame(); // (SSPC_CP_ASYNC_FLIP: the frontend's frame begins at the marker, in stream order)
+        break;
     default:
         break;
     }
@@ -2514,7 +2518,9 @@ void ParallelCp::Flip(const Cp::FlipMarker& marker) {
         }
         ++t1_.queued_flips;
         PushRecord();
-        frontend_->NewFrame();
+        if (!fthread_mode_) {
+            frontend_->NewFrame();
+        }
         return;
     }
     Drain(DrainReason::Flip);
