@@ -131,19 +131,29 @@ bool Describe(u64 material, u64 r, u64 records, u64 n, u64 mesh, DrawDescription
 /// other memory - L[12] (cue+0x78), L[4] (cue+0xc120+stage*8) - and the dwords L[13]/L[14]/L[15] are not in it.
 inline constexpr u32 kMaxShadowDwords = 512;
 inline constexpr u32 kShadowPointers = 7;
-struct StageShadow {
+/// (N: the copy's capacity in dwords - StageShadow's 512 for the G-buffer ring, CompactStageShadow's for R10's)
+template <u32 N>
+struct StageShadowOf {
+    static constexpr u32 kCapacity = N;
     u64 layout = 0;   ///< L: the stage's layout (the CUE's per-shader user-data layout)
     u16 dwords = 0;   ///< L[0]: the dwords the commit copies (0: an empty layout - its registers are direct entries)
-    bool captured = false; ///< false: no layout, or more than kMaxShadowDwords
+    bool captured = false; ///< false: no layout, or more than N dwords
     std::array<u8, kShadowPointers> reg{};   ///< the user-data register given the copy + off[i] dwords (0xff: none)
     std::array<u16, kShadowPointers> off{};
-    std::array<u32, kMaxShadowDwords> shadow{}; ///< [0, dwords): the copy the stage's registers point into
+    std::array<u32, N> shadow{}; ///< [0, dwords): the copy the stage's registers point into
 };
+using StageShadow = StageShadowOf<kMaxShadowDwords>;
+/// R10 (SSPC_R10_NATIVE_DRAWS, engine/render/draw_runs.h): the shadow casters' and mesh draws' CUE state, in a ring of
+/// smaller slots (a layout of more dwords is not captured: those draws take the full path).
+inline constexpr u32 kCompactShadowDwords = 224; // (R10: the most seen in the city 216)
+using CompactStageShadow = StageShadowOf<kCompactShadowDwords>;
 /// Capture `stage`'s (VS 2, PS 1) CUE state of context `r` into `out`; false when it has no layout or too many dwords.
 bool CaptureStage(u64 r, u32 stage, StageShadow& out);
+bool CaptureStage(u64 r, u32 stage, CompactStageShadow& out);
 /// CaptureStage so far: [0] no layout (refused), [1] an empty layout (captured: nothing copied), [2] more than
-/// kMaxShadowDwords (refused); [3] the most dwords a layout had.
+/// kMaxShadowDwords (refused); [3] the most dwords a layout had. (The compact captures: CompactCaptureRefusals.)
 std::array<u64, 4> CaptureRefusals();
+std::array<u64, 4> CompactCaptureRefusals();
 
 /// Set the module base and the pure callees Describe needs (0x45f590, 0x61e260, 0x27530) if Prepare() has not already;
 /// a lighter setup than Prepare for the Native Engine G-buffer path, which uses no recording clones.

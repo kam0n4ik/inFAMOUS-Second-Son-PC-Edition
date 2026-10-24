@@ -13,6 +13,7 @@
 // registers and preparation (parallel_cp.h, SSPC_CITY_ENGINE_OPT).
 #pragma once
 
+#include <array>
 #include <atomic>
 
 #include "base/abi.h"
@@ -66,6 +67,24 @@ const EngineDraw* EngineDescPeek(u32 seq);
 bool EngineDescStill(u32 seq);
 /// Engine-descriptor capture is on (SSPC_NATIVE_GBUFFER set and the reconstruction's pure callees are ready).
 bool EngineDescOn();
+/// R10 (SSPC_R10_NATIVE_DRAWS=verify|guarded|native, off by default; docs/R10_CP.md): the shadow casters' (0x43d480) and
+/// mesh (0x1a1960) draws' VS / PS CUE state at their commit, captured after the engine's call as for 0x1a1770 (the
+/// same commit 0x14ad0 runs right before their drawIndex), into a ring of its own with smaller slots
+/// (CompactStageShadow; SSPC_R10_NATIVE_DRAWS_SOURCES=shadow|mesh|shadow,mesh, both by default). The tag carries
+/// kNativeDesc and nop[3] the sequence as for the G-buffer; the source in the tag tells which ring it is.
+struct EngineStages {
+    NativeEngine::Reconstructed::GBufferDraw::CompactStageShadow vs, ps;
+};
+const EngineStages* StagesPeek(u32 seq);
+bool StagesStill(u32 seq);
+/// The capture is on for draws of `source` (Source::Mesh / Source::Shadow).
+bool StagesOn(Source source);
+/// R10: the captures so far by source (Mesh, Shadow): made; the stages not captured (no layout / too many dwords);
+/// the game threads' ticks spent capturing (CaptureStage x2 + the ring write).
+struct StagesCounters {
+    std::array<u64, 2> made{}, refused{}, ticks{};
+};
+StagesCounters StagesStats();
 /// The tag carries kMaterialChanged.
 inline bool MaterialChangedOf(const u32* nop) {
     return nop[0] == kTrailingNopHeader && nop[1] == kRunMagic && (nop[2] & kMaterialChanged) != 0;

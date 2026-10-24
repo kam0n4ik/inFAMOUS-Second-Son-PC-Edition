@@ -14,6 +14,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include <intrin.h>
 #include <windows.h>
 
 #include "base/log.h"
@@ -43,6 +44,23 @@ constexpr u32 kDescRingMask = kDescRingSize - 1;
 std::unique_ptr<DescSlot[]> g_desc_ring;
 std::atomic<u64> g_desc_head{0};
 bool g_desc_on = false; ///< capture installed (SSPC_NATIVE_GBUFFER and the pure callees ready)
+
+// R10 (SSPC_R10_NATIVE_DRAWS): the shadow casters' and mesh draws' CUE state, the same seqlock scheme. These draws come
+// from several game threads (the shadow cascades' jobs), ~9 000 a frame in the city: 32768 slots of ~1 KiB hold more
+// than three frames of them.
+struct StagesSlot {
+    std::atomic<u64> seq{~0ull};
+    EngineStages draw;
+};
+constexpr u32 kStagesRingBits = 15;
+constexpr u32 kStagesRingMask = (1u << kStagesRingBits) - 1;
+std::unique_ptr<StagesSlot[]> g_stages_ring;
+std::atomic<u64> g_stages_head{0};
+std::array<bool, 2> g_stages_on{}; ///< by source - 1 (Mesh, Shadow)
+struct alignas(64) StagesCount {
+    std::atomic<u64> made{0}, refused{0}, ticks{0};
+};
+std::array<StagesCount, 2> g_stages_count{};
 
 // the same sites as the draw census (draw_census.cpp): prologues checked in Ghidra, bodies pinned by hash
 constexpr ProbeSite kSites[3] = {
@@ -199,6 +217,28 @@ SSPC_SYSV_ABI void Probe(u64 a, u64 r, u64 c, u64 d, u64 e, u64 f) {
                 tag |= kNativeDesc;
             }
         }
+    } else {
+        // R10 (SSPC_R10_NATIVE_DRAWS): 0x1a1960 / 0x43d480 - their commit 0x14ad0 ran right before their drawIndex, so the
+        // CUE shadows now are what the stages' registers point into (as for 0x1a1770, gbuffer_draw.h CaptureStage)
+        if (g_stages_on[I]) {
+            const u64 t0 = __rdtsc();
+            const u64 h = g_stages_head.fetch_add(1, std::memory_order_relaxed);
+            StagesSlot& s = g_stages_ring[h & kStagesRingMask];
+            s.seq.store(~0ull, std::memory_order_release); // being written: readers see it as stale
+            std::atomic_thread_fence(std::memory_order_release);
+            const bool vs = GDR::CaptureStage(r, 2, s.draw.vs);
+            const bool ps = GDR::CaptureStage(r, 1, s.draw.ps);
+            if (vs && ps) {
+                s.seq.store(h, std::memory_order_release); // published
+                desc_seq = static_cast<u32>(h);
+                have_desc = true;
+                tag |= kNativeDesc;
+                g_stages_count[I].made.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_stages_count[I].refused.fetch_add(1, std::memory_order_relaxed);
+            }
+            g_stages_count[I].ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+        }
     }
     u32* const p1 = *cmd;
     // the trailing NOP of the draw this call wrote: the last 4 dwords, written by this call (in this chunk after p0,
@@ -263,6 +303,38 @@ bool EngineDescStill(u32 seq) {
     std::atomic_thread_fence(std::memory_order_acquire);
     const u64 seq2 = g_desc_ring[seq & kDescRingMask].seq.load(std::memory_order_relaxed);
     return static_cast<u32>(seq2) == seq && seq2 != ~0ull; // not overwritten while it was read
+}
+
+const EngineStages* StagesPeek(u32 seq) {
+    if (g_stages_ring == nullptr) {
+        return nullptr;
+    }
+    const StagesSlot& s = g_stages_ring[seq & kStagesRingMask];
+    const u64 seq1 = s.seq.load(std::memory_order_acquire);
+    if (static_cast<u32>(seq1) != seq || seq1 == ~0ull) {
+        return nullptr; // the slot holds another draw now (or is being written)
+    }
+    return &s.draw;
+}
+
+bool StagesStill(u32 seq) {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const u64 seq2 = g_stages_ring[seq & kStagesRingMask].seq.load(std::memory_order_relaxed);
+    return static_cast<u32>(seq2) == seq && seq2 != ~0ull; // not overwritten while it was read
+}
+
+bool StagesOn(Source source) {
+    return (source == Source::Mesh && g_stages_on[0]) || (source == Source::Shadow && g_stages_on[1]);
+}
+
+StagesCounters StagesStats() {
+    StagesCounters c;
+    for (u32 i = 0; i < 2; ++i) {
+        c.made[i] = g_stages_count[i].made.load(std::memory_order_relaxed);
+        c.refused[i] = g_stages_count[i].refused.load(std::memory_order_relaxed);
+        c.ticks[i] = g_stages_count[i].ticks.load(std::memory_order_relaxed);
+    }
+    return c;
 }
 
 bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
@@ -346,6 +418,22 @@ bool InstallFromEnvironment(u64 eboot_base, bool native_backend) {
                                       "vertex streams, draw constants) and its VS/PS CUE state at the commit captured "
                                       "for the command processor's native path", ng);
         }
+    }
+    // R10 (SSPC_R10_NATIVE_DRAWS): the shadow casters' and mesh draws' CUE state for the command processor (draw_runs.h)
+    if (char nd[16] = {}; GetEnvironmentVariableA("SSPC_R10_NATIVE_DRAWS", nd, sizeof(nd)) > 0 && nd[0] != '0' &&
+                          std::string_view(nd) != "off") {
+        char srcs[32] = {};
+        const DWORD k = GetEnvironmentVariableA("SSPC_R10_NATIVE_DRAWS_SOURCES", srcs, sizeof(srcs));
+        const std::string_view sv = k > 0 && k < sizeof(srcs) ? std::string_view(srcs, k) : std::string_view("shadow,mesh");
+        g_stages_on[0] = sv.find("mesh") != std::string_view::npos;
+        g_stages_on[1] = sv.find("shadow") != std::string_view::npos;
+        if (g_stages_on[0] || g_stages_on[1]) {
+            g_stages_ring = std::make_unique<StagesSlot[]>(size_t{1} << kStagesRingBits);
+        }
+        SSPC_LOG(Engine, Warning, "EXPERIMENT: SSPC_R10_NATIVE_DRAWS={} - the VS/PS CUE state at the commit of the {}{}{} "
+                                  "captured for the command processor's engine-state preparation (no SRT walk)", nd,
+                 g_stages_on[1] ? "shadow casters' draws 0x43d480" : "", g_stages_on[0] && g_stages_on[1] ? " and the " : "",
+                 g_stages_on[0] ? "mesh draws 0x1a1960" : "");
     }
     SSPC_LOG(Engine, Warning, "EXPERIMENT: SSPC_CITY_ENGINE_OPT={} - the engine's mesh draws (0x1a1960) and shadow casters' "
                               "draws (0x43d480){} tagged for the command processor's runs", v,

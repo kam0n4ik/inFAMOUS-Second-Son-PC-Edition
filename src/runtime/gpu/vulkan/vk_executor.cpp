@@ -3197,7 +3197,7 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
                           .pBufferInfo = nullptr});
     }
     // images
-    const bool gb_parts = !compute && CpProfile::On() && (CpProfile::t_source & 3) == 3; // (R8: a 0x1a1770 draw's parts)
+    const bool gb_parts = !compute && CpProfile::PartsSource(); // (R8: a 0x1a1770 draw's parts; R10: SSPC_R10_T2_PARTS)
     if (gb_parts) {
         CpProfile::Enter(CpProfile::Sec::T2GbBindImages);
     }
@@ -4968,7 +4968,7 @@ bool FitMovieCoords(u64 address, u64 size, float v_end) {
 /// a time, the last one left at the record's end (any return)
 class GBufferRecordStages {
 public:
-    GBufferRecordStages() : on_(CpProfile::On() && (CpProfile::t_source & 3) == 3) { // (3: DrawRuns::Source::GBuffer)
+    GBufferRecordStages() : on_(CpProfile::PartsSource()) { // (3: DrawRuns::Source::GBuffer; SSPC_R10_T2_PARTS)
         if (on_) {
             CpProfile::Enter(CpProfile::Sec::T2GbHead);
         }
