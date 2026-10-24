@@ -149,6 +149,19 @@ void Timeline::SubmittedOnLane(u64 value) {
     lane_pending_.push_back(value);
 }
 
+bool Timeline::MainReached(u64 value) const {
+    if (!main_free_ || lane_ == VK_NULL_HANDLE) {
+        return false;
+    }
+    {
+        const std::lock_guard lock{lane_mu_};
+        if (OnLaneLocked(value)) {
+            return false;
+        }
+    }
+    return QueryMain() >= value;
+}
+
 u64 Timeline::QueryMain() const {
     u64 v = 0;
     return Fn().vkGetSemaphoreCounterValue(ctx_.Device(), semaphore_, &v) == VK_SUCCESS ? v : 0;
@@ -163,6 +176,15 @@ u64 Timeline::DenseLocked(u64 main, u64 lane) const {
     // the main semaphore's value: every batch up to it completed (a main batch waited for the lane's earlier ones);
     // above it, the run of lane values the lane completed that follow one another
     u64 v = std::max(main, completed_.load(std::memory_order_acquire));
+    if (main_free_) {
+        // R10 (SetMainFree): a main batch need not have waited for the lane's earlier ones - below the lane's first
+        // value not completed (the lane completes in its order: the values up to `lane` did; never below what was
+        // seen: those values were complete then)
+        const auto first = std::upper_bound(lane_pending_.begin(), lane_pending_.end(), lane);
+        if (first != lane_pending_.end() && *first <= v) {
+            v = std::max(*first - 1, completed_.load(std::memory_order_acquire));
+        }
+    }
     auto it = std::upper_bound(lane_pending_.begin(), lane_pending_.end(), v);
     while (it != lane_pending_.end() && *it == v + 1 && *it <= lane) {
         v = *it++;

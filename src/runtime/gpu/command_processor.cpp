@@ -2252,13 +2252,90 @@ bool WaitHolds(u32 function, u32 v, u32 ref) {
 }
 } // namespace
 
-bool CommandProcessor::HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 ref, u32* by_queue) const {
+/// R10 pacing (docs/R10_PACING.md): SSPC_R10_AQ_HELD_EXACT=1 - a WAIT_REG_MEM met by held fences is met by the earliest
+/// of them from which on every held write there meets it, and the work after the wait is ordered behind the batch with
+/// that fence's work (FrameBreak AQ: else behind the last batch with the fence queue's work - the whole graphics frame
+/// the processor got through, when it is ahead of the GPU).
+bool CommandProcessor::R10HeldExact() {
+    static const bool on = [] {
+        char v[4] = {};
+        const bool o = GetEnvironmentVariableA("SSPC_R10_AQ_HELD_EXACT", v, sizeof(v)) == 1 && v[0] == '1';
+        if (o) {
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R10_AQ_HELD_EXACT=1 - a wait met by held fences goes after the batch "
+                                   "of the earliest fence meeting it, not after the fence queue's last batch");
+        }
+        return o;
+    }();
+    return on;
+}
+
+/// R10 diagnostics: SSPC_R10_DIAG_HELD=1 - the first waits met by held fences, each with every held fence there.
+bool CommandProcessor::R10HeldDiag() {
+    static const bool on = [] {
+        char v[4] = {};
+        const bool o = GetEnvironmentVariableA("SSPC_R10_DIAG_HELD", v, sizeof(v)) == 1 && v[0] == '1';
+        if (o) {
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_R10_DIAG_HELD=1 - waits met by held fences logged (the first 300)");
+        }
+        return o;
+    }();
+    return on;
+}
+
+void CommandProcessor::R10LogHeldWait(const Queue& q, u64 poll, u32 function, u32 mask, u32 ref, u32 by_queue,
+                                      u64 chosen_seq) const {
+    // (only the waits met by another queue's fence - the first 300 of them, and every 64th after those up to 300 more:
+    // the measured window is a minute in)
+    if (by_queue == q.id) {
+        return;
+    }
+    static std::atomic<u32> seen{0};
+    static std::atomic<u32> logged{0};
+    const u32 k = seen.fetch_add(1, std::memory_order_relaxed);
+    if (k >= 300 && (k % 64) != 0) {
+        return;
+    }
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 600) {
+        return;
+    }
+    std::string held;
+    const Queue* fq = Q(by_queue);
+    u32 later = 0, met_index = ~0u;
+    if (fq != nullptr) {
+        for (u32 i = 0; i < fq->fence_count; ++i) {
+            const FenceOp& f = fq->fences[(fq->fence_head + i) % kMaxFences];
+            if (f.addr == poll || (f.data_sel == 2 && f.addr + 4 == poll)) {
+                held += fmt::format(" [{} sel {} data {:#x} after {}{}]", f.kind == FenceKind::EndOfShader ? "eos" : "rel",
+                                    f.data_sel, f.addr == poll ? static_cast<u32>(f.data) : static_cast<u32>(f.data >> 32),
+                                    f.after_seq, f.after_seq == chosen_seq ? " *" : "");
+                if (f.after_seq == chosen_seq) {
+                    met_index = i;
+                }
+            }
+        }
+        for (u32 i = met_index == ~0u ? fq->fence_count : met_index + 1; i < fq->fence_count; ++i) {
+            ++later; // (the queue's held fences after the meeting one, at any address)
+        }
+    }
+    u32 now = 0;
+    (void)options_.memory->Read(poll, &now, sizeof(now));
+    SSPC_LOG(GPU, Info, "R10 held wait #{} tsc {}: queue {} waits [{:#x}] func {} mask {:#x} ref {:#x} (memory {:#x}); "
+             "met by queue {} (its work {}, done {}; held fences {}, {} after the meeting one), its held fences there:{}",
+             k, __rdtsc(), q.id, poll, function, mask, ref, now,
+             by_queue, fq ? fq->work_seq : 0, fq ? fq->work_done : 0, fq ? fq->fence_count : 0, later, held);
+}
+
+bool CommandProcessor::HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 ref, u32* by_queue, u64* after_seq,
+                                          bool earliest) const {
     for (u32 id = 0; id < kNumQueues; ++id) {
         const Queue* qp = Q(id);
         if (qp == nullptr || qp->fence_count == 0) {
             continue;
         }
         // the queue's last held fence to that address is the value its memory keeps once they all completed
+        // (R10 `earliest`: going back from it, the earliest of the held writes there that all meet the wait - from its
+        // completion on, the memory meets it whatever completes after)
+        const FenceOp* met = nullptr;
         for (u32 i = qp->fence_count; i-- > 0;) {
             const FenceOp& f = qp->fences[(qp->fence_head + i) % kMaxFences];
             u32 v = 0;
@@ -2284,12 +2361,21 @@ bool CommandProcessor::HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 
                 continue;
             }
             if (WaitHolds(function, v & mask, ref)) {
-                if (by_queue != nullptr) {
-                    *by_queue = id;
+                met = &f;
+                if (earliest) {
+                    continue; // (an earlier write there may meet it too)
                 }
-                return true;
             }
-            break; // the queue's last write there does not meet it
+            break; // the queue's last write there does not meet it (`earliest`: the one before the run that does)
+        }
+        if (met != nullptr) {
+            if (by_queue != nullptr) {
+                *by_queue = id;
+            }
+            if (after_seq != nullptr) {
+                *after_seq = met->after_seq;
+            }
+            return true;
         }
     }
     return false;
@@ -2400,13 +2486,18 @@ StepStatus CommandProcessor::WaitRegMem(Queue& q, u64 addr, std::span<const u32>
                 .count());
     };
     u32 by_queue = ~0u;
+    u64 held_seq = 0;
     if (!ok && memory && options_.waits_by_held_fences && options_.work != nullptr &&
-        HeldFenceSatisfies(key, function, b[4], ref, &by_queue)) {
+        HeldFenceSatisfies(key, function, b[4], ref, &by_queue, &held_seq, R10HeldExact())) {
         // met in the GPU's order: the work before the fence is already handed on (P4.6); (FrameBreak AQ: the fence's
-        // queue + 1 in the upper half - the executor orders the work after it behind that queue's batch)
+        // queue + 1 in the upper half - the executor orders the work after it behind that queue's batch; R10: behind
+        // the batch with the meeting fence's own work)
         ok = true;
         ++stats_.waits_met_held;
-        options_.work->WaitMetByHeldFence(q.id | ((by_queue + 1) << 16));
+        if (R10HeldDiag()) {
+            R10LogHeldWait(q, key, function, b[4], ref, by_queue, held_seq);
+        }
+        options_.work->WaitMetByHeldFence(q.id | ((by_queue + 1) << 16), R10HeldExact() ? held_seq : 0);
     }
     if (!ok) {
         if (!q.blocked) {

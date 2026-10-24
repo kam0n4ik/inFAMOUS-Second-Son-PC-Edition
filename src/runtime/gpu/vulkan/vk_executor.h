@@ -182,6 +182,13 @@ struct ExecutorStats {
     u64 aq_lane_batches = 0, aq_main_batches = 0, aq_splits = 0, aq_wait_conflict = 0, aq_wait_images = 0,
         aq_wait_all = 0, aq_wait_shared = 0, aq_free = 0, aq_kept_main = 0, aq_out_of_order = 0;
     u64 aq_lane_gpu_ns = 0, aq_overlap_ns = 0;
+    /// R10 SSPC_R10_AQ_HELD_EXACT: waits met by held fences ordered behind the fence's own batch, of them behind an
+    /// earlier batch than the fence queue's last, or with that work already complete
+    u64 r10_held_exact = 0, r10_held_earlier = 0, r10_held_complete = 0;
+    /// R10 SSPC_R10_AQ_MAIN_FREE: main batches submitted with lane batches in flight before them, of them waiting for
+    /// one (a conflict, the lane batch's images/unknown accesses, a guest wait met by a lane fence) or none
+    u64 r10_main_free_batches = 0, r10_main_wait_conflict = 0, r10_main_wait_images = 0, r10_main_wait_sync = 0,
+        r10_main_wait_order = 0, r10_main_free = 0;
     std::string first_skip[static_cast<size_t>(Skip::Count)];
 };
 
@@ -318,7 +325,7 @@ public:
     bool GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
                        u32 pattern) override;
     void MemoryAcquired(u32 queue, bool blocked, u64 poll_address) override;
-    void WaitMetByHeldFence(u32 queue) override;
+    void WaitMetByHeldFence(u32 queue, u64 after_seq) override;
     /// What MemoryAcquired runs: the backend applies the guest's CPU writes seen so far to the caches (true: some).
     void SetAcquireHook(bool (*hook)(void*), void* ctx) {
         acquire_hook_ = hook;
@@ -458,6 +465,7 @@ private:
         // P4.12 stall trace: the submission (TSC before the queue's lock, after vkQueueSubmit2), the frame recorded in
         u64 submit_t0 = 0, submit_t1 = 0;
         u32 trace_frame = 0;
+        u64 open_t = 0; ///< R10: TSC of its Begin (stall trace on)
         // FrameBreak AQ (SSPC_FB_ASYNC_COMPUTE): the queue it went to (0 main, 1 the async compute lane) and what its
         // commands touched, for a later lane batch's decision whether to wait for it
         u8 lane = 0;
@@ -1242,11 +1250,24 @@ private:
     u32 aq_marker_next_ = 1;
     void AqMarkersReport(std::string& out);
     u64 aq_next_wait_main_ = 0;    ///< a held fence's main batch for the next batch (none open at the wait)
+    /// R10 pacing (SSPC_R10_AQ_MAIN_FREE=1, docs/R10_PACING.md): a main batch waits only for the lane batches it
+    /// conflicts with (as a lane batch for the main ones), the lane batches with images or accesses of unknown extent,
+    /// and for each guest queue with work in it the lane batch a wait of that queue was met by (r10_q_sync_: the highest
+    /// such value per waiting queue; a lane batch completes after the ones before it) - not for every lane batch before
+    /// it. The guest's queues run beside one another on the GPU and are ordered only by their own waits (labels, the
+    /// CPU); a compute queue's wait for its own work on the lane orders only that queue's later work.
+    bool r10_main_free_ = false;
+    std::array<u64, Cp::kNumQueues> r10_q_sync_{};
+    /// R10: the last lane batch with each guest queue's work - a main batch with work of that queue waits for it (the
+    /// queue's own order: its commands after the lane's, whatever ranges were noted)
+    std::array<u64, Cp::kNumQueues> r10_q_lane_{};
     struct AqLast {
         u64 value = 0;
         u8 lane = 0;
     };
     std::array<AqLast, Cp::kNumQueues> aq_q_last_{}; ///< the batch each guest queue's work was recorded in last
+    /// R10: the batch a held fence's work (`after_seq` of the queue) is in (aq_q_last_ when 0; {} when complete)
+    AqLast AqFenceBatch(u32 fence_q, u64 after_seq);
     u64 aq_last_lane_ = 0, aq_last_main_ = 0; ///< the last values submitted on each
     struct AqInterval {
         u64 begin = 0, end = 0; ///< GPU timestamps

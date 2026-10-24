@@ -441,7 +441,7 @@ const char* EvName(Ev e) {
         "PipelineCreate", "ShaderTranslate", "FlipAcquire", "CopyFallback", "VblankWait", "NotReady", "Present",
         "PresentFence", "PresentAcquire", "PresentSubmit", "GameSubmitLock", "GameIdleWait", "GameSubmitFlip",
         "GameSubmitFrame", "GameComputeWait", "GameSubmitDone", "GameDingDong", "FenceHeld", "FenceWrite",
-        "GameEarlySubmit", "CpQueueSlice",
+        "GameEarlySubmit", "CpQueueSlice", "AqSubmit",
     };
     static_assert(std::size(kNames) == kEvents);
     const size_t i = static_cast<size_t>(e);
@@ -516,7 +516,7 @@ void RegisterThread(Role role) {
     }
 }
 
-void GpuBatch(u64 value, u64 submit_t0, u64 submit_t1, u64 gpu_t0, u64 gpu_t1, u32 frame) {
+void GpuBatch(u64 value, u64 submit_t0, u64 submit_t1, u64 gpu_t0, u64 gpu_t1, u32 frame, u32 flags) {
     if ((detail::g_mode.load(std::memory_order_relaxed) & 3) == 0) {
         return;
     }
@@ -545,7 +545,7 @@ void GpuBatch(u64 value, u64 submit_t0, u64 submit_t1, u64 gpu_t0, u64 gpu_t1, u
     g.gpu_last_frame = frame;
     if (Deep() && InWindow(submit_t0, submit_t1)) {
         if (g.batches.size() < g.batches.capacity()) {
-            g.batches.push_back({value, submit_t0, submit_t1, gpu_t0, gpu_t1, frame, 0});
+            g.batches.push_back({value, submit_t0, submit_t1, gpu_t0, gpu_t1, frame, flags});
         } else {
             ++g.batches_dropped;
         }

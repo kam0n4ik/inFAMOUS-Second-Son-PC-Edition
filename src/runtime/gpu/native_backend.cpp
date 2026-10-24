@@ -328,7 +328,9 @@ public:
 
     // ---- VideoOut::Sink (the present thread)
     bool Ready(u64 value) override {
-        return value == 0 || (timeline_ && timeline_->Completed() >= value);
+        // (R10 SSPC_R10_AQ_MAIN_FREE: a flip's main batch and the main batches before it - lane batches before it are
+        // the guest's async compute, ordered before the frame only where the game waits for it)
+        return value == 0 || (timeline_ && (timeline_->Completed() >= value || timeline_->MainReached(value)));
     }
     bool WaitReady(u64 value, u64 timeout_ns) override {
         return value == 0 || (timeline_ && timeline_->Wait(value, timeout_ns));
@@ -2509,6 +2511,19 @@ std::string Backend::Report() {
                                    es.aq_wait_conflict, es.aq_wait_images, es.aq_wait_all, es.aq_wait_shared,
                                    es.aq_out_of_order, static_cast<double>(es.aq_lane_gpu_ns) / 1e6,
                                    static_cast<double>(es.aq_overlap_ns) / 1e6);
+                if (es.r10_main_free_batches != 0) {
+                    out += fmt::format("R10 main batches with lane work before them (SSPC_R10_AQ_MAIN_FREE): {}, waiting "
+                                       "for a lane batch - a range/GDS/LDS conflict {}, the lane's images/unknown "
+                                       "accesses {}, a wait met by a lane fence (or an unknown one) {}, its queues' "
+                                       "own order {}; free {}\n",
+                                       es.r10_main_free_batches, es.r10_main_wait_conflict, es.r10_main_wait_images,
+                                       es.r10_main_wait_sync, es.r10_main_wait_order, es.r10_main_free);
+                }
+                if (es.r10_held_exact != 0) {
+                    out += fmt::format("R10 held fence waits ordered behind the fence's own batch (SSPC_R10_AQ_HELD_EXACT): "
+                                       "{}, of them behind an earlier batch than the queue's last {}, already complete {}\n",
+                                       es.r10_held_exact, es.r10_held_earlier, es.r10_held_complete);
+                }
             }
         }
         out += fmt::format("barriers kept by ranges: off {}, unknown write pending {}, own unknown access {}, too many "
