@@ -27,6 +27,7 @@
 #include "engine/render/render_layout.h"
 #include "runtime/gpu/critical_compute.h"
 #include "runtime/gpu/gnm/gnm_driver.h"
+#include "runtime/gpu/r11/label_wait.h"
 #include "runtime/gpu/stall_trace.h"
 
 namespace SecondSon::Engine::Render::Trace {
@@ -77,6 +78,9 @@ SubmitFrameFn g_submit = nullptr;
 bool g_lifecycle = false; ///< P5.4: SubmitFrame's span goes to the stall trace (SSPC_P54_FRAME_TRACE=1)
 bool g_critical = false;  ///< CC-2: the async compute wait counts its blocked waits (SSPC_CC_CRITICAL=1)
 bool g_wait_hooked = false; ///< the async compute wait 0x1695e0 is replaced (by the lifecycle trace or CC-2)
+bool g_label_wait = false;  ///< R11: the wait sleeps on its label (SSPC_R11_LABEL_WAIT=1, runtime/gpu/r11/label_wait.h)
+u32 g_label_spin_us = 20;   ///< ... after spinning this long (SSPC_R11_LABEL_WAIT_SPIN_US)
+std::atomic<u64> g_label_waits{0};
 void SubmitFrameTimed(u8* frame, u32 flags);
 ResetFn g_reset = nullptr;
 ReserveFn g_reserve = nullptr;
@@ -666,7 +670,19 @@ SSPC_SYSV_ABI void ComputeWaitHook(u8* queue) {
             Gpu::CriticalCompute::Begin(); // (CC-2: the processor serves the compute queues first meanwhile)
         }
         waited = 1;
-        g_delay(50);
+        if (g_label_wait) {
+            Gpu::LabelWait::Sleep(label, target, g_label_spin_us); // (R11: asleep until the fence write lands)
+        } else {
+            g_delay(50);
+        }
+    }
+    if (g_label_wait && waited != 0) {
+        const u64 n = g_label_waits.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || n == 100 || n == 1000 || n == 10000 || n % 100000 == 0) {
+            const Gpu::LabelWait::Totals t = Gpu::LabelWait::Read();
+            SSPC_LOG(Engine, Info, "R11 label wait: {} blocked compute waits; sleeps {}, met while spinning {}, ended by "
+                     "the 1 ms timeout {}, woken by a fence write {}", n, t.sleeps, t.spins_met, t.timeouts, t.wakes);
+        }
     }
     if (waited != 0 && g_critical) {
         Gpu::CriticalCompute::End();
@@ -1009,6 +1025,36 @@ bool InstallDeferComputeWaitFromEnvironment(u64 eboot_base) {
                  "EXPERIMENT: SSPC_R9_REA3_SAFE_RESET=0 - REA-3 without its safe reset: the compute buffer may be reset "
                  "while its work is in flight (the hang after ~16 min; for A/B only)");
     }
+    return true;
+}
+
+bool InstallLabelWaitFromEnvironment(u64 eboot_base) {
+    if (Env("SSPC_R11_LABEL_WAIT") != "1") {
+        return true;
+    }
+    std::string error;
+    if (!g_wait_hooked) {
+        for (const GuestFunction& f : {kComputeWait, kDelay}) {
+            if (!VerifyGuestFunction(eboot_base, f, error)) {
+                SSPC_LOG(Engine, Error, "R11 label wait not installed: {}", error);
+                return false;
+            }
+        }
+        g_base = eboot_base;
+        g_delay = reinterpret_cast<DelayFn>(eboot_base + kDelay.rva);
+        if (!InstallJump(eboot_base + kComputeWait.rva, reinterpret_cast<const void*>(&ComputeWaitHook), error)) {
+            SSPC_LOG(Engine, Critical, "R11 label wait: {}", error);
+            std::abort();
+        }
+        g_wait_hooked = true;
+    }
+    g_label_spin_us = std::min<u32>(EnvU32("SSPC_R11_LABEL_WAIT_SPIN_US", 20), 1000);
+    g_label_wait = true;
+    Gpu::LabelWait::g_on.store(true, std::memory_order_release);
+    SSPC_LOG(Engine, Warning,
+             "EXPERIMENT: SSPC_R11_LABEL_WAIT=1 - the async compute wait 0x1695e0 replaced by the same loop that spins "
+             "{} us with PAUSE, then sleeps on its label (WaitOnAddress, woken by the command processor's fence write, "
+             "1 ms at most) instead of the game's rdtsc spin delay(50)", g_label_spin_us);
     return true;
 }
 

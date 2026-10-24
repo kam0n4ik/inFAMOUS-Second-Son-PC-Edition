@@ -881,6 +881,8 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         Engine::Render::Trace::InstallEarlySubmitFromEnvironment(linker.GetModule(eboot_index)->Base());
         // (REA-3: the gate goes through SecondSonPC's Gnm driver too)
         Engine::Render::Trace::InstallDeferComputeWaitFromEnvironment(linker.GetModule(eboot_index)->Base());
+        // (R11: the labels' wake-ups come from SecondSonPC's command processor)
+        Engine::Render::Trace::InstallLabelWaitFromEnvironment(linker.GetModule(eboot_index)->Base());
     } else if (char es[4] = {}; GetEnvironmentVariableA("SSPC_P54_EARLY_SUBMIT", es, sizeof(es)) == 1 && es[0] == '1') {
         SSPC_LOG(Loader, Warning, "SSPC_P54_EARLY_SUBMIT=1 ignored: only SecondSonPC's GPU backend (--gpu-backend "
                  "sspc) hands frames on early");

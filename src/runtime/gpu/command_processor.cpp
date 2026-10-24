@@ -16,6 +16,7 @@
 #include "engine/render/draw_runs.h"
 #include "runtime/gpu/cp_r6_opt.h"
 #include "runtime/gpu/r8/cp_profile.h"
+#include "runtime/gpu/r11/label_wait.h"
 #include "runtime/gpu/stall_trace.h"
 
 // Descriptors and fence records are filled naming only the fields a packet sets.
@@ -2153,6 +2154,7 @@ bool CommandProcessor::WriteFence(Queue& q, FenceOp& op) {
     }
     op.written = true;
     ++stats_.fences_written;
+    LabelWait::Written(op.addr, bytes); // (R11 SSPC_R11_LABEL_WAIT: the game's main thread sleeps on this label)
     // (P5.4: the wake-up point of whoever polls this label - the game's frame and compute waits)
     StallTrace::Instant(StallTrace::Ev::FenceWrite, op.addr, static_cast<u32>(op.data), static_cast<u16>(q.id));
     if (fence_stats_.size() < 4096 || fence_stats_.contains(op.addr)) { // bounded (review LOW 10)
