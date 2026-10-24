@@ -15,7 +15,10 @@
 #include "runtime/kernel/kernel_memory.h"
 #include "runtime/kernel/signal.h"
 #include "runtime/kernel/thread.h"
+#include "runtime/libc/libc_stdio.h"
+#include "runtime/net/net_core.h"
 #include "runtime/pad/pad.h"
+#include "runtime/system/common_dialog.h"
 #include "runtime/savedata/savedata.h"
 #include "runtime/system/system_service.h"
 #include "runtime/user/user_service.h"
@@ -105,6 +108,11 @@ std::vector<Export> Collect() {
                              Kernel::MemoryApi::Exports(), Kernel::Clock::Exports(),
                              Net::NetUtilExports(), Np::NpManagerExports(), Offline::OfflineExports(), Libc::LibcMemExports(), Gpu::Gnm::GnmExports(), Gpu::VideoOut::Exports(),
                              std::span<const Export>(kFilesystemObservers)}) {
+        all.insert(all.end(), group.begin(), group.end());
+    }
+    // R10 sysrt (docs/R10_SYSRT.md): CommonDialog, libSceNet's library state, libSceLibcInternal's stdout and heap
+    // trace information - experimental groups sysrt-dialog / sysrt-net / sysrt-libc (SSPC_R10_SYSRT=native)
+    for (const auto group : {CommonDialog::CommonDialogExports(), Net::NetCoreExports(), Libc::LibcStdioExports()}) {
         all.insert(all.end(), group.begin(), group.end());
     }
     return all;

@@ -117,6 +117,7 @@ function(sspc_attach_bootstrap runtime_target)
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/host_shaders_host.cpp
         ${CMAKE_SOURCE_DIR}/src/bridge/shadps4/generated/bridge_exports.cpp
     )
+    target_sources(shadps4 PRIVATE ${SSPC_R10_SYSRT_BRIDGE_SOURCES}) # R10 sysrt (cmake/r10/sysrt.cmake)
     target_link_libraries(shadps4 PRIVATE ${runtime_target})
     # Only this file needs the generation: a new one recompiles one file, not the bridge.
     set_source_files_properties(${_sspc_shad_dir}/src/video_core/cache_storage.cpp TARGET_DIRECTORY shadps4
