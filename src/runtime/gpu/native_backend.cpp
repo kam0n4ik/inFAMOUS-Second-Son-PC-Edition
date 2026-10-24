@@ -51,6 +51,7 @@
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_translator.h"
 #include "runtime/gpu/r10/latency.h"
+#include "runtime/gpu/r10/spread.h"
 #include "runtime/gpu/static/static_predictor.h"
 #include "runtime/gpu/upscale/upscale_settings.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
@@ -1247,6 +1248,7 @@ bool Backend::CpuCopy(u64 src, u64 dst, u64 bytes) {
 
 void Backend::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuNative");
+    R10::SpreadThisThread(R10::Heavy::Cp); // (SSPC_R10_SPREAD)
     StallTrace::RegisterThread(StallTrace::Role::Cp);
     R8_CP_PROF_THREAD(Cp);
     Vk::Emit::SetProducerThread();
@@ -2264,6 +2266,14 @@ std::string Backend::CacheReport() {
                            pipelines_->PrefetchQueued(), ps.prefetch_taken, static_cast<double>(ps.prefetch_build_ns) / 1e6,
                            static_cast<double>(ps.prefetch_slowest_ns) / 1e6, ps.prefetch_waited,
                            static_cast<double>(ps.prefetch_wait_ns) / 1e6, ps.prefetch_claimed, ps.prefetch_failed);
+    }
+    if (const R10::WorkPool* pool = pipelines_->Pool()) {
+        const R10::WorkPool::Stats st = pool->GetStats();
+        out += fmt::format("R10 work pool (SSPC_R10_SCHED): {} workers; tasks submitted {}, ran {}, stolen {}, refused {} "
+                           "(the pipeline factory's {}); the most waiting at once {}; the workers busy {:.1f} ms, "
+                           "asleep {} times\n",
+                           pool->Workers(), st.submitted, st.ran, st.stolen, st.refused, pipelines_->PoolRefused(),
+                           st.max_pending, static_cast<double>(st.busy_ns) / 1e6, st.sleeps);
     }
     if (const Vk::PipelinePrecompiler* pre = pipelines_->Precompiler()) {
         const auto p = pre->Progress();

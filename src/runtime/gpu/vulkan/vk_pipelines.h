@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "base/abi.h"
+#include "runtime/gpu/r10/work_pool.h"
 #include "runtime/gpu/shader/pipeline_state.h"
 #include "runtime/gpu/shader/shader_cache.h"
 #include "runtime/gpu/shader/shader_disk_cache.h"
@@ -103,6 +104,9 @@ public:
     bool Prefetching() const { return prefetch_; }
     /// Pipelines handed to the prefetch workers so far (any thread).
     u64 PrefetchQueued() const { return pf_queued_.load(std::memory_order_relaxed); }
+    /// R10: the pool the background jobs run on (nullptr: the factory's own threads), its refused submissions.
+    const R10::WorkPool* Pool() const { return pool_; }
+    u64 PoolRefused() const { return pool_refused_.load(std::memory_order_relaxed); }
 
     const PipelineStats& Stats() const { return stats_; }
 
@@ -186,6 +190,9 @@ private:
         std::string error;
     };
     void AsyncWorker();
+    /// One queued job taken (`wait`: until one comes or the stop - the own workers; else nullptr when none - a pool task)
+    AsyncJob* PopAsync(bool wait);
+    void RunAsync(AsyncJob* j);
     bool async_ = false, async_compute_ = false;
     std::unordered_map<u64, std::unique_ptr<AsyncJob>, U64Hash> async_jobs_; ///< by key (the recording thread's)
     std::mutex async_mutex_;
@@ -206,6 +213,8 @@ private:
         std::string error;
     };
     void PrefetchWorker();
+    PrefetchJob* PopPrefetch(bool wait); ///< (as PopAsync)
+    void RunPrefetch(PrefetchJob* j);
     /// The recording thread: the prefetched pipeline of `desc`, installed under `key` (waits for a worker still
     /// building it). nullptr: none, failed, or not started yet (taken out of the queue: the caller builds it now).
     const PipelineObjects* TakePrefetched(u64 key, u64 hash, const GS::PipelineDesc& desc, const GS::Module* cs);
@@ -224,6 +233,21 @@ private:
     std::vector<std::thread> pf_workers_;
     bool pf_stop_ = false;
     std::atomic<u64> pf_queued_{0};
+
+    // R10 (SSPC_R10_SCHED=1, r10/work_pool.h): the async graphics and prefetch jobs run as tasks of the shared work
+    // pool instead of the threads above - drainer tasks (at most one a worker per kind) take the oldest job of their
+    // queue, one a task, and go on as a new task while it is not empty; a job is never dropped (the first version
+    // refused jobs when the pool's queue was full: on a cold cache the draws stayed skipped - docs §8). The destructor
+    // waits for the tasks submitted so far (those that find the factory dying take nothing).
+    /// A drainer task of the pool for the kind's queue (prefetch / async graphics) when fewer than the workers run.
+    void Kick(bool prefetch);
+    bool SubmitDrainer(bool prefetch);
+    bool QueuedFor(bool prefetch);
+    std::atomic<u32> pool_drainers_[2] = {}; ///< drainer tasks of each kind submitted and not ended
+    R10::WorkPool* pool_ = nullptr;
+    std::atomic<u32> pool_inflight_{0};
+    std::atomic<bool> pool_dead_{false};
+    std::atomic<u64> pool_refused_{0};
 };
 
 /// The layout signature of plans (binding numbers, kinds, counts): part of a pipeline's key.

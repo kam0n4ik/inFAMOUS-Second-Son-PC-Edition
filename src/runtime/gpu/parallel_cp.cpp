@@ -20,6 +20,7 @@
 #include "runtime/gpu/native_videoout.h"
 #include "runtime/gpu/r8/cp_native_diag.h"
 #include "runtime/gpu/r8/cp_profile.h"
+#include "runtime/gpu/r10/spread.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_buffer_cache.h"
 #include "runtime/gpu/vulkan/vk_emit.h"
@@ -1620,6 +1621,7 @@ void ParallelCp::FrontStep(Record& r, u64 index) {
 
 void ParallelCp::FrontLoop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuFrontend");
+    R10::SpreadThisThread(R10::Heavy::Frontend); // (SSPC_R10_SPREAD)
     StallTrace::RegisterThread(StallTrace::Role::Frontend); // (R10 timeline)
     R8_CP_PROF_THREAD(Front);
     const bool trace_prep = StallTrace::DeepRecords();
@@ -1704,6 +1706,7 @@ void ParallelCp::FrontLoop() {
 
 void ParallelCp::Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuRecord");
+    R10::SpreadThisThread(R10::Heavy::Record); // (SSPC_R10_SPREAD)
     StallTrace::RegisterThread(StallTrace::Role::Record);
     R8_CP_PROF_THREAD(Record);
     Vk::Emit::SetProducerThread();

@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "base/log.h"
+#include "runtime/gpu/r10/spread.h"
 #include "runtime/exports.h"
 #include "runtime/kernel/pthread_sync.h"
 #include "runtime/kernel/thread.h"
@@ -313,6 +314,21 @@ std::string GuestName(const char* name, u32 tid) {
 void SetHostThreadName(const std::string& name) {
     const std::wstring wide(name.begin(), name.end());
     SetThreadDescription(GetCurrentThread(), wide.c_str());
+}
+
+/// R10 diagnostics (SSPC_R10_AFFINITY_LOG=1, docs/R10_CPU_GPU_SCHEDULER.md): the priority and CPU mask a guest thread
+/// asks for - logged, still not applied.
+bool AffinityLog() {
+    static const bool on = [] {
+        char v[4] = {};
+        const bool o = GetEnvironmentVariableA("SSPC_R10_AFFINITY_LOG", v, sizeof(v)) == 1 && v[0] == '1';
+        if (o) {
+            SSPC_LOG(Kernel, Warning, "DIAGNOSTIC: SSPC_R10_AFFINITY_LOG=1 - the guest threads' priorities and CPU masks "
+                                      "are logged (kept, not applied to Windows threads)");
+        }
+        return o;
+    }();
+    return on;
 }
 
 // --- stacks (g_table_lock held unless said otherwise)
@@ -624,6 +640,14 @@ DWORD WINAPI ThreadEntry(void* param) {
     _mm_setcsr(kMxcsr);
     asm volatile("fldcw %0" : : "m"(kFpucw));
     SetHostThreadName(t->name);
+    if (t->name == "Game:Main") {
+        ::SecondSon::Gpu::R10::SpreadThisThread(::SecondSon::Gpu::R10::Heavy::GameMain); // (SSPC_R10_SPREAD)
+    }
+    if (AffinityLog()) {
+        SSPC_LOG(Kernel, Info, "R10 affinity: thread '{}' (tid {}, Windows {}) starts with priority {}, policy {}, CPU mask "
+                 "{}", t->name, t->tid, GetCurrentThreadId(), t->attr.prio, t->attr.policy,
+                 t->attr.has_cpuset ? fmt::format("{:#x}", t->attr.cpuset) : std::string("none (every CPU)"));
+    }
     g_host->ThreadStarted();
     void* const top = reinterpret_cast<void*>(
         (reinterpret_cast<uintptr_t>(t->stack) + t->stack_size) & ~uintptr_t{15});
@@ -1009,6 +1033,9 @@ s32 Setaffinity(void* handle, u64 mask) {
     }
     // Kept, not applied: the oracle does not pin guest threads either (its SetAffinity is off).
     return WithThread(handle, [mask](Thread& t) {
+        if (AffinityLog()) {
+            SSPC_LOG(Kernel, Info, "R10 affinity: scePthreadSetaffinity '{}' (tid {}) CPU mask {:#x}", t.name, t.tid, mask);
+        }
         t.attr.has_cpuset = true;
         t.attr.cpuset = mask;
         return kOk;

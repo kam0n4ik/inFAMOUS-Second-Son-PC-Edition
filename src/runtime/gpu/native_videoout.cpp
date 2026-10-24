@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include "runtime/gpu/native_videoout.h"
+#include "runtime/gpu/r10/spread.h"
 
 #include <algorithm>
 #include <array>
@@ -410,6 +411,7 @@ void FreeLoop(HANDLE timer, const LARGE_INTEGER& freq, double period_ticks, doub
 
 void PresentThread() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:VideoOutPresent");
+    R10::SpreadThisThread(R10::Heavy::Present); // (SSPC_R10_SPREAD)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     StallTrace::RegisterThread(StallTrace::Role::Present);
     const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);

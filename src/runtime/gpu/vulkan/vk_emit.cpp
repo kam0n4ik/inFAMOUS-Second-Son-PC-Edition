@@ -16,6 +16,7 @@
 
 #include "base/abi.h"
 #include "base/log.h"
+#include "runtime/gpu/r10/spread.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_api.h"
 
@@ -136,6 +137,7 @@ void FullSync() {
 
 void Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuEmit");
+    R10::SpreadThisThread(R10::Heavy::Emit); // (SSPC_R10_SPREAD)
     // (R10 timeline: this thread may start before the trace does - its role is registered once the trace is on)
     bool trace_role = false;
     u64 r = 0;
