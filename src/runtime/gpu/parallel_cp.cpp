@@ -256,6 +256,16 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
                          m, gmat_ == 2 ? " (verify: each also prepared in full and compared)" : "");
             }
         }
+        if (char p[16] = {}; GetEnvironmentVariableA("SSPC_R10_RUN_PS", p, sizeof(p)) > 0 && p[0] != '0' &&
+                             std::string_view(p) != "off") {
+            run_ps_ = std::string_view(p) == "verify" ? 2 : 1;
+            char m[8] = {};
+            run_ps_mat_ = GetEnvironmentVariableA("SSPC_R10_RUN_PS_MATERIAL", m, sizeof(m)) > 0 && m[0] == '1' ? 1 : 0;
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R10_RUN_PS={} - members of mesh 0x1a1960 / shadow 0x43d480 runs "
+                                   "with other PS user data join with their PS plan decoded again{}{}",
+                     p, run_ps_mat_ != 0 ? ", their own T#s / S#s too (SSPC_R10_RUN_PS_MATERIAL=1)" : "",
+                     run_ps_ == 2 ? " - verify: each also prepared in full and compared" : "");
+        }
     }
     if (fthread_mode_) {
         // SSPC_FP_RUN_HOLD_US (default 50): a held run with no record to join is published after this long (thread 1
@@ -2213,6 +2223,12 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
                                               (Cp::GroupMask{1} << static_cast<u32>(G::DrawParams));
     // Phase 6: a G-buffer run - its members may differ in PS user data too (each one's PS plan decoded again below)
     const bool g = GRunsNow() && a.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer);
+    // R10 (SSPC_R10_RUN_PS): a mesh / shadow run's members may differ in PS user data too - their PS plan decoded again
+    // below, as a G-buffer member's (not the stencil reference: that ends the run as before)
+    const bool psm = g || (run_ps_ != 0 &&
+                           (a.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::Mesh) ||
+                            a.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::Shadow)));
+    const u8 mat = g ? gmat_ : run_ps_mat_; // (members with T#s / S#s of their own)
     if (g && b.engine_material) {
         // (the engine set another material for it: its PS reads other descriptors - not walked again to see that;
         // SSPC_CITY_GB_RUN_MATERIAL: walked again below, its own images and samplers)
@@ -2225,7 +2241,9 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     // (a G-buffer run: the PS user data, and the stencil reference the engine sets per mesh - Vulkan dynamic state)
     constexpr Cp::GroupMask kGBufferGroups =
         (Cp::GroupMask{1} << static_cast<u32>(G::PsUserData)) | (Cp::GroupMask{1} << static_cast<u32>(G::StencilRef));
-    if (const Cp::GroupMask other = b.changed & ~(kGeometryGroups | (g ? kGBufferGroups : 0)); other != 0) {
+    constexpr Cp::GroupMask kPsGroups = Cp::GroupMask{1} << static_cast<u32>(G::PsUserData);
+    if (const Cp::GroupMask other = b.changed & ~(kGeometryGroups | (g ? kGBufferGroups : psm ? kPsGroups : 0));
+        other != 0) {
         if (srt_diag_) {
             SrtDiag& sd = srt_by_[a.engine_run & 3];
             for (u32 k = 0; k < sd.groups.size(); ++k) {
@@ -2251,7 +2269,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     }
     const size_t vs = static_cast<size_t>(Cp::Stage::Vs), ps = static_cast<size_t>(Cp::Stage::Ps);
     for (size_t s = 0; s < a.user_data.size(); ++s) {
-        if (s != vs && (s != ps || !g) && ((a.active_stages >> s) & 1) != 0 && a.user_data[s] != b.user_data[s]) {
+        if (s != vs && (s != ps || !psm) && ((a.active_stages >> s) & 1) != 0 && a.user_data[s] != b.user_data[s]) {
             return no(6);
         }
     }
@@ -2376,7 +2394,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     }
     u32 own_img = 0, own_smp = 0; // (SSPC_CITY_GB_RUN_MATERIAL: its own T#s / S#s, without those it has again)
     bool ps_redecoded = false;
-    if (g && a.user_data[ps] != b.user_data[ps]) {
+    if (psm && a.user_data[ps] != b.user_data[ps]) {
         // Phase 6: its PS plan from its registers (RedecodeStage: the walk's output again, the same module and binding
         // numbers) - the same images and samplers; only read-only constant blocks of the same format elsewhere
         const GS::StageView& pp = lead.ps;
@@ -2422,8 +2440,8 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
             same = p.binding == q.binding && p.count == q.count && p.view_type == q.view_type &&
                    p.storage == q.storage && p.depth == q.depth && p.array == q.array && p.fmask == q.fmask &&
                    p.status == q.status;
-            if (same && p.desc.raw != q.desc.raw && (gmat_ == 0 || q.status == GS::ResourceStatus::Ok)) {
-                if (gmat_ == 0) {
+            if (same && p.desc.raw != q.desc.raw && (mat == 0 || q.status == GS::ResourceStatus::Ok)) {
+                if (mat == 0) {
                     same = false;
                 } else if (i >= Cp::RunMember::kMaxSharpIndex) {
                     return no(18);
@@ -2438,8 +2456,8 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
             const GS::SamplerBinding& p = x.samplers[i];
             const GS::SamplerBinding& q = y.samplers[i];
             same = p.binding == q.binding && p.status == q.status;
-            if (same && p.desc.raw != q.desc.raw && (gmat_ == 0 || q.status == GS::ResourceStatus::Ok)) {
-                if (gmat_ == 0) {
+            if (same && p.desc.raw != q.desc.raw && (mat == 0 || q.status == GS::ResourceStatus::Ok)) {
+                if (mat == 0) {
                     same = false;
                 } else if (i >= Cp::RunMember::kMaxSharpIndex) {
                     return no(18);
@@ -2573,7 +2591,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     m.vgt_index_offset = b.vgt_index_offset;
     m.changed = b.changed;
     m.vs_user_data = b.user_data[vs];
-    if (runs_ == 2 || gruns_ == 2 || (gmat_ == 2 && g)) {
+    if (runs_ == 2 || gruns_ == 2 || (gmat_ == 2 && g) || (run_ps_ == 2 && psm && !g)) {
         // verify: the full preparation of this draw against the first's with its geometry (it must be the same)
         // (R8: the groups changed at draws the native G-buffer path prepared without the frontend - the run's first
         // one too - count as changed, as in PrepareDraw: else the frontend kept older registers - a PS translated with
@@ -2657,6 +2675,9 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     }
     if (g && b.engine_material) {
         Bump(run_material_joined_);
+    }
+    if (ps_redecoded && !g) {
+        Bump(run_ps_joined_[a.engine_run & 3]);
     }
     if ((own_img | own_smp) != 0) {
         Bump(gmat_joined_);
@@ -3109,6 +3130,11 @@ std::string ParallelCp::Report() const {
             }
             out += fmt::format("  R8/R10 {} members refused for registers (3), by group (Cp::Group):{}\n", kRunSrc[src],
                                groups.empty() ? std::string(" none") : groups);
+        }
+        if (run_ps_ != 0) {
+            out += fmt::format("  R10 mesh / shadow members with a PS of their own (SSPC_R10_RUN_PS{}{}): mesh {}, shadow {}\n",
+                               run_ps_ == 2 ? "=verify" : "", run_ps_mat_ != 0 ? ", own T#s/S#s" : "",
+                               ld(run_ps_joined_[1]), ld(run_ps_joined_[2]));
         }
         if (gmat_ != 0) {
             out += fmt::format("  R8 G-buffer members with another material (SSPC_CITY_GB_RUN_MATERIAL{}): joined with "
