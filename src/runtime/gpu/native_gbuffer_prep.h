@@ -49,7 +49,28 @@ class NativeGBuffer {
 public:
     enum class Mode : u8 { Off, Verify, Guarded, Native };
 
+    /// A stage's CUE state at its draw's commit, whichever ring holds it (the G-buffer's StageShadow, R10's compact one).
+    struct ShadowRef {
+        u64 layout = 0;
+        u16 dwords = 0;
+        bool captured = false;
+        std::array<u8, GDR::kShadowPointers> reg{};
+        std::array<u16, GDR::kShadowPointers> off{};
+        const u32* shadow = nullptr; ///< [0, dwords)
+        template <u32 N>
+        ShadowRef(const GDR::StageShadowOf<N>& s) // NOLINT (implicit: a view)
+            : layout(s.layout), dwords(s.dwords), captured(s.captured), reg(s.reg), off(s.off), shadow(s.shadow.data()) {}
+    };
+    /// A draw's two stages as the engine committed them.
+    struct EngineState {
+        ShadowRef vs, ps;
+    };
+
+    /// SSPC_NATIVE_GBUFFER's path (0x1a1770).
     NativeGBuffer();
+    /// R10 (SSPC_R10_NATIVE_DRAWS): the same path for another engine draw function's draws - `env` its mode's
+    /// variable, `what` its name in the log and the report.
+    NativeGBuffer(const char* env, const char* what);
 
     Mode mode() const { return mode_; }
     bool On() const { return mode_ != Mode::Off; }
@@ -68,14 +89,14 @@ public:
     /// guest reader (a template's validation in a new frame); `targets`: a hash of the draw's colour/depth target
     /// registers (the register file's group hashes). `material`: the stages' (VS, PS) material ids - module, T#s,
     /// S#s - for the executor's binding memo (Vk::Executor::GbBind; 0: a stage it does not keep).
-    bool Prepare(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e,
+    bool Prepare(const Cp::DrawDescriptor& d, const EngineState& e,
                  GS::ProgramCache& programs, GS::GuestReader& memory, u64 targets, GS::DrawPreparation& prep,
                  const GS::GraphicsPipelineState*& state, GS::StageView& vs, GS::StageView& ps,
                  std::array<u64, 2>& material);
 
     /// After `d`'s full preparation (`prep`, `state`, its VS/PS views): keep it as its key's template; `check` (verify:
     /// every draw, guarded: its samples) builds the draw from `e` as Prepare would and compares it with the walk's.
-    void AfterFull(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e,
+    void AfterFull(const Cp::DrawDescriptor& d, const EngineState& e,
                    GS::ProgramCache& programs, GS::GuestReader& memory, u64 targets, const GS::DrawPreparation& prep,
                    const GS::GraphicsPipelineState* state, const GS::StageView& vs, const GS::StageView& ps,
                    bool check);
@@ -89,7 +110,7 @@ public:
     /// kPlanOk: `out` is the plan, of `head`'s module and bindings; kPlanOther: another module or other bindings (the
     /// member is refused - the walk would decode the same); kPlanNone: no map / not ready (the caller walks).
     static constexpr u8 kPlanOk = 0, kPlanOther = 1, kPlanNone = 2;
-    u8 MemberPlan(const GS::StageView& head, const GDR::StageShadow& sh, std::span<const u32, 16> ud,
+    u8 MemberPlan(const GS::StageView& head, const ShadowRef& sh, std::span<const u32, 16> ud,
                   GS::ResourceBindingPlan& out);
     /// SSPC_CITY_GB_RUN_MATERIAL=verify: MemberPlan's answer `result` / plan `mine` against the walk's (RedecodeStage:
     /// `walked` - it gave a plan of the same module and bindings - and `walk`), counted by part (Report).
@@ -166,7 +187,7 @@ private:
     static void Bump(std::atomic<u64>& c, u64 n = 1) {
         c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed); // (one writer thread)
     }
-    static Key KeyOf(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e, u64 targets);
+    static Key KeyOf(const Cp::DrawDescriptor& d, const EngineState& e, u64 targets);
     static u64 HashOf(const Key& k);
     /// The VS fetch shader's address in `ud` (`first`: the VS layout's first module) and its register.
     static u64 FetchOf(const GS::Module* first, std::span<const u32, 16> ud, u32& reg);
@@ -183,11 +204,11 @@ private:
     bool Revalidate(Template& t, GS::ProgramCache& programs, GS::GuestReader& memory);
 
     /// The map of `v`'s stage for CUE state `sh` (made on first use). nullptr: the view has no first module yet.
-    const StageMap* MapOf(const GS::StageView& v, const GDR::StageShadow& sh);
-    void MakeMap(StageMap& m, const GS::Module& first, const GDR::StageShadow& sh);
+    const StageMap* MapOf(const GS::StageView& v, const ShadowRef& sh);
+    void MakeMap(StageMap& m, const GS::Module& first, const ShadowRef& sh);
     /// `out` = `head`'s stage for this draw, its plan from the CUE state `sh` through `m`, `key` its specialization
     /// (the module it needs). false: the head's module is not ready.
-    bool BuildStage(const GS::StageView& head, const StageMap& m, const GDR::StageShadow& sh,
+    bool BuildStage(const GS::StageView& head, const StageMap& m, const ShadowRef& sh,
                     std::span<const u32, 16> ud, GS::StageView& out, GS::SpecializationKey& key);
     /// A prepared stage's material id (Prepare); 0: an image the executor's memo does not keep (several views, FMask,
     /// storage).
@@ -195,7 +216,12 @@ private:
     /// verify: `built` against the walk's `full`, binding by binding; counts by part, logs the first ones. true: same.
     bool Compare(const GS::StageView& full, const GS::StageView& built, u32 stage);
 
+    void Init(const char* env, const char* what, const char* detail);
+
     Mode mode_ = Mode::Off;
+    const char* env_ = "SSPC_NATIVE_GBUFFER";
+    const char* what_ = "native G-buffer 0x1a1770";
+    bool compact_ = false; ///< R10's instance: its stages are in the compact ring (the report's capture counts)
     bool tripped_ = false; ///< guarded: a checked build differed - the engine path is off from then on
     u64 sample_ = 0;
     std::unordered_map<u64, std::unique_ptr<StageMap>> maps_;

@@ -696,33 +696,35 @@ void GD::EnsurePureCallees(u64 module_base) {
 
 namespace {
 std::array<std::atomic<u64>, 4> g_capture_refused{}; // (CaptureRefusals)
+std::array<std::atomic<u64>, 4> g_compact_refused{}; // (CompactCaptureRefusals: R10's shadow / mesh draws)
+
+std::array<u64, 4> Loaded(const std::array<std::atomic<u64>, 4>& c) {
+    return {c[0].load(std::memory_order_relaxed), c[1].load(std::memory_order_relaxed),
+            c[2].load(std::memory_order_relaxed), c[3].load(std::memory_order_relaxed)};
 }
 
-std::array<u64, 4> GD::CaptureRefusals() {
-    return {g_capture_refused[0].load(std::memory_order_relaxed), g_capture_refused[1].load(std::memory_order_relaxed),
-            g_capture_refused[2].load(std::memory_order_relaxed), g_capture_refused[3].load(std::memory_order_relaxed)};
-}
-
-bool GD::CaptureStage(u64 r, u32 stage, StageShadow& out) {
+template <u32 N>
+bool CaptureStageOf(u64 r, u32 stage, GD::StageShadowOf<N>& out, std::array<std::atomic<u64>, 4>& refused) {
+    using namespace GD;
     const u64 cue = r + kCue;
     out.layout = GuestLoad<u64>(cue + kCueLayout + 8 * u64{stage});
     out.dwords = 0;
     out.captured = false;
     if (out.layout == 0) {
-        g_capture_refused[0].fetch_add(1, std::memory_order_relaxed);
+        refused[0].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     const u16 dwords = GuestLoad<u16>(out.layout);
-    if (dwords > g_capture_refused[3].load(std::memory_order_relaxed)) {
-        g_capture_refused[3].store(dwords, std::memory_order_relaxed); // (one game thread draws the G-buffer)
+    if (dwords > refused[3].load(std::memory_order_relaxed)) {
+        refused[3].store(dwords, std::memory_order_relaxed); // (a maximum for the report: a lost race only lowers it)
     }
-    if (dwords > kMaxShadowDwords) {
-        g_capture_refused[2].fetch_add(1, std::memory_order_relaxed);
+    if (dwords > N) {
+        refused[2].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     if (dwords == 0) {
-        g_capture_refused[1].fetch_add(1, std::memory_order_relaxed); // (the commit copies nothing; a walk that reads
-                                                                       // the copy fails its stage map: past the copy)
+        refused[1].fetch_add(1, std::memory_order_relaxed); // (the commit copies nothing; a walk that reads the copy
+                                                             // fails its stage map: past the copy)
     }
     // 0x14ad0: the registers it points into the stage's copy and the dword offset each gets (L byte, L u16)
     constexpr std::array<std::pair<u8, u8>, kShadowPointers> kPointers = {
@@ -735,6 +737,23 @@ bool GD::CaptureStage(u64 r, u32 stage, StageShadow& out) {
     out.dwords = dwords;
     out.captured = true;
     return true;
+}
+} // namespace
+
+std::array<u64, 4> GD::CaptureRefusals() {
+    return Loaded(g_capture_refused);
+}
+
+std::array<u64, 4> GD::CompactCaptureRefusals() {
+    return Loaded(g_compact_refused);
+}
+
+bool GD::CaptureStage(u64 r, u32 stage, StageShadow& out) {
+    return CaptureStageOf(r, stage, out, g_capture_refused);
+}
+
+bool GD::CaptureStage(u64 r, u32 stage, CompactStageShadow& out) {
+    return CaptureStageOf(r, stage, out, g_compact_refused);
 }
 
 bool GD::Describe(u64 material, u64 r, u64 records, u64 n, u64 mesh, DrawDescription& out) {

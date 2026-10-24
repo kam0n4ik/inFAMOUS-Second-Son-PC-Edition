@@ -6,6 +6,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <optional>
 #include <bit>
 #include <cstring>
 #include <exception>
@@ -254,6 +255,16 @@ ParallelCp::ParallelCp(Vk::Executor& executor, Vk::BufferCache* buffers, const O
                                        "join their run with their own PS textures and samplers{}",
                          m, gmat_ == 2 ? " (verify: each also prepared in full and compared)" : "");
             }
+        }
+        if (char p[16] = {}; GetEnvironmentVariableA("SSPC_R10_RUN_PS", p, sizeof(p)) > 0 && p[0] != '0' &&
+                             std::string_view(p) != "off") {
+            run_ps_ = std::string_view(p) == "verify" ? 2 : 1;
+            char m[8] = {};
+            run_ps_mat_ = GetEnvironmentVariableA("SSPC_R10_RUN_PS_MATERIAL", m, sizeof(m)) > 0 && m[0] == '1' ? 1 : 0;
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R10_RUN_PS={} - members of mesh 0x1a1960 / shadow 0x43d480 runs "
+                                   "with other PS user data join with their PS plan decoded again{}{}",
+                     p, run_ps_mat_ != 0 ? ", their own T#s / S#s too (SSPC_R10_RUN_PS_MATERIAL=1)" : "",
+                     run_ps_ == 2 ? " - verify: each also prepared in full and compared" : "");
         }
     }
     if (fthread_mode_) {
@@ -1022,25 +1033,46 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
     // SSPC_NATIVE_GBUFFER (native_gbuffer_prep.h): a 0x1a1770 draw with the engine's record - guarded / native prepare it
     // from the engine's state (no SRT walk); verify and guarded's samples prepare it in full below and compare
     namespace DR = Engine::Render::DrawRuns;
-    const DR::EngineDraw* engine = nullptr;
+    // R10 (SSPC_R10_NATIVE_DRAWS): the mesh and shadow casters' draws the same way, from their ring (EngineStages)
+    NativeGBuffer* nat = nullptr;
+    std::optional<NativeGBuffer::EngineState> engine;
+    bool (*still)(u32) = nullptr;
+    CpProfile::Sec nat_sec = CpProfile::Sec::FrontNative;
+    if (ngb_.On() && r.draw.engine_run == static_cast<u8>(DR::Source::GBuffer)) {
+        nat = &ngb_;
+        still = &DR::EngineDescStill;
+        if (const DR::EngineDraw* e = r.draw.engine_native_present ? DR::EngineDescPeek(r.draw.engine_native) : nullptr) {
+            engine.emplace(NativeGBuffer::EngineState{e->vs, e->ps});
+        }
+    } else if ((r.draw.engine_run == static_cast<u8>(DR::Source::Mesh) ||
+                r.draw.engine_run == static_cast<u8>(DR::Source::Shadow)) &&
+               ndr_[r.draw.engine_run - 1].On()) {
+        nat = &ndr_[r.draw.engine_run - 1];
+        still = &DR::StagesStill;
+        nat_sec = r.draw.engine_run == static_cast<u8>(DR::Source::Mesh) ? CpProfile::Sec::FrontNativeMesh
+                                                                          : CpProfile::Sec::FrontNativeShadow;
+        if (const DR::EngineStages* e = r.draw.engine_native_present ? DR::StagesPeek(r.draw.engine_native) : nullptr) {
+            engine.emplace(NativeGBuffer::EngineState{e->vs, e->ps});
+        }
+    }
     bool ngb_check = false;
     u64 ngb_targets = 0;
-    if (ngb_.On() && r.draw.engine_run == static_cast<u8>(DR::Source::GBuffer)) {
+    if (nat != nullptr) {
         // (the colour/depth target registers, which the stages' runtime parameters and the pipeline read: by content)
         ngb_targets = (regs.GroupHash(Cp::Group::ColorTarget) * 0x9E3779B97F4A7C15ull) ^
                       regs.GroupHash(Cp::Group::DepthTarget);
-        engine = r.draw.engine_native_present ? DR::EngineDescPeek(r.draw.engine_native) : nullptr;
-        ngb_.NoteRecord(engine != nullptr);
-        ngb_check = engine != nullptr && (ngb_.mode() == NativeGBuffer::Mode::Verify || ngb_.SampleCheck());
-        if (engine != nullptr && ngb_.Takes() && !ngb_check) {
-            R8_CP_PROF_ENTER(CpProfile::Sec::FrontNative);
-            const bool ok = ngb_.Prepare(r.draw, *engine, frontend_->MutablePrograms(), reader_, ngb_targets, r.prep,
+        nat->NoteRecord(engine.has_value());
+        ngb_check = engine.has_value() && (nat->mode() == NativeGBuffer::Mode::Verify || nat->SampleCheck());
+        if (engine.has_value() && nat->Takes() && !ngb_check) {
+            R8_CP_PROF_ENTER(nat_sec);
+            const bool ok = nat->Prepare(r.draw, *engine, frontend_->MutablePrograms(), reader_, ngb_targets, r.prep,
                                          r.state, r.stage, r.ps, r.material) &&
-                            DR::EngineDescStill(r.draw.engine_native); // (the slot not reused while it was read)
+                            still(r.draw.engine_native); // (the slot not reused while it was read)
             R8_CP_PROF_LEAVE();
-            if (!ok) {
-                r.material = {};
-            } else {
+            if (!ok || nat != &ngb_) {
+                r.material = {}; // (R10's draws: the executor's G-buffer binding memo, GbBind, is not theirs)
+            }
+            if (ok) {
                 r.prepared = true;
                 // the frontend skipped this draw: its next preparation sees the register groups changed meanwhile
                 ngb_pending_ |= r.draw.changed;
@@ -1116,12 +1148,11 @@ void ParallelCp::PrepareDraw(Record& r, u64 index, const Cp::RegisterFile& regs)
     r.prepared = true;
     // SSPC_NATIVE_GBUFFER: the full preparation is its key's template; verify / guarded's samples compare the engine
     // build with it (the full one is what the draw uses)
-    if (engine != nullptr && r.stage_shared == nullptr && r.ps_shared == nullptr &&
-        DR::EngineDescStill(r.draw.engine_native)) {
-        R8_CP_PROF(CpProfile::Sec::FrontNative);
+    if (engine.has_value() && r.stage_shared == nullptr && r.ps_shared == nullptr && still(r.draw.engine_native)) {
+        R8_CP_PROF(nat_sec);
         const GS::StageView& dv = r.vs_same ? frontend_->Stage(GS::HwStage::Vs) : r.Vs();
         const GS::StageView& dp = r.ps_same ? frontend_->Stage(GS::HwStage::Ps) : r.Ps();
-        ngb_.AfterFull(r.draw, *engine, frontend_->MutablePrograms(), reader_, ngb_targets, r.prep, r.state, dv, dp,
+        nat->AfterFull(r.draw, *engine, frontend_->MutablePrograms(), reader_, ngb_targets, r.prep, r.state, dv, dp,
                        ngb_check);
     }
     if (srt_diag_) {
@@ -2192,6 +2223,12 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
                                               (Cp::GroupMask{1} << static_cast<u32>(G::DrawParams));
     // Phase 6: a G-buffer run - its members may differ in PS user data too (each one's PS plan decoded again below)
     const bool g = GRunsNow() && a.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer);
+    // R10 (SSPC_R10_RUN_PS): a mesh / shadow run's members may differ in PS user data too - their PS plan decoded again
+    // below, as a G-buffer member's (not the stencil reference: that ends the run as before)
+    const bool psm = g || (run_ps_ != 0 &&
+                           (a.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::Mesh) ||
+                            a.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::Shadow)));
+    const u8 mat = g ? gmat_ : run_ps_mat_; // (members with T#s / S#s of their own)
     if (g && b.engine_material) {
         // (the engine set another material for it: its PS reads other descriptors - not walked again to see that;
         // SSPC_CITY_GB_RUN_MATERIAL: walked again below, its own images and samplers)
@@ -2204,17 +2241,18 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     // (a G-buffer run: the PS user data, and the stencil reference the engine sets per mesh - Vulkan dynamic state)
     constexpr Cp::GroupMask kGBufferGroups =
         (Cp::GroupMask{1} << static_cast<u32>(G::PsUserData)) | (Cp::GroupMask{1} << static_cast<u32>(G::StencilRef));
-    if (const Cp::GroupMask other = b.changed & ~(kGeometryGroups | (g ? kGBufferGroups : 0)); other != 0) {
+    constexpr Cp::GroupMask kPsGroups = Cp::GroupMask{1} << static_cast<u32>(G::PsUserData);
+    if (const Cp::GroupMask other = b.changed & ~(kGeometryGroups | (g ? kGBufferGroups : psm ? kPsGroups : 0));
+        other != 0) {
         if (srt_diag_) {
             SrtDiag& sd = srt_by_[a.engine_run & 3];
             for (u32 k = 0; k < sd.groups.size(); ++k) {
                 Bump(sd.groups[k], (other >> k) & 1);
             }
         }
-        if (g) { // (a G-buffer member: which groups ended the run - the report)
-            for (Cp::GroupMask o = other; o != 0; o &= o - 1) {
-                Bump(gb_groups_[std::countr_zero(o) & 63]);
-            }
+        // (which groups ended the run, by its engine source - the report)
+        for (Cp::GroupMask o = other; o != 0; o &= o - 1) {
+            Bump(gb_groups_[a.engine_run & 3][std::countr_zero(o) & 63]);
         }
         return no(3);
     }
@@ -2231,7 +2269,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     }
     const size_t vs = static_cast<size_t>(Cp::Stage::Vs), ps = static_cast<size_t>(Cp::Stage::Ps);
     for (size_t s = 0; s < a.user_data.size(); ++s) {
-        if (s != vs && (s != ps || !g) && ((a.active_stages >> s) & 1) != 0 && a.user_data[s] != b.user_data[s]) {
+        if (s != vs && (s != ps || !psm) && ((a.active_stages >> s) & 1) != 0 && a.user_data[s] != b.user_data[s]) {
             return no(6);
         }
     }
@@ -2356,7 +2394,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     }
     u32 own_img = 0, own_smp = 0; // (SSPC_CITY_GB_RUN_MATERIAL: its own T#s / S#s, without those it has again)
     bool ps_redecoded = false;
-    if (g && a.user_data[ps] != b.user_data[ps]) {
+    if (psm && a.user_data[ps] != b.user_data[ps]) {
         // Phase 6: its PS plan from its registers (RedecodeStage: the walk's output again, the same module and binding
         // numbers) - the same images and samplers; only read-only constant blocks of the same format elsewhere
         const GS::StageView& pp = lead.ps;
@@ -2364,7 +2402,8 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
         // material's tables again (NativeGBuffer::MemberPlan; the walk's cost, R8: most of the member's on the
         // frontend); no map: the walk
         u8 planned = NativeGBuffer::kPlanNone;
-        if (gmat_ != 0 && ngb_.On() && b.engine_native_present) {
+        if (gmat_ != 0 && ngb_.On() && b.engine_native_present &&
+            b.engine_run == static_cast<u8>(Engine::Render::DrawRuns::Source::GBuffer)) { // (R10's tags: their own ring)
             namespace DR = Engine::Render::DrawRuns;
             if (const DR::EngineDraw* e = DR::EngineDescPeek(b.engine_native); e != nullptr) {
                 planned = ngb_.MemberPlan(pp, e->ps, b.user_data[ps], run_ps_plan_);
@@ -2401,8 +2440,8 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
             same = p.binding == q.binding && p.count == q.count && p.view_type == q.view_type &&
                    p.storage == q.storage && p.depth == q.depth && p.array == q.array && p.fmask == q.fmask &&
                    p.status == q.status;
-            if (same && p.desc.raw != q.desc.raw && (gmat_ == 0 || q.status == GS::ResourceStatus::Ok)) {
-                if (gmat_ == 0) {
+            if (same && p.desc.raw != q.desc.raw && (mat == 0 || q.status == GS::ResourceStatus::Ok)) {
+                if (mat == 0) {
                     same = false;
                 } else if (i >= Cp::RunMember::kMaxSharpIndex) {
                     return no(18);
@@ -2417,8 +2456,8 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
             const GS::SamplerBinding& p = x.samplers[i];
             const GS::SamplerBinding& q = y.samplers[i];
             same = p.binding == q.binding && p.status == q.status;
-            if (same && p.desc.raw != q.desc.raw && (gmat_ == 0 || q.status == GS::ResourceStatus::Ok)) {
-                if (gmat_ == 0) {
+            if (same && p.desc.raw != q.desc.raw && (mat == 0 || q.status == GS::ResourceStatus::Ok)) {
+                if (mat == 0) {
                     same = false;
                 } else if (i >= Cp::RunMember::kMaxSharpIndex) {
                     return no(18);
@@ -2552,7 +2591,7 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     m.vgt_index_offset = b.vgt_index_offset;
     m.changed = b.changed;
     m.vs_user_data = b.user_data[vs];
-    if (runs_ == 2 || gruns_ == 2 || (gmat_ == 2 && g)) {
+    if (runs_ == 2 || gruns_ == 2 || (gmat_ == 2 && g) || (run_ps_ == 2 && psm && !g)) {
         // verify: the full preparation of this draw against the first's with its geometry (it must be the same)
         // (R8: the groups changed at draws the native G-buffer path prepared without the frontend - the run's first
         // one too - count as changed, as in PrepareDraw: else the frontend kept older registers - a PS translated with
@@ -2636,6 +2675,9 @@ bool ParallelCp::JoinRun(const Cp::DrawDescriptor& b, const Cp::RegisterFile& re
     }
     if (g && b.engine_material) {
         Bump(run_material_joined_);
+    }
+    if (ps_redecoded && !g) {
+        Bump(run_ps_joined_[a.engine_run & 3]);
     }
     if ((own_img | own_smp) != 0) {
         Bump(gmat_joined_);
@@ -3078,15 +3120,21 @@ std::string ParallelCp::Report() const {
                                                      gruns_ == 2 ? "=verify" : "")
                                        : std::string{},
                            ld(es.materials), ld(es.material_tagged), ld(run_material_), ld(run_material_joined_));
-        if (gruns_ != 0) {
+        constexpr const char* kRunSrc[] = {"untagged", "mesh 0x1a1960", "shadow 0x43d480", "G-buffer 0x1a1770"};
+        for (size_t src = 1; src < gb_groups_.size(); ++src) {
             std::string groups;
-            for (size_t k = 0; k < gb_groups_.size(); ++k) {
-                if (ld(gb_groups_[k]) != 0) {
-                    groups += fmt::format(" {}:{}", k, ld(gb_groups_[k]));
+            for (size_t k = 0; k < gb_groups_[src].size(); ++k) {
+                if (ld(gb_groups_[src][k]) != 0) {
+                    groups += fmt::format(" {}:{}", k, ld(gb_groups_[src][k]));
                 }
             }
-            out += fmt::format("  R8 G-buffer members refused for registers (3), by group (Cp::Group):{}\n",
+            out += fmt::format("  R8/R10 {} members refused for registers (3), by group (Cp::Group):{}\n", kRunSrc[src],
                                groups.empty() ? std::string(" none") : groups);
+        }
+        if (run_ps_ != 0) {
+            out += fmt::format("  R10 mesh / shadow members with a PS of their own (SSPC_R10_RUN_PS{}{}): mesh {}, shadow {}\n",
+                               run_ps_ == 2 ? "=verify" : "", run_ps_mat_ != 0 ? ", own T#s/S#s" : "",
+                               ld(run_ps_joined_[1]), ld(run_ps_joined_[2]));
         }
         if (gmat_ != 0) {
             out += fmt::format("  R8 G-buffer members with another material (SSPC_CITY_GB_RUN_MATERIAL{}): joined with "
@@ -3096,6 +3144,15 @@ std::string ParallelCp::Report() const {
     }
     if (ngb_.On()) {
         out += "  " + ngb_.Report();
+    }
+    for (u32 i = 0; i < 2; ++i) {
+        if (ndr_[i].On()) {
+            const auto st = Engine::Render::DrawRuns::StagesStats();
+            out += fmt::format("  R10 engine captures ({}): made {}, not captured {}, game threads {:.1f} ms in all\n",
+                               i == 0 ? "mesh 0x1a1960" : "shadow 0x43d480", st.made[i], st.refused[i],
+                               static_cast<double>(GS::TicksToNs(st.ticks[i])) / 1e6);
+            out += "  " + ndr_[i].Report();
+        }
     }
     if (resources_ != 0 || gruns_ != 0) {
         std::string why;

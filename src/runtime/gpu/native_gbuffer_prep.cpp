@@ -101,7 +101,20 @@ u64 Mix(u64 h, u64 v) {
 } // namespace
 
 NativeGBuffer::NativeGBuffer() {
-    const std::string v = EnvA("SSPC_NATIVE_GBUFFER");
+    Init("SSPC_NATIVE_GBUFFER", "native G-buffer 0x1a1770", "0x1a1770's draws prepared from the engine's state (its "
+                                                            "descriptors and CUE copy, no SRT walk; native_gbuffer_prep.h)");
+}
+
+NativeGBuffer::NativeGBuffer(const char* env, const char* what) {
+    compact_ = true;
+    Init(env, what, "draws prepared from the engine's CUE state at their commit (no SRT walk; native_gbuffer_prep.h, "
+                    "R10)");
+}
+
+void NativeGBuffer::Init(const char* env, const char* what, const char* detail) {
+    env_ = env;
+    what_ = what;
+    const std::string v = EnvA(env);
     if (v.empty() || v == "0" || v == "off") {
         return;
     }
@@ -112,19 +125,16 @@ NativeGBuffer::NativeGBuffer() {
     } else if (v == "native" || v == "1") {
         mode_ = Mode::Native;
     } else {
-        SSPC_LOG(GPU, Warning, "SSPC_NATIVE_GBUFFER={} not understood (verify|guarded|native|off) - off", v);
+        SSPC_LOG(GPU, Warning, "{}={} not understood (verify|guarded|native|off) - off", env, v);
         return;
     }
-    SSPC_LOG(GPU, Warning,
-             "EXPERIMENT: SSPC_NATIVE_GBUFFER={} - 0x1a1770's draws prepared from the engine's state (its descriptors "
-             "and CUE copy, no SRT walk; native_gbuffer_prep.h){}",
-             v,
+    SSPC_LOG(GPU, Warning, "EXPERIMENT: {}={} ({}) - {}{}", env, v, what, detail,
              mode_ == Mode::Verify    ? " - verify: each also prepared in full, the full one used, the two compared"
              : mode_ == Mode::Guarded ? " - guarded: every 64th checked against the full preparation"
                                       : "");
 }
 
-NativeGBuffer::Key NativeGBuffer::KeyOf(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e,
+NativeGBuffer::Key NativeGBuffer::KeyOf(const Cp::DrawDescriptor& d, const EngineState& e,
                                         u64 targets) {
     return {.vs = d.shaders[kVs].address,
             .ps = d.shaders[kPs].address,
@@ -229,7 +239,7 @@ bool NativeGBuffer::Revalidate(Template& t, GS::ProgramCache& programs, GS::Gues
     return n != 0;
 }
 
-const NativeGBuffer::StageMap* NativeGBuffer::MapOf(const GS::StageView& v, const GDR::StageShadow& sh) {
+const NativeGBuffer::StageMap* NativeGBuffer::MapOf(const GS::StageView& v, const ShadowRef& sh) {
     const GS::Module* first = FirstModule(v);
     if (first == nullptr) {
         return nullptr;
@@ -249,14 +259,14 @@ const NativeGBuffer::StageMap* NativeGBuffer::MapOf(const GS::StageView& v, cons
     Bump(map_why_[slot->ok ? 0 : std::min<u32>(slot->why, 7)]);
     if (!slot->ok && logged_.load(std::memory_order_relaxed) < 24) {
         Bump(logged_);
-        SSPC_LOG(GPU, Info, "SSPC_NATIVE_GBUFFER: stage {} program {:#x} (CUE layout {:#x}) not from the engine's CUE "
+        SSPC_LOG(GPU, Info, "{}: stage {} program {:#x} (CUE layout {:#x}) not from the engine's CUE "
                             "copy: reason {} (native_gbuffer_prep.h StageMap::why)",
-                 static_cast<u32>(first->result.reflection.hw), v.address, sh.layout, slot->why);
+                 env_, static_cast<u32>(first->result.reflection.hw), v.address, sh.layout, slot->why);
     }
     return slot.get();
 }
 
-void NativeGBuffer::MakeMap(StageMap& m, const GS::Module& first, const GDR::StageShadow& sh) {
+void NativeGBuffer::MakeMap(StageMap& m, const GS::Module& first, const ShadowRef& sh) {
     const GS::ShaderReflection& r = first.result.reflection;
     const auto no = [&](u8 why) {
         m.ok = false;
@@ -342,7 +352,7 @@ void NativeGBuffer::MakeMap(StageMap& m, const GS::Module& first, const GDR::Sta
     m.ok = true;
 }
 
-bool NativeGBuffer::BuildStage(const GS::StageView& head, const StageMap& m, const GDR::StageShadow& sh,
+bool NativeGBuffer::BuildStage(const GS::StageView& head, const StageMap& m, const ShadowRef& sh,
                                std::span<const u32, 16> ud, GS::StageView& out, GS::SpecializationKey& key) {
     if (head.module == nullptr || head.module->state.load(std::memory_order_acquire) != GS::ModuleState::Ready ||
         m.first == nullptr) {
@@ -365,12 +375,12 @@ bool NativeGBuffer::BuildStage(const GS::StageView& head, const StageMap& m, con
         if (run.from == kZero) {
             std::fill_n(to, run.n, 0u);
         } else {
-            std::copy_n(sh.shadow.data() + run.from, run.n, to);
+            std::copy_n(sh.shadow + run.from, run.n, to);
         }
     }
     vreads_.resize(m.vertex.size());
     for (size_t i = 0; i < m.vertex.size(); ++i) {
-        std::memcpy(vreads_[i].data(), &sh.shadow[m.vertex[i]], 16);
+        std::memcpy(vreads_[i].data(), sh.shadow + m.vertex[i], 16);
     }
     GS::DecodeResources(r, head.start, fetch, ud, head.address, GS::VertexSource{nullptr, vreads_}, out.plan);
     out.plan.srt = {};
@@ -383,7 +393,7 @@ bool NativeGBuffer::BuildStage(const GS::StageView& head, const StageMap& m, con
     return true;
 }
 
-u8 NativeGBuffer::MemberPlan(const GS::StageView& head, const GDR::StageShadow& sh, std::span<const u32, 16> ud,
+u8 NativeGBuffer::MemberPlan(const GS::StageView& head, const ShadowRef& sh, std::span<const u32, 16> ud,
                              GS::ResourceBindingPlan& out) {
     const auto give = [&](u8 result) {
         Bump(member_[result]);
@@ -414,7 +424,7 @@ u8 NativeGBuffer::MemberPlan(const GS::StageView& head, const GDR::StageShadow& 
         if (run.from == kZero) {
             std::fill_n(to, run.n, 0u);
         } else {
-            std::copy_n(sh.shadow.data() + run.from, run.n, to);
+            std::copy_n(sh.shadow + run.from, run.n, to);
         }
     }
     GS::DecodeResources(r, head.start, nullptr, ud, head.address, GS::VertexSource{}, out);
@@ -491,7 +501,7 @@ u64 NativeGBuffer::MaterialOf(const GS::StageView& v) {
     return h | 1; // (never 0)
 }
 
-bool NativeGBuffer::Prepare(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e,
+bool NativeGBuffer::Prepare(const Cp::DrawDescriptor& d, const EngineState& e,
                             GS::ProgramCache& programs, GS::GuestReader& memory, u64 targets,
                             GS::DrawPreparation& prep, const GS::GraphicsPipelineState*& state, GS::StageView& vs,
                             GS::StageView& ps, std::array<u64, 2>& material) {
@@ -637,13 +647,32 @@ bool NativeGBuffer::Compare(const GS::StageView& x, const GS::StageView& y, u32 
                 what += fmt::format(" (flat size walk {} engine {})", x.plan.flat.size(), y.plan.flat.size());
             }
         }
-        SSPC_LOG(GPU, Warning, "SSPC_NATIVE_GBUFFER check: stage {} program {:#x}: the engine build differs from the "
-                               "walk:{}", stage, x.address, what);
+        if (!same[4]) {
+            // R10: the first vertex binding that differs (walk / engine), or the counts
+            for (size_t i = 0; i < std::min(x.plan.vertices.size(), y.plan.vertices.size()); ++i) {
+                const auto& a = x.plan.vertices[i];
+                const auto& b = y.plan.vertices[i];
+                if (!vtxs(a, b)) {
+                    what += fmt::format(" (vertex {} attribute {}/{}: address {:#x}/{:#x} size {}/{} V# {:08x}{:08x}/"
+                                        "{:08x}{:08x} read[0] {:08x}/{:08x} status {}/{})",
+                                        i, a.attribute, b.attribute, a.address, b.address, a.size, b.size,
+                                        static_cast<u32>(a.desc.raw[1]), static_cast<u32>(a.desc.raw[0]),
+                                        static_cast<u32>(b.desc.raw[1]), static_cast<u32>(b.desc.raw[0]), a.read[0],
+                                        b.read[0], static_cast<u32>(a.status), static_cast<u32>(b.status));
+                    break;
+                }
+            }
+            if (x.plan.vertices.size() != y.plan.vertices.size()) {
+                what += fmt::format(" (vertices walk {} engine {})", x.plan.vertices.size(), y.plan.vertices.size());
+            }
+        }
+        SSPC_LOG(GPU, Warning, "{} check: stage {} program {:#x}: the engine build differs from the "
+                               "walk:{}", env_, stage, x.address, what);
     }
     return false;
 }
 
-void NativeGBuffer::AfterFull(const Cp::DrawDescriptor& d, const Engine::Render::DrawRuns::EngineDraw& e,
+void NativeGBuffer::AfterFull(const Cp::DrawDescriptor& d, const EngineState& e,
                               GS::ProgramCache& programs, GS::GuestReader& memory, u64 targets,
                               const GS::DrawPreparation& prep, const GS::GraphicsPipelineState* state,
                               const GS::StageView& vs, const GS::StageView& ps, bool check) {
@@ -677,8 +706,8 @@ void NativeGBuffer::AfterFull(const Cp::DrawDescriptor& d, const Engine::Render:
             const bool b = Compare(vs, check_vs_, 2);
             if ((!a || !b) && mode_ == Mode::Guarded && !tripped_) {
                 tripped_ = true;
-                SSPC_LOG(GPU, Error, "SSPC_NATIVE_GBUFFER=guarded: an engine build differed from the full "
-                                     "preparation - the engine path is off for the rest of the run");
+                SSPC_LOG(GPU, Error, "{}=guarded: an engine build differed from the full "
+                                     "preparation - the engine path is off for the rest of the run", env_);
             }
         }
     }
@@ -744,11 +773,11 @@ std::string NativeGBuffer::Report() const {
     const auto ld = [](const std::atomic<u64>& a) { return a.load(std::memory_order_relaxed); };
     const char* name = mode_ == Mode::Verify ? "verify" : mode_ == Mode::Guarded ? "guarded" : "native";
     std::string out = fmt::format(
-        "native G-buffer 0x1a1770 (SSPC_NATIVE_GBUFFER={}{}): tagged draws {}, with an engine record {}, without {}; "
+        "{} ({}={}{}): tagged draws {}, with an engine record {}, without {}; "
         "prepared from the engine {}{}; refused (1 indirect/stages, 2 no CUE state, 3 no template, 4 its programs changed, "
         "5 another fetch shader, 6 a stage not of the CUE copy, 7 not ready, 8 no variant of these modules, 9 other "
         "bindings):",
-        name, tripped_ ? ", tripped: off" : "", ld(draws_), ld(with_record_), ld(no_record_), ld(taken_),
+        what_, env_, name, tripped_ ? ", tripped: off" : "", ld(draws_), ld(with_record_), ld(no_record_), ld(taken_),
         mode_ == Mode::Verify ? " (verify: would be; each checked)" : "");
     for (u32 i = 1; i <= 9; ++i) {
         out += fmt::format(" {}:{}", i, ld(refused_[i]));
@@ -761,11 +790,13 @@ std::string NativeGBuffer::Report() const {
     for (u32 i = 0; i < 8; ++i) {
         out += fmt::format(" {}:{}", i, ld(map_why_[i]));
     }
-    const auto cr = GDR::CaptureRefusals();
-    out += fmt::format("; CUE state not captured: no layout {}, more than {} dwords {}; empty layouts {} (the most "
+    const auto cr = compact_ ? GDR::CompactCaptureRefusals() : GDR::CaptureRefusals();
+    out += fmt::format("; CUE state not captured{}: no layout {}, more than {} dwords {}; empty layouts {} (the most "
                        "dwords {}); run members' PS plans from the CUE state (SSPC_CITY_GB_RUN_MATERIAL): {}, another "
                        "module/bindings {}, walked (no map) {}",
-                       cr[0], GDR::kMaxShadowDwords, cr[2], cr[1], cr[3], ld(member_[kPlanOk]),
+                       compact_ ? " (stages of the R10 ring, mesh and shadow draws together)" : "", cr[0],
+                       compact_ ? GDR::kCompactShadowDwords : GDR::kMaxShadowDwords, cr[2], cr[1], cr[3],
+                       ld(member_[kPlanOk]),
                        ld(member_[kPlanOther]), ld(member_[kPlanNone]));
     if (ld(member_check_[0]) != 0) {
         out += fmt::format("; checked against the walk {} (the same {}), differing by part flat {} buffers {} images {} "

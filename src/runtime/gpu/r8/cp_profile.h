@@ -139,6 +139,9 @@ enum class Sec : u8 {
     FrontNativeKey,    ///< its specialization key, the variant of these modules, EndOf
     JoinPsPlan,        ///< JoinRun: a G-buffer member's PS plan from its CUE state (NativeGBuffer::MemberPlan)
     T2IdleHeld,        ///< thread 2 waiting at a held run's first draw (front mode: the frontend thread joining members)
+    // R10 (SSPC_R10_NATIVE_DRAWS): the engine-state preparation of a 0x1a1960 / 0x43d480 draw (and, verify, its check)
+    FrontNativeMesh,
+    FrontNativeShadow,
     Count,
 };
 inline constexpr u32 kSections = static_cast<u32>(Sec::Count);
@@ -153,6 +156,14 @@ inline constexpr Sec Front(u32 engine_run) {
 /// Thread 2: the engine tag of the draw record it executes (Cp::DrawDescriptor::engine_run & 3; 0 for any other
 /// record), set by ParallelCp::Execute - BindStage and DrawRunMembers file their time under it.
 inline thread_local constinit u8 t_source = 0;
+/// SSPC_R10_T2_PARTS (read once, at static initialization): the engine source whose draw records thread 2's part
+/// sections (T2Gb*: the record's stages, BindStage's images and samplers) split - 3 G-buffer 0x1a1770 (the default,
+/// R8's), 2 shadow 0x43d480 ("shadow"), 1 mesh 0x1a1960 ("mesh"), 0 untagged draws ("untagged").
+extern const u8 g_parts_source;
+/// Thread 2: whether the draw being recorded is of g_parts_source (its record and BindStage split by parts).
+inline bool PartsSource() {
+    return g_mode != 0 && (t_source & 3) == g_parts_source;
+}
 /// `untagged` for an untagged draw, else the section of the source among the three after `mesh`.
 inline constexpr Sec BySource(Sec untagged, Sec mesh, u32 source) {
     return (source & 3) == 0 ? untagged : static_cast<Sec>(static_cast<u32>(mesh) + (source & 3) - 1);

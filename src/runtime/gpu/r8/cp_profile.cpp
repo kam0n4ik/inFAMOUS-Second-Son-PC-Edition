@@ -140,6 +140,8 @@ constexpr std::array<Info, kSections> MakeInfo() {
     set(Sec::FrontNativeKey, "frontend native G-buffer: specialization key, variant, EndOf", Cls::Compute);
     set(Sec::JoinPsPlan, "JoinRun: a G-buffer member's PS plan from its CUE state (no walk)", Cls::Compute);
     set(Sec::T2IdleHeld, "T2 idle: at a held run's first draw (the frontend joining)", Cls::Idle);
+    set(Sec::FrontNativeMesh, "R10 frontend native mesh 0x1a1960 (CUE state: template, plans, key)", Cls::Compute);
+    set(Sec::FrontNativeShadow, "R10 frontend native shadow 0x43d480 (CUE state: template, plans, key)", Cls::Compute);
     return a;
 }
 constexpr std::array<Info, kSections> kInfo = MakeInfo();
@@ -449,6 +451,12 @@ double RowSeconds(const Row& r) {
 } // namespace
 
 const u8 g_mode = ParseMode();
+const u8 g_parts_source = [] {
+    char v[16] = {};
+    const DWORD n = GetEnvironmentVariableA("SSPC_R10_T2_PARTS", v, sizeof(v));
+    const std::string_view sv(v, n < sizeof(v) ? n : 0);
+    return sv == "shadow" ? u8{2} : sv == "mesh" ? u8{1} : sv == "untagged" ? u8{0} : u8{3};
+}();
 thread_local constinit ThreadAcc t_acc{};
 
 void RegisterThread(Role role) {
@@ -837,6 +845,12 @@ std::string Report() {
     Row w{};
     const u32 n1 = SumWindow(0, from, to, w);
     out += fmt::format(" window {:.0f}..{:.0f} s: {} frames\n", from, to, n1);
+    if (g_parts_source != 3) {
+        constexpr std::string_view kParts[] = {"untagged draws", "mesh 0x1a1960", "shadow 0x43d480"};
+        out += fmt::format(" (SSPC_R10_T2_PARTS: the sections \"T2 G-buffer record: ...\" and \"T2 BindStage G-buffer: "
+                           "...\" are of the {} draw records here, not of 0x1a1770)\n",
+                           kParts[g_parts_source]);
+    }
     if (n1 != 0) {
         out += Table(w, n1, 0);
         if (g_mode == 2) {
