@@ -114,6 +114,9 @@ public:
     /// The recording thread: the pipeline built for `desc` (nullptr: not one of this precompiler's, failed, or claimed
     /// now for the caller to build). `waited`/`wait_ns`: it was being built and the caller waited.
     PipelineObjects* Take(const GS::PipelineDesc& desc, u64 hash, bool& waited, u64& wait_ns);
+    /// Whether `desc` is one of this precompiler's (any thread: the index and the descriptions do not change after
+    /// the constructor). R9-N: the frontend does not prefetch those.
+    bool Has(const GS::PipelineDesc& desc, u64 hash) const;
     /// Pipelines built and never taken (at the stop: what this run did not need).
     u32 NeverTaken() const;
 

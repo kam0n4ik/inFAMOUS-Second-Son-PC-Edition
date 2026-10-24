@@ -246,6 +246,10 @@ public:
     void DrawPrepared(const Cp::DrawDescriptor& draw, const PreparedCommand& prepared);
     void DispatchPrepared(const Cp::DispatchDescriptor& dispatch, const Cp::ComputeRegisters* cs,
                           const PreparedCommand& prepared);
+    /// R9-N (SSPC_PIPE_PREFETCH): the compute pipeline of a dispatch just prepared, started on the pipeline factory's
+    /// workers if nothing has built it (PipelineFactory::PrefetchCompute). Where the dispatch was prepared (the
+    /// frontend's thread, the processor's without one) - never the recording thread.
+    void PrefetchCompute(const GS::StageView& cs);
     /// SSPC_CITY_BATCH (docs/CITY_PERFORMANCE.md): may `next`, the draw right after `first` in the stream, be recorded
     /// with it as one draw - the same pipeline, resources, constants, targets and registers, only the geometry (vertex
     /// and index ranges the CPU wrote, VS user data the shader does not read) its own. The registers are `first`'s.

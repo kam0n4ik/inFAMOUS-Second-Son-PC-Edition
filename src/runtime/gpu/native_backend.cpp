@@ -51,6 +51,7 @@
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_translator.h"
 #include "runtime/gpu/static/static_predictor.h"
+#include "runtime/gpu/upscale/upscale_settings.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
 #include "runtime/gpu/vulkan/vk_emit.h"
@@ -532,6 +533,33 @@ private:
     u64 label_base_ = 0;                               ///< VideoOut's buffer labels (a wait on them waits for a flip)
 };
 
+std::string PipelineBench(Vk::DeviceContext& ctx, const GS::DeviceProfile& profile, GS::ShaderDiskCache& disk,
+                          const std::filesystem::path& logs_dir, std::string mode); // (below)
+
+/// SSPC_DIAG_BENCH_AT=ctx|buffers|present (R9-N): the pipeline bench (SSPC_PIPE_BENCH=...) on the backend's device at
+/// that step of Backend::Start (the shader cache opened read-only for it), then the process ends - which step makes the
+/// driver miss its pipeline cache file
+void DiagBenchAt(Vk::DeviceContext& ctx, const GS::DeviceProfile& profile, const Options& o, std::string_view point) {
+    char v[16] = {}, bm[24] = {};
+    if (GetEnvironmentVariableA("SSPC_DIAG_BENCH_AT", v, sizeof(v)) == 0 || point != v ||
+        GetEnvironmentVariableA("SSPC_PIPE_BENCH", bm, sizeof(bm)) == 0) {
+        return;
+    }
+    const auto root = o.shader_cache_dir / o.game / (Gcn::OwnTranslatorInstalled() ? "native_own" : "native");
+    const std::string gen = GS::ShaderCacheGeneration(profile);
+    GS::ShaderDiskCache disk;
+    std::string error;
+    if (!disk.Open({.dir = root / gen, .generation = gen, .read_only = true}, error)) {
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_BENCH_AT={} - the shader cache: {}", point, error);
+    } else {
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_BENCH_AT={} - {}", point,
+                 PipelineBench(ctx, profile, disk, o.logs_dir, bm));
+        disk.Close();
+    }
+    std::fflush(nullptr);
+    std::quick_exit(0);
+}
+
 bool Backend::Start(const Options& o, std::string& error) {
     options_ = o;
     Vk::ContextOptions co;
@@ -550,7 +578,9 @@ bool Backend::Start(const Options& o, std::string& error) {
         return false;
     }
     ctx_->QueryProfile(profile_);
+    DiagBenchAt(*ctx_, profile_, o, "ctx");
     timeline_ = std::make_unique<Vk::Timeline>(*ctx_);
+    DiagBenchAt(*ctx_, profile_, o, "timeline");
     // the stream ring: small read-only ranges and user data each command (~35 MiB a frame measured): room for 4 frames
     // in the BAR heap, so recording never waits for the GPU to free it
     // By default hybrid: the CPU copies into cached system memory, one copy per submission puts the bytes into a
@@ -579,6 +609,7 @@ bool Backend::Start(const Options& o, std::string& error) {
         error = "the timeline or the stream ring could not be created";
         return false;
     }
+    DiagBenchAt(*ctx_, profile_, o, "ring");
     if (ring_mirror) {
         if (std::string merr; !ring_->CreateMirror(merr)) {
             SSPC_LOG(GPU, Warning, "native backend: no video memory mirror of the stream ring ({}): the GPU reads it "
@@ -596,6 +627,7 @@ bool Backend::Start(const Options& o, std::string& error) {
         SSPC_LOG(GPU, Warning, "native backend: no write shadow ring: dispatches write the buffer cache in place");
         shadow_ring_.reset();
     }
+    DiagBenchAt(*ctx_, profile_, o, "shadow");
     {
         const auto& mem = ctx_->Memory();
         const u32 t = ring_->MemoryType();
@@ -612,8 +644,11 @@ bool Backend::Start(const Options& o, std::string& error) {
         return false;
     }
     std::memset(gds_.mapped, 0, Cp::kGdsBytes);
+    DiagBenchAt(*ctx_, profile_, o, "gds");
     guest_ = std::make_unique<Vk::GuestBuffers>(*ctx_);
+    DiagBenchAt(*ctx_, profile_, o, "guest");
     buffers_ = std::make_unique<Vk::BufferCache>(*ctx_, *guest_, &tracker_, 2560ull << 20, o.validation);
+    DiagBenchAt(*ctx_, profile_, o, "bcache");
     images_ = std::make_unique<Vk::ImageCache>(*ctx_, *guest_);
     {
         // the images' video memory: 40% of the device-local heap, at most 3 GiB (the route keeps ~0.85 GiB);
@@ -633,11 +668,13 @@ bool Backend::Start(const Options& o, std::string& error) {
         }
         images_->SetBudget(budget);
     }
+    DiagBenchAt(*ctx_, profile_, o, "buffers");
     pipelines_ = std::make_unique<Vk::PipelineFactory>(*ctx_, profile_);
     presenter_ = Vk::Presenter::Create(*ctx_, *timeline_, o.sdl_window, o.present_mode, error);
     if (!presenter_) {
         return false;
     }
+    DiagBenchAt(*ctx_, profile_, o, "present");
     GS::FrontendOptions fo;
     fo.async = false; // modules ready before the draw that needs them (no draw waits for a worker)
     fo.translate = true;
@@ -1819,7 +1856,7 @@ void Backend::OnFlip(u64 gpu_value) {
     t.batches = s.batches;
     const auto& p = pipelines_->Stats();
     t.pipelines = p.graphics + p.compute;
-    t.pipeline_ns = p.create_ns;
+    t.pipeline_ns = p.create_ns + p.prefetch_wait_ns; // (R9-N: a prefetched pipeline costs the frame only its wait)
     t.module_ns = p.module_ns;
     t.callbacks_ns = GS::TicksToNs(s.t_cb);
     FrameLog::CpFlip(gpu_value, t, t.last_unblock_tsc);
@@ -2034,6 +2071,14 @@ void Backend::StartShaderCache(const Options& o) {
     } else {
         SSPC_LOG(GPU, Info, "pipeline cache (driver): {}", pcache_->LoadNote());
     }
+    // SSPC_DIAG_BENCH_AT=cache (R9-N): the pipeline bench (SSPC_PIPE_BENCH=...) on the backend's own device, here,
+    // before the precompiler (bootstrap.cpp DiagBenchAt: the same before the backend started)
+    if (char v[16] = {}, bm[24] = {}; GetEnvironmentVariableA("SSPC_DIAG_BENCH_AT", v, sizeof(v)) > 0 &&
+                                      std::string_view(v) == "cache" &&
+                                      GetEnvironmentVariableA("SSPC_PIPE_BENCH", bm, sizeof(bm)) > 0) {
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_BENCH_AT=cache - {}",
+                 PipelineBench(*ctx_, profile_, *disk, o.logs_dir, bm));
+    }
     // the offline index of the game's programs (--scan-game-shaders): the cache's coverage of the game
     if (std::string ierr; game_index_.Load(root / "game_programs.idx", ierr)) {
         for (const GS::ProgramIdentity& id : disk->ProgramIdentities()) {
@@ -2099,9 +2144,31 @@ void Backend::RunStaticPrediction(const Options& o) {
 void Backend::RunPrecompile(const Options& o) {
     // the pipelines the last runs used first (a skipped wait, or the time limit, leaves the likeliest ones ready)
     std::vector<GS::PipelineDesc> descs = disk_->PipelinesByUse();
+    // SSPC_DIAG_PRECOMPILE_SKIP_FROM=<i> (R9-N A/B, docs/R9_NEON_DASH.md): the manifest's records from the i-th on (in
+    // the order they were first met: what runs after the first i created on demand, and what this series adds) left
+    // out - the game meets them as new ones again
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_DIAG_PRECOMPILE_SKIP_FROM", v, sizeof(v)) > 0) {
+        const size_t from = std::strtoull(v, nullptr, 10);
+        const std::vector<GS::PipelineDesc> all = disk_->Pipelines();
+        std::unordered_set<u64> skip;
+        for (size_t i = from; i < all.size(); ++i) {
+            skip.insert(all[i].Hash());
+        }
+        const size_t before = descs.size();
+        std::erase_if(descs, [&](const GS::PipelineDesc& d) { return skip.contains(d.Hash()); });
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_PRECOMPILE_SKIP_FROM={} - {} of the manifest's {} pipelines not "
+                               "precompiled", from, before - descs.size(), before);
+    }
     if (descs.empty()) {
         SSPC_LOG(GPU, Info, "shader precompiler: the manifest is empty (a first run): nothing to prepare");
         return;
+    }
+    // SSPC_DIAG_PRECOMPILE_DELAY_MS=<ms> (R9-N): the precompiler started that much later (does the driver take the
+    // pipeline cache file's data in the background after vkCreatePipelineCache returned?)
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_DIAG_PRECOMPILE_DELAY_MS", v, sizeof(v)) > 0) {
+        const DWORD ms = static_cast<DWORD>(std::strtoul(v, nullptr, 10));
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_PRECOMPILE_DELAY_MS={} - the precompiler starts that much later", ms);
+        Sleep(ms);
     }
     Vk::PrecompileOptions po;
     po.threads = o.precompile_threads;
@@ -2187,6 +2254,14 @@ std::string Backend::CacheReport() {
     if (ps.async_queued != 0) {
         out += fmt::format("background pipelines (SSPC_ASYNC_PIPELINES): queued {}, built {}, failed {}; draws skipped "
                            "while building {}\n", ps.async_queued, ps.async_built, ps.async_failed, ps.async_skips);
+    }
+    if (pipelines_->Prefetching()) {
+        out += fmt::format("prefetched compute pipelines (SSPC_PIPE_PREFETCH): queued {}, taken {} ({:.1f} ms of the "
+                           "workers' time, slowest {:.1f} ms), still building when recorded {} (the recording thread "
+                           "waited {:.1f} ms), not started yet - built by the recording thread {}, failed {}\n",
+                           pipelines_->PrefetchQueued(), ps.prefetch_taken, static_cast<double>(ps.prefetch_build_ns) / 1e6,
+                           static_cast<double>(ps.prefetch_slowest_ns) / 1e6, ps.prefetch_waited,
+                           static_cast<double>(ps.prefetch_wait_ns) / 1e6, ps.prefetch_claimed, ps.prefetch_failed);
     }
     if (const Vk::PipelinePrecompiler* pre = pipelines_->Precompiler()) {
         const auto p = pre->Progress();
@@ -2848,12 +2923,265 @@ std::string BuildPredictedPipelines(Vk::DeviceContext& ctx, const GS::DeviceProf
               : std::string("NOT saved"));
 }
 
+/// SSPC_PIPE_BENCH=cache|cold|noopt|par<N>|parnoopt<N> (R9-N, docs/R9_NEON_DASH.md): what the driver costs for the
+/// manifest's last SSPC_PIPE_BENCH_LAST (403: a run's pipelines created on demand) pipelines, each created once
+/// (SSPC_PIPE_BENCH_KIND=compute|graphics|all), nothing saved:
+///   cache   through the driver's pipeline cache file (vulkan.bin): which of them it holds
+///   cold    without a pipeline cache (with __GL_SHADER_DISK_CACHE_PATH=<an empty directory> the driver's own one is
+///           empty too: what the game's first creation costs)
+///   noopt   cold with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT
+///   par<N>  cold on N threads at once (parnoopt<N>: without optimization): the set's wall time
+/// -> <logs>\pipe_bench_<mode>.tsv (a pipeline a line) and the summary.
+std::string PipelineBench(Vk::DeviceContext& ctx, const GS::DeviceProfile& profile, GS::ShaderDiskCache& disk,
+                          const std::filesystem::path& logs_dir, std::string mode) {
+    u32 last = 403;
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_PIPE_BENCH_LAST", v, sizeof(v)) > 0) {
+        last = std::max<u32>(static_cast<u32>(std::strtoul(v, nullptr, 10)), 1);
+    }
+    std::string kind = "all";
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_PIPE_BENCH_KIND", v, sizeof(v)) > 0) {
+        kind = v;
+    }
+    const std::vector<GS::PipelineDesc> all = disk.Pipelines();
+    std::vector<const GS::PipelineDesc*> set;
+    for (size_t i = all.size() > last ? all.size() - last : 0; i < all.size(); ++i) {
+        if (kind == "all" || (kind == "compute") == all[i].compute) {
+            set.push_back(&all[i]);
+        }
+    }
+    const bool noopt = mode == "noopt" || mode.starts_with("parnoopt");
+    const VkPipelineCreateFlags cflags = noopt ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0u;
+    u32 threads = 1;
+    if (mode.starts_with("par")) {
+        threads = std::max(1, std::atoi(mode.c_str() + (noopt ? 8 : 3)));
+    }
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_PIPE_BENCH_THREADS", v, sizeof(v)) > 0) {
+        threads = std::max(1, std::atoi(v));
+    }
+    // cache2 / fresh2: the set built twice through vulkan.bin / a new empty pipeline cache (does the second pass hit:
+    // does the driver keep what it compiled in the application's cache; its data size before and after each pass)
+    const bool twice = mode == "cache2" || mode == "fresh2";
+    std::unique_ptr<Vk::PipelineCacheFile> pcache;
+    VkPipelineCache fresh = VK_NULL_HANDLE;
+    if (mode == "cache" || mode == "cache2") {
+        pcache = std::make_unique<Vk::PipelineCacheFile>(ctx, disk);
+        if (!pcache->Load()) {
+            return "SSPC_PIPE_BENCH: " + pcache->LoadNote();
+        }
+    } else if (mode == "fresh2") {
+        const VkPipelineCacheCreateInfo ci{.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        if (Vk::Fn().vkCreatePipelineCache(ctx.Device(), &ci, nullptr, &fresh) != VK_SUCCESS) {
+            return "SSPC_PIPE_BENCH: vkCreatePipelineCache failed";
+        }
+    } else if (mode != "cold" && !noopt && !mode.starts_with("par")) {
+        return "SSPC_PIPE_BENCH: unknown mode " + mode;
+    }
+    const VkPipelineCache cache = pcache ? pcache->Handle() : fresh;
+    const auto cache_bytes = [&] {
+        size_t n = 0;
+        if (cache != VK_NULL_HANDLE) {
+            Vk::Fn().vkGetPipelineCacheData(ctx.Device(), cache, &n, nullptr);
+        }
+        return n;
+    };
+    // SSPC_PIPE_BENCH_SPARSE_GIB=<n>: a sparse buffer of n GiB (as the buffer cache's mirror of the guest's GPU address
+    // space, 512 GiB on this GPU) made first - does the driver take its pipeline cache with it?
+    VkBuffer sparse = VK_NULL_HANDLE;
+    if (char v[16] = {}; GetEnvironmentVariableA("SSPC_PIPE_BENCH_SPARSE_GIB", v, sizeof(v)) > 0) {
+        const VkBufferCreateInfo bci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                     .flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT,
+                                     .size = std::strtoull(v, nullptr, 10) << 30,
+                                     .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        const VkResult r = Vk::Fn().vkCreateBuffer(ctx.Device(), &bci, nullptr, &sparse);
+        SSPC_LOG(GPU, Warning, "SSPC_PIPE_BENCH_SPARSE_GIB={}: a sparse buffer made first ({})", v, static_cast<int>(r));
+    }
+    Vk::PipelineFactory factory(ctx, profile);
+    factory.SetPersistence(cache, nullptr);
+    struct Row {
+        u64 hash = 0, ns = 0;
+        u32 words = 0, flags = 0;
+        bool ok = false;
+    };
+    std::vector<Row> rows(set.size());
+    std::atomic<size_t> next{0};
+    std::string first_error;
+    std::mutex error_mutex;
+    const auto pass = [&] {
+    next = 0;
+    std::vector<std::thread> pool;
+    for (u32 t = 0; t < threads; ++t) {
+        pool.emplace_back([&] {
+            const VkDevice dev = factory.Device();
+            std::vector<u32> vs, ps;
+            for (size_t i; (i = next.fetch_add(1)) < set.size();) {
+                const GS::PipelineDesc& d = *set[i];
+                Row& r = rows[i];
+                r.hash = d.Hash();
+                if (!disk.LoadSpirv(d.vs, vs) || (!d.compute && d.has_ps && !disk.LoadSpirv(d.ps, ps))) {
+                    continue;
+                }
+                r.words = static_cast<u32>(vs.size() + (!d.compute && d.has_ps ? ps.size() : 0));
+                VkShaderModule vm = VK_NULL_HANDLE, pm = VK_NULL_HANDLE;
+                const auto make = [dev](const std::vector<u32>& code, VkShaderModule& out) {
+                    const VkShaderModuleCreateInfo ci{.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                                      .pNext = nullptr,
+                                                      .flags = 0,
+                                                      .codeSize = code.size() * 4,
+                                                      .pCode = code.data()};
+                    return Vk::Fn().vkCreateShaderModule(dev, &ci, nullptr, &out) == VK_SUCCESS;
+                };
+                std::string error;
+                if (make(vs, vm) && (d.compute || !d.has_ps || make(ps, pm))) {
+                    Vk::PipelineObjects obj;
+                    const auto b0 = std::chrono::steady_clock::now();
+                    r.ok = factory.Build(d, vm, pm, obj, r.flags, error, cflags);
+                    r.ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - b0).count());
+                    if (r.ok) {
+                        factory.Destroy(obj);
+                    }
+                } else {
+                    error = "a shader module was refused";
+                }
+                if (vm != VK_NULL_HANDLE) {
+                    Vk::Fn().vkDestroyShaderModule(dev, vm, nullptr);
+                }
+                if (pm != VK_NULL_HANDLE) {
+                    Vk::Fn().vkDestroyShaderModule(dev, pm, nullptr);
+                }
+                if (!r.ok) {
+                    std::scoped_lock lock{error_mutex};
+                    if (first_error.empty()) {
+                        first_error = error;
+                    }
+                }
+            }
+        });
+    }
+    for (auto& t : pool) {
+        t.join();
+    }
+    };
+    const size_t bytes0 = cache_bytes();
+    std::string first_pass;
+    if (twice) {
+        const auto f0 = std::chrono::steady_clock::now();
+        pass();
+        u64 hits = 0, ns = 0;
+        for (const Row& r : rows) {
+            hits += (r.flags & ShaderTrace::kPipeCacheHit) != 0 ? 1 : 0;
+            ns += r.ns;
+        }
+        first_pass = fmt::format(" first pass: wall {:.0f} ms, sum {:.0f} ms, cache hits {}, the cache {} -> {} bytes;",
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count(),
+                                 static_cast<double>(ns) / 1e6, hits, bytes0, cache_bytes());
+        rows.assign(set.size(), Row{});
+    }
+    const size_t bytes1 = cache_bytes();
+    const auto t0 = std::chrono::steady_clock::now();
+    pass();
+    const double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const size_t bytes2 = cache_bytes();
+    if (fresh != VK_NULL_HANDLE) {
+        Vk::Fn().vkDestroyPipelineCache(ctx.Device(), fresh, nullptr);
+    }
+    if (sparse != VK_NULL_HANDLE) {
+        Vk::Fn().vkDestroyBuffer(ctx.Device(), sparse, nullptr);
+    }
+    std::ofstream tsv(logs_dir / fmt::format("pipe_bench_{}.tsv", mode), std::ios::trunc);
+    std::string out = fmt::format("SSPC_PIPE_BENCH={} ({} threads, the manifest's last {}, kind {}): {} pipelines,{} wall "
+                                  "{:.0f} ms, the cache {} -> {} bytes;", mode, threads, last, kind, set.size(), first_pass,
+                                  wall_ms, bytes1, bytes2);
+    for (int c = 1; c >= 0; --c) {
+        std::vector<double> ms;
+        u64 hits = 0, words = 0;
+        for (size_t i = 0; i < set.size(); ++i) {
+            if (set[i]->compute != (c == 1) || !rows[i].ok) {
+                continue;
+            }
+            ms.push_back(static_cast<double>(rows[i].ns) / 1e6);
+            hits += (rows[i].flags & ShaderTrace::kPipeCacheHit) != 0 ? 1 : 0;
+            words += rows[i].words;
+        }
+        if (ms.empty()) {
+            continue;
+        }
+        double sum = 0;
+        for (const double m : ms) {
+            sum += m;
+        }
+        std::ranges::sort(ms);
+        out += fmt::format(" {}: {} built, cache hits {}, sum {:.0f} ms, mean {:.1f}, p50 {:.1f}, p95 {:.1f}, max {:.1f} ms, "
+                           "SPIR-V mean {:.0f} KiB;",
+                           c == 1 ? "compute" : "graphics", ms.size(), hits, sum, sum / static_cast<double>(ms.size()),
+                           ms[ms.size() / 2], ms[std::min(ms.size() - 1, ms.size() * 95 / 100)], ms.back(),
+                           static_cast<double>(words) * 4.0 / 1024.0 / static_cast<double>(ms.size()));
+    }
+    // which program and specialization each first stage was translated from (the cache's module records)
+    struct Origin {
+        u64 program = 0;
+        u32 length = 0;
+        std::string key;
+    };
+    std::unordered_map<u64, Origin> origin; // SPIR-V hash (lo) -> its module
+    for (const GS::ProgramIdentity& p : disk.ProgramIdentities()) {
+        for (const GS::ModuleStub& s : disk.Stubs(p)) {
+            GS::DiskModule m;
+            std::string e;
+            if (disk.LoadModule(s.record, m, e)) {
+                origin[m.spirv_hash.lo] = {p.hash.lo, p.length, fmt::format("{:08x}", fmt::join(m.key.words, "."))};
+            }
+        }
+    }
+    tsv << "i\tcompute\tdesc_hash\tspirv_words\tms\thit\tok\tspirv\tprogram\tprogram_bytes\tkey\n";
+    for (size_t i = 0; i < set.size(); ++i) {
+        const auto it = origin.find(set[i]->vs.lo);
+        tsv << fmt::format("{}\t{}\t{:016x}\t{}\t{:.3f}\t{}\t{}\t{:016x}\t{:016x}\t{}\t{}\n", i, set[i]->compute ? 1 : 0,
+                           rows[i].hash, rows[i].words, static_cast<double>(rows[i].ns) / 1e6,
+                           (rows[i].flags & ShaderTrace::kPipeCacheHit) != 0 ? 1 : 0, rows[i].ok ? 1 : 0,
+                           set[i]->vs.lo, it != origin.end() ? it->second.program : 0,
+                           it != origin.end() ? it->second.length : 0, it != origin.end() ? it->second.key : "");
+    }
+    if (!first_error.empty()) {
+        out += " first failure: " + first_error;
+    }
+    return out;
+}
+
 } // namespace
 
 bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
     Vk::ContextOptions co;
     co.device_index = o.device_index;
     co.presentation = false;
+    // SSPC_PIPE_BENCH_PRESENT=1: the device as the game makes it (presentation, NGX, frame generation queues)
+    if (char pv[4] = {}; GetEnvironmentVariableA("SSPC_PIPE_BENCH", nullptr, 0) > 0 &&
+                         GetEnvironmentVariableA("SSPC_PIPE_BENCH_PRESENT", pv, sizeof(pv)) == 1 && pv[0] == '1') {
+        co.presentation = true;
+    }
+    // the game's process before its device: SSPC_PIPE_BENCH_CUDA=1 - CUDA initialized first (Upscale::ReserveCudaWindow);
+    // SSPC_PIPE_BENCH_RESERVE=1 - every free byte of [0xab20000, 1 TiB) reserved, as the guest's memory manager does
+    if (GetEnvironmentVariableA("SSPC_PIPE_BENCH", nullptr, 0) > 0) {
+        if (char v[4] = {}; GetEnvironmentVariableA("SSPC_PIPE_BENCH_CUDA", v, sizeof(v)) == 1 && v[0] == '1') {
+            Upscale::ReserveCudaWindow();
+        }
+        if (char v[4] = {}; GetEnvironmentVariableA("SSPC_PIPE_BENCH_RESERVE", v, sizeof(v)) == 1 && v[0] == '1') {
+            u64 held = 0;
+            MEMORY_BASIC_INFORMATION mi{};
+            for (u64 a = 0xab20000ull; a < 0x10000000000ull && VirtualQuery(reinterpret_cast<void*>(a), &mi, sizeof(mi));) {
+                const u64 base = reinterpret_cast<u64>(mi.BaseAddress), end = base + mi.RegionSize;
+                const u64 b = (base + 0xFFFF) & ~0xFFFFull, e = std::min<u64>(end, 0x10000000000ull) & ~0xFFFFull;
+                if (mi.State == MEM_FREE && e > b && VirtualAlloc(reinterpret_cast<void*>(b), e - b, MEM_RESERVE,
+                                                                  PAGE_NOACCESS) != nullptr) {
+                    held += e - b;
+                }
+                a = end;
+            }
+            SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_PIPE_BENCH_RESERVE=1 - {} GiB below 1 TiB reserved (as the guest)",
+                     held >> 30);
+        }
+    }
     std::string error;
     const auto ctx = Vk::DeviceContext::Create(co, error);
     GS::ShaderTranslator* translator = GS::GetShaderTranslator();
@@ -2874,6 +3202,12 @@ bool PredictShaders(const PredictShadersOptions& o, std::string& summary) {
         summary = fmt::format("--predict-shaders: the shader cache {}: {}", (root / gen).string(), error);
         SSPC_LOG(GPU, Error, "{}", summary);
         return false;
+    }
+    if (char bm[24] = {}; GetEnvironmentVariableA("SSPC_PIPE_BENCH", bm, sizeof(bm)) > 0) {
+        summary = PipelineBench(*ctx, profile, disk, o.logs_dir, bm);
+        SSPC_LOG(GPU, Info, "{}", summary);
+        disk.Close();
+        return true;
     }
     // SSPC_STATIC_KEYS=<a cache generation directory>: instead of predicting, the specialization keys of that cache's
     // modules as the frontend makes them (a layout's from its own translation) -> logs\cache_module_keys.tsv (the

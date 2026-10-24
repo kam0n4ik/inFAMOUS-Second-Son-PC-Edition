@@ -1320,6 +1320,9 @@ void ParallelCp::PrepareDispatch(Record& r, u64 index) {
         }
     }
     r.prepared = true;
+    if (r.prep.ready) {
+        exec_.PrefetchCompute(r.stage); // (R9-N SSPC_PIPE_PREFETCH: a new pipeline built while thread 2 catches up)
+    }
     bool writes = false;
     NoteStageWrites(r.stage, index, writes);
     if (writes) {
