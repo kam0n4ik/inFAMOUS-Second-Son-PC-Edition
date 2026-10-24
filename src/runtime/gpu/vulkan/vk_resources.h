@@ -78,6 +78,13 @@ public:
     /// Waits until the main semaphore reaches `main_value` or the lane's `lane_value` or the wake semaphore
     /// `wake_value` (0: not that one); true when one of the GPU's was reached.
     bool WaitAny(u64 main_value, u64 lane_value, u64 wake_value, u64 timeout_ns);
+    /// R10 pacing (SSPC_R10_AQ_MAIN_FREE=1, docs/R10_PACING.md): a main batch no longer waits for every lane batch
+    /// before it, so the main semaphore at `v` means every MAIN batch up to `v` completed; the completed value (every
+    /// batch up to it) stops below the lane's first value not completed.
+    void SetMainFree(bool on) { main_free_ = on; }
+    /// R10: the main-queue batch `value` and the main batches before it completed (lane batches before it possibly
+    /// not); false for a lane value (the caller asks Completed then).
+    bool MainReached(u64 value) const;
 
 private:
     DeviceContext& ctx_;
@@ -98,6 +105,7 @@ private:
     }
 
     u64 last_ = 0;
+    bool main_free_ = false; ///< R10: SetMainFree
     std::atomic<u64> completed_{0};
     std::atomic<VkResult> last_error_{VK_SUCCESS};
 };

@@ -269,7 +269,7 @@ public:
     bool GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u32 gds_offset, u32 bytes,
                        u32 pattern) override;
     void MemoryAcquired(u32 queue, bool blocked, u64 poll_address) override;
-    void WaitMetByHeldFence(u32 queue) override;
+    void WaitMetByHeldFence(u32 queue, u64 after_seq) override;
 
     // Cp::RegisterSink (thread 1: the processor's register file)
     void OnWrite(Cp::Space space, u32 offset, const u32* values, u32 count) override;
@@ -309,7 +309,8 @@ private:
         std::vector<u8> payload;             ///< CP-9 Write: the data (capacity reused)
         Cp::DmaKind gds_kind{};              ///< CP-9 Gds (memory in src)
         u32 gds_offset = 0, pattern = 0;     ///< Gds; Zpass: the DB mask, the stride
-        u64 seq = 0, src = 0, dst = 0, bytes = 0; ///< Copy; MemoryAcquired: dst = the poll address, seq = met (TSC)
+        u64 seq = 0, src = 0, dst = 0, bytes = 0; ///< Copy; MemoryAcquired: dst = the poll address, seq = met (TSC);
+                                              ///< WaitMet: seq = the meeting fence's after_seq (R10; 0: none)
         // stage 2: the frontend's preparation, copied at the packet (the frontend's own state is the next command's)
         GS::DrawPreparation prep;
         GS::StageView stage, ps; ///< VS or CS; PS

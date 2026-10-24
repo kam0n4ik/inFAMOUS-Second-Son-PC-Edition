@@ -2032,7 +2032,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
             exec_.Dma(r.dma);
             break;
         case Kind::WaitMet:
-            exec_.WaitMetByHeldFence(r.queue);
+            exec_.WaitMetByHeldFence(r.queue, r.seq);
             break;
         case Kind::MemoryAcquired:
             if (r.hook_done) {
@@ -2757,10 +2757,10 @@ void ParallelCp::Dma(const Cp::DmaOp& op) {
     SSPC_P410_QUEUED_CALL(Kind::Dma, kQDma, DrainReason::Dma, exec_.Dma(op), r.dma = op);
 }
 
-void ParallelCp::WaitMetByHeldFence(u32 queue) {
+void ParallelCp::WaitMetByHeldFence(u32 queue, u64 after_seq) {
     R8_CP_PROF(CpProfile::Sec::CbWaitMet);
-    SSPC_P410_QUEUED_CALL(Kind::WaitMet, kQWaitMet, DrainReason::WaitMet, exec_.WaitMetByHeldFence(queue),
-                          r.queue = queue);
+    SSPC_P410_QUEUED_CALL(Kind::WaitMet, kQWaitMet, DrainReason::WaitMet, exec_.WaitMetByHeldFence(queue, after_seq),
+                          r.queue = queue; r.seq = after_seq);
 }
 
 void ParallelCp::MemoryAcquired(u32 queue, bool blocked, u64 poll_address) {

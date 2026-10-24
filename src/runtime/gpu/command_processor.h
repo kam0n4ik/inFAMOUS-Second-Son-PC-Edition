@@ -308,8 +308,9 @@ public:
     /// Isolated with Options::waits_by_held_fences: a WAIT_REG_MEM was met in the GPU's order - a fence held for work
     /// already handed on will write a value meeting it (EVENT_WRITE_EOS then a wait for it: the GPU waiting for its own
     /// shaders). The executor orders everything after it after all earlier work (a full barrier); the fence's memory is
-    /// still written only when that work completed (P4.6).
-    virtual void WaitMetByHeldFence(u32 /*queue*/) {}
+    /// still written only when that work completed (P4.6). `after_seq` (R10, SSPC_R10_AQ_HELD_EXACT=1; else 0): the
+    /// fence queue's work the meeting fence waits for - the work after the wait need only follow that work.
+    virtual void WaitMetByHeldFence(u32 /*queue*/, u64 /*after_seq*/) {}
 };
 
 /// Before/after every packet (validation; nullptr: none).
@@ -535,9 +536,16 @@ private:
 
     Queue* Q(u32 queue) const;
     /// Isolated (diagnostics): a fence held for the GPU (any queue) will write `poll` with a value meeting the wait.
-    bool HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 ref, u32* by_queue = nullptr) const;
+    /// R10 (`after_seq`): the fence queue's work the meeting fence waits for; `earliest`: the earliest held fence from
+    /// which on every held write there meets the wait (else the queue's last one).
+    bool HeldFenceSatisfies(u64 poll, u32 function, u32 mask, u32 ref, u32* by_queue = nullptr, u64* after_seq = nullptr,
+                            bool earliest = false) const;
     /// Isolated: a held fence writes GDS data (RELEASE_MEM data_sel 5, EVENT_WRITE_EOS GDS store) when it completes.
     bool HeldGdsFence() const;
+    /// R10 pacing: SSPC_R10_AQ_HELD_EXACT / SSPC_R10_DIAG_HELD (command_processor.cpp).
+    static bool R10HeldExact();
+    static bool R10HeldDiag();
+    void R10LogHeldWait(const Queue& q, u64 poll, u32 function, u32 mask, u32 ref, u32 by_queue, u64 chosen_seq) const;
     /// Isolated (diagnostics): the WAIT_REG_MEM addresses the queues blocked on, the time they blocked.
     struct WaitStat {
         u64 count = 0, ns = 0, held = 0;

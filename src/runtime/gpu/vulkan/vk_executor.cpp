@@ -407,6 +407,12 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
                 SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_FB_ASYNC_NOTE_READS=1 - the main queue's graphics reads noted for "
                                        "the lane's conflicts");
             }
+            if (char mf[4] = {}; GetEnvironmentVariableA("SSPC_R10_AQ_MAIN_FREE", mf, sizeof(mf)) == 1 && mf[0] == '1') {
+                r10_main_free_ = true;
+                timeline_.SetMainFree(true);
+                SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R10_AQ_MAIN_FREE=1 - a main batch waits only for the lane batches "
+                                       "it conflicts with or a guest wait was met by, not for every lane batch before it");
+            }
             buffers_.DisableLazy(); // (FB-7's kept-back write-backs stay on the main queue: not with the lane)
             char sp[16] = {};
             if (GetEnvironmentVariableA("SSPC_FB_ASYNC_SPLIT", sp, sizeof(sp)) > 0) {
@@ -568,6 +574,7 @@ bool Executor::Begin() {
     cur_.aq_unreported.reset();
     cur_.value = timeline_.Next();
     cur_.trace_frame = StallTrace::CurrentFrame(); // (P4.12)
+    cur_.open_t = StallTrace::On() ? StallTrace::Now() : 0; // (R10: AqSubmit's start)
     cur_.submit_t0 = cur_.submit_t1 = 0;
     g_diag_submission.store(cur_.value, std::memory_order_relaxed);
     batch_first_cmd_ = batch_last_cmd_ = 0;
@@ -1002,6 +1009,7 @@ void Executor::Flush() {
     // FrameBreak AQ: the lane for a batch of compute queues only; it waits for the main batches in flight it conflicts
     // with (or all of them); a main batch waits for the lane's last batch
     u64 aq_wait_main = 0, aq_wait_lane = 0;
+    u16 aq_why = 0; // (R10: the stall trace's AqSubmit flags)
     if (!aq_family_) {
         cur_.lane = 0;
     }
@@ -1021,9 +1029,13 @@ void Executor::Flush() {
             }
             if (aq_wait_main != 0) {
                 ++stats_.aq_wait_all; // (a wait met by a held fence of a main batch in flight)
+                aq_why = StallTrace::kAqWhyAll | StallTrace::kAqWhyRange; // (R10: all|range = this path)
             } else if (cur_.aq_wait_all || cur_.aq_images || cur_.aq_overflow) {
                 aq_wait_main = aq_last_main_ > main_done ? aq_last_main_ : 0;
                 ++(cur_.aq_wait_all ? stats_.aq_wait_all : cur_.aq_images ? stats_.aq_wait_images : stats_.aq_wait_conflict);
+                aq_why = cur_.aq_wait_all ? StallTrace::kAqWhyAll
+                         : cur_.aq_images ? StallTrace::kAqWhyImages
+                                          : StallTrace::kAqWhyShared;
             } else {
                 bool shared = false;
                 for (const Batch& b : in_flight_) {
@@ -1033,10 +1045,50 @@ void Executor::Flush() {
                     }
                 }
                 ++(aq_wait_main == 0 ? stats_.aq_free : shared ? stats_.aq_wait_shared : stats_.aq_wait_conflict);
+                aq_why = aq_wait_main == 0 ? 0 : shared ? StallTrace::kAqWhyShared : StallTrace::kAqWhyRange;
             }
+            aq_why |= StallTrace::kAqLane | (aq_wait_main != 0 ? StallTrace::kAqWaitMain : 0);
         } else {
             stats_.aq_kept_main += cur_.work[Cp::kGraphicsQueue] == 0 && !cur_.queues.empty() ? 1 : 0;
-            aq_wait_lane = aq_last_lane_ > timeline_.QueryLane() ? aq_last_lane_ : 0;
+            const u64 lane_done = timeline_.QueryLane();
+            if (!r10_main_free_) {
+                aq_wait_lane = aq_last_lane_ > lane_done ? aq_last_lane_ : 0;
+                aq_why = aq_wait_lane != 0 ? StallTrace::kAqWaitLane : 0;
+            } else if (aq_last_lane_ > lane_done) {
+                // R10: the lane batches in flight it conflicts with, those with images / unknown accesses, the guest's
+                // waits met by a lane fence (the AqSubmit flags: wait lane + range / images / all)
+                ++stats_.r10_main_free_batches;
+                u64 conflict = 0, images = 0;
+                for (const Batch& b : in_flight_) {
+                    if (b.lane == 0 || b.done || b.value <= lane_done) {
+                        continue;
+                    }
+                    if (b.aq_images || b.aq_overflow || b.aq_wait_all) {
+                        images = std::max(images, b.value);
+                    } else if (b.value > conflict && AqConflict(cur_, b)) {
+                        conflict = b.value;
+                    }
+                }
+                u64 sync = 0, order = 0;
+                for (const u32 q : cur_.queues) {
+                    sync = std::max(sync, r10_q_sync_[q]);
+                    order = std::max(order, r10_q_lane_[q]);
+                }
+                sync = sync > lane_done ? sync : 0;
+                order = order > lane_done ? order : 0;
+                aq_wait_lane = std::max({conflict, images, sync, order});
+                if (aq_wait_lane == 0) {
+                    ++stats_.r10_main_free;
+                } else {
+                    ++(aq_wait_lane == sync     ? stats_.r10_main_wait_sync
+                       : aq_wait_lane == order  ? stats_.r10_main_wait_order
+                       : aq_wait_lane == images ? stats_.r10_main_wait_images
+                                                : stats_.r10_main_wait_conflict);
+                    aq_why = StallTrace::kAqWaitLane | (aq_wait_lane == sync || aq_wait_lane == order ? StallTrace::kAqWhyAll
+                                                        : aq_wait_lane == images ? StallTrace::kAqWhyImages
+                                                                                 : StallTrace::kAqWhyRange);
+                }
+            }
         }
     }
     const VkSemaphoreSubmitInfo signal{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
@@ -1048,6 +1100,7 @@ void Executor::Flush() {
     const u64 submit_t0 = GS::Ticks();
     u64 locked_t = 0;
     bool contended = false;
+    bool bind_waited = false;
     {
         std::unique_lock lock{ctx_.QueueMutex(), std::try_to_lock};
         if (!lock.owns_lock()) {
@@ -1059,6 +1112,7 @@ void Executor::Flush() {
         VkSemaphore bind_sem = VK_NULL_HANDLE;
         u64 bind_value = 0;
         buffers_.SubmitBinds(bind_sem, bind_value);
+        bind_waited = bind_sem != VK_NULL_HANDLE;
         if (aq_ && bind_sem == VK_NULL_HANDLE && buffers_.LastBindValue() != 0) {
             // AQ: blocks an earlier batch's binds made resident (on the main queue) may be used here - the lane is not
             // ordered behind them by the queue (measured: device lost with an MMU fault in a shader otherwise)
@@ -1109,6 +1163,14 @@ void Executor::Flush() {
             StallTrace::Span(StallTrace::Ev::QueueLock, submit_t0, locked_t, cur_.value);
         }
         StallTrace::Span(StallTrace::Ev::Submit, locked_t, submit_t1, cur_.value, static_cast<u32>(commands_));
+        // R10: the batch from its first command to here, its queue and what it waits for on the other one
+        u16 qmask = 0;
+        for (const u32 q : cur_.queues) {
+            qmask |= q < 8 ? static_cast<u16>(1u << q) : u16{0x80};
+        }
+        StallTrace::Span(StallTrace::Ev::AqSubmit, cur_.open_t != 0 ? cur_.open_t : locked_t, submit_t1, cur_.value,
+                         static_cast<u32>(aq_wait_main != 0 ? aq_wait_main : aq_wait_lane),
+                         static_cast<u16>(aq_why | (bind_waited ? StallTrace::kAqBinds : 0) | (qmask << 8)));
     }
     if (r != VK_SUCCESS) {
         const u64 value = cur_.value;
@@ -1131,6 +1193,11 @@ void Executor::Flush() {
     submitted_value_.store(cur_.value, std::memory_order_release);
     if (aq_) {
         (cur_.lane != 0 ? aq_last_lane_ : aq_last_main_) = cur_.value;
+        if (cur_.lane != 0) {
+            for (const u32 q : cur_.queues) {
+                r10_q_lane_[q] = cur_.value; // (R10 SSPC_R10_AQ_MAIN_FREE)
+            }
+        }
         ++(cur_.lane != 0 ? stats_.aq_lane_batches : stats_.aq_main_batches);
     }
     in_flight_.push_back(std::move(cur_));
@@ -1249,7 +1316,8 @@ void Executor::Retire(Batch& b) {
                         mine.pop_front();
                     }
                 }
-                StallTrace::GpuBatch(b.value, b.submit_t0, b.submit_t1, ts[0], ts[1], b.trace_frame); // (P4.12)
+                StallTrace::GpuBatch(b.value, b.submit_t0, b.submit_t1, ts[0], ts[1], b.trace_frame,
+                                     b.lane != 0 ? 1u : 0u); // (P4.12; R10: the lane)
                 if (insp_catalog_ != nullptr) {
                     // the frame's GPU time: the union of its batches' intervals (one queue; a batch's start may come
                     // before the previous one's end - its top-of-pipe timestamp)
@@ -2610,7 +2678,7 @@ void Executor::MemoryAcquiredApplied(u32 queue, bool blocked, u64 poll_address, 
     stats_.acquires_applied += applied ? 1 : 0;
 }
 
-void Executor::WaitMetByHeldFence(u32 queue_and_fence) {
+void Executor::WaitMetByHeldFence(u32 queue_and_fence, u64 after_seq) {
     const CallbackTimer cb_timer(stats_.t_cb, stats_.n_cb); // (P4.10)
     // (FrameBreak AQ: the fence's queue + 1 in the upper half, 0 unknown)
     const u32 queue = queue_and_fence & 0xFFFF;
@@ -2621,6 +2689,24 @@ void Executor::WaitMetByHeldFence(u32 queue_and_fence) {
     ++stats_.waits_by_held;
     MarkWrites(2);
     if (aq_) {
+        // R10 diagnostics (SSPC_R10_DIAG_HELD=1): what each wait made the later work wait for (the first 200, then
+        // every 32nd up to 400 more)
+        static const bool diag = [] {
+            char v[4] = {};
+            return GetEnvironmentVariableA("SSPC_R10_DIAG_HELD", v, sizeof(v)) == 1 && v[0] == '1';
+        }();
+        if (diag) {
+            static u32 seen = 0, logged = 0;
+            const u32 k = seen++;
+            if ((k < 200 || (k % 32) == 0) && logged++ < 600) {
+                const AqLast l = fence_q < Cp::kNumQueues ? AqFenceBatch(fence_q, after_seq) : AqLast{};
+                const AqLast last = fence_q < Cp::kNumQueues ? aq_q_last_[fence_q] : AqLast{};
+                SSPC_LOG(GPU, Info, "R10 AQ wait-met #{} tsc {}: queue {} fence queue {} after {}; fence batch v{} lane {} "
+                         "(queue's last v{} lane {}); open {} v{} lane {} queues {}; last main v{} lane v{}", k, __rdtsc(),
+                         queue, static_cast<int>(fence_q), after_seq, l.value, l.lane, last.value, last.lane, open_,
+                         cur_.value, cur_.lane, cur_.queues.size(), aq_last_main_, aq_last_lane_);
+            }
+        }
         // AQ: the work after the wait goes after the batch the fence's queue recorded in last - nothing to wait for on
         // the same queue or in the open batch; a main batch when the work after it may go to the lane
         if (fence_q >= Cp::kNumQueues || !aq_family_) {
@@ -2629,7 +2715,17 @@ void Executor::WaitMetByHeldFence(u32 queue_and_fence) {
             } else {
                 aq_next_wait_main_ = std::max(aq_next_wait_main_, aq_last_main_);
             }
-        } else if (const AqLast& l = aq_q_last_[fence_q]; l.lane == 0 && l.value != 0) {
+            if (r10_main_free_ && queue < Cp::kNumQueues) {
+                // R10: unknown - the queue's later work in a main batch after every lane batch so far (the open one
+                // included)
+                r10_q_sync_[queue] = std::max(r10_q_sync_[queue], open_ && cur_.pool_lane != 0 ? cur_.value : aq_last_lane_);
+            }
+        } else if (const AqLast l = AqFenceBatch(fence_q, after_seq);
+                   r10_main_free_ && l.lane != 0 && l.value != 0 && queue < Cp::kNumQueues) {
+            // R10: the fence's work is a lane batch's (REA-3's gate: graphics waiting for the frame's async compute) -
+            // a main batch with the waiting queue's work from here on waits for it
+            r10_q_sync_[queue] = std::max(r10_q_sync_[queue], l.value);
+        } else if (l.lane == 0 && l.value != 0) {
             if (open_ && l.value == cur_.value) {
                 // the fence is in the open main batch: ordered while the work stays in it, but a split right after it
                 // moves that work to the lane - the next batch waits for this one
@@ -2642,6 +2738,30 @@ void Executor::WaitMetByHeldFence(u32 queue_and_fence) {
             }
         }
     }
+}
+
+Executor::AqLast Executor::AqFenceBatch(u32 fence_q, u64 after_seq) {
+    // R10 (SSPC_R10_AQ_HELD_EXACT=1: after_seq != 0): the first batch with the fence queue's work up to the fence (the
+    // main queue completes in order: it and everything before it); that work complete: nothing to wait for
+    if (after_seq == 0) {
+        return aq_q_last_[fence_q];
+    }
+    ++stats_.r10_held_exact;
+    for (const Batch& b : in_flight_) {
+        if (b.work[fence_q] >= after_seq) {
+            if (b.done) {
+                ++stats_.r10_held_complete;
+                return {};
+            }
+            stats_.r10_held_earlier += b.value != aq_q_last_[fence_q].value ? 1 : 0;
+            return {b.value, b.lane};
+        }
+    }
+    if (open_ && cur_.work[fence_q] >= after_seq) {
+        return {cur_.value, cur_.lane};
+    }
+    ++stats_.r10_held_complete; // (retired: completed)
+    return {};
 }
 
 void Executor::BeforeUpload() {
