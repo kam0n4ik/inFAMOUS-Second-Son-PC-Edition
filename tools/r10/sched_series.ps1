@@ -7,7 +7,7 @@
 #       -Configs "A|#B|SSPC_R10_SCHED=1;SSPC_PIPE_PREFETCH=1"   (name|env;env ... configurations separated by #)
 param([Parameter(Mandatory)] [string]$Name, [Parameter(Mandatory)] [string]$Configs, [string]$Route = "traverse",
       [ValidateSet("city", "user", "neon", "beach", "harbor", "village")] [string]$Scene = "city", [int]$Rounds = 4,
-      [double]$Gate = 8, [double]$Dirty = 10, [int]$Tries = 3, [int]$GateMinutes = 15,
+      [double]$Gate = 8, [double]$Dirty = 10, [int]$Tries = 3, [int]$GateMinutes = 15, [string]$Shots = "",
       [string]$Worktree = "E:\SecondSonPC-r10-sched", [string]$Out = "E:\research\r10\runs\sched")
 $ErrorActionPreference = "Continue"
 $list = @($Configs.Split('#', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object {
@@ -39,7 +39,7 @@ for ($r = 1; $r -le $Rounds; $r++) {
             "$(Get-Date -Format 'HH:mm:ss') round $r $tag" | Add-Content "$dir\series.txt"
             "  gate: background $bg%$(if ($bg -ge $Gate) { " (over the gate after $GateMinutes min, run anyway)" })" |
                 Add-Content "$dir\series.txt"
-            & "$PSScriptRoot\sched_run.ps1" -Tag $tag -Scene $Scene -Route $Route -Env $c.Env -Worktree $Worktree -Out $dir |
+            & "$PSScriptRoot\sched_run.ps1" -Tag $tag -Scene $Scene -Route $Route -Env $c.Env -Worktree $Worktree -Out $dir -Shots $Shots |
                 Select-Object -Last 1
             $during = [double](& python -I "E:\research\deep_perf\tools\bgof.py" "$dir\$tag")
             if ($during -le $Dirty -and $during -ge 0) {
