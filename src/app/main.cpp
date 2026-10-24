@@ -560,6 +560,25 @@ int main(int argc, char* argv[]) {
             config->memory_commit_on_demand = true;
         }
     }
+    // R10 sysrt (docs/R10_SYSRT.md): SSPC_R10_SYSRT=native - the game's remaining CommonDialog, libSceNet and
+    // libSceLibcInternal calls on SecondSonPC's own functions (groups sysrt-dialog, sysrt-net, sysrt-libc; each also
+    // with --native <group>, back with --bridge <group>); bridge or unset - the bridge's, as before.
+    if (const char* v = std::getenv("SSPC_R10_SYSRT");
+        v != nullptr && config->loader == App::Config::LoaderBackend::Sspc && !config->selftest) {
+        const std::string_view mode = v;
+        if (mode == "native") {
+            for (const char* g : {"sysrt-dialog", "sysrt-net", "sysrt-libc"}) {
+                if (std::find(config->native_groups.begin(), config->native_groups.end(), g) ==
+                        config->native_groups.end() &&
+                    std::find(config->bridged_groups.begin(), config->bridged_groups.end(), g) ==
+                        config->bridged_groups.end()) {
+                    config->native_groups.emplace_back(g);
+                }
+            }
+        } else if (mode != "bridge") {
+            return Fail("SSPC_R10_SYSRT must be native or bridge");
+        }
+    }
     if (config->selftest && config->loader != App::Config::LoaderBackend::Sspc) {
         return Fail("--selftest compares SecondSonPC's subsystems with shadPS4's; it needs --loader sspc");
     }

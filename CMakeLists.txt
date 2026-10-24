@@ -217,6 +217,9 @@ foreach(_r9 profile)
     include(${CMAKE_SOURCE_DIR}/cmake/r9/${_r9}.cmake)
 endforeach()
 target_sources(sspc_runtime PRIVATE ${SSPC_R9_PROFILE_SOURCES})
+# R10 sysrt (docs/R10_SYSRT.md): its own list (cmake/r10/sysrt.cmake), the bridge's part in sspc_attach_bootstrap
+include(${CMAKE_SOURCE_DIR}/cmake/r10/sysrt.cmake)
+target_sources(sspc_runtime PRIVATE ${SSPC_R10_SYSRT_SOURCES})
 # libSceVideodec (runtime/media/videodec.cpp): FFmpeg's H.264 decoder, the library the oracle uses too
 target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
 # P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation

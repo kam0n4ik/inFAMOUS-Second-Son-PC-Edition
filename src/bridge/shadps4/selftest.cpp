@@ -39,6 +39,7 @@
 #include "bridge/shadps4/memory_host.h"
 #include "bridge/shadps4/selftest_threads.h"
 #include "bridge/shadps4/selftest_vmm.h"
+#include "bridge/shadps4/sysrt_host.h"
 #include "common/elf_info.h"
 #include "common/singleton.h"
 #include "core/file_format/psf.h"
@@ -4859,11 +4860,18 @@ int RunSelfTest(const App::Config& cfg) {
                              std::string_view(only) == "shader";
     // FrameBreak: SSPC_SELFTEST_ONLY=settings - the PC settings' groups alone (same reason)
     const bool settings_only = std::string_view(only) == "settings";
+    // R10: SSPC_SELFTEST_ONLY=sysrt - CommonDialog, libSceNet and libSceLibcInternal's stdout alone (selftest_sysrt.cpp)
+    const bool sysrt_only = std::string_view(only) == "sysrt";
     decltype(TestShaderFrontend(cfg)) native_groups;
     if (settings_only) {
         TestPcSettings(t, cfg);
     }
     if (!shader_only && !settings_only) {
+        for (auto& g : TestSysrt(cfg)) {
+            native_groups.push_back(std::move(g));
+        }
+    }
+    if (!shader_only && !settings_only && !sysrt_only) {
     TestParamSfo(t, cfg);
     TestFileSystem(t, cfg);
     TestPlayGo(t);
@@ -4928,7 +4936,7 @@ int RunSelfTest(const App::Config& cfg) {
         native_groups.push_back(std::move(g));
     }
     } // (!shader_only)
-    if (!settings_only) {
+    if (!settings_only && !sysrt_only) {
     // P5.3: the native operations' direct path through the processor (light: also in the shader-only run).
     for (auto& g : TestGpuNativeDirect()) {
         native_groups.push_back(std::move(g));

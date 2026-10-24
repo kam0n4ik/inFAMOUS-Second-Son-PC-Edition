@@ -57,6 +57,7 @@
 #include "bridge/shadps4/native_memory.h"
 #include "bridge/shadps4/perf_opts.h"
 #include "bridge/shadps4/settings_host.h"
+#include "bridge/shadps4/sysrt_host.h"
 #include "runtime/gpu/gcn/gcn_translator.h"
 #include "runtime/savedata/savedata.h"
 #include "runtime/gpu/upscale/reflex.h"
@@ -756,6 +757,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     }
     StartBridgeLibraries(bindings, cfg.selftest);
     InstallKernelHost(cfg, psf_attributes);
+    InstallSysrtHost(cfg); // R10 sysrt: the bridge's dialogs and sockets beside SecondSonPC's CommonDialog / libSceNet
     if (!HasBridgeImport(bindings, "libScePad")) {
         // Automated runs (--press) inject input; the system cursor must not be grabbed by them.
         InstallNativeInput(cfg, g_window->GetSDLWindow(), !cfg.test_presses.empty());
