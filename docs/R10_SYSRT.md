@@ -10,7 +10,7 @@
 |---|---|---|
 | Владельцы 417 импортов: NATIVE / BRIDGE / COMMON_STUB / UNRESOLVED [E, binding table] | 338 / 59 / 18 / 2 | 350 / 49 / 17 / 1 |
 | Вызванные за запуск импорты не у SecondSonPC (обычный путь: запуск, загрузка, город) [E] | 9: CommonDialog 1, Net 3, libc 3 (`vprintf` — COMMON_STUB), Ajm 2 | 2: Ajm 2 (зона агента ajm) |
-| То же с ручным сохранением из «Настройки → Сохранение» [E] | +3 SaveDataDialog | +3 SaveDataDialog (заблокировано, §5) |
+| То же с «Настройки → Сохранение» или «→ Загрузка» [E] | +3 SaveDataDialog | +3 SaveDataDialog (заблокировано, §5) |
 
 Перенесены все вызываемые функции из зоны sysrt: `sceCommonDialogInitialize`, `sceNetInit`, `sceNetPoolCreate`,
 `sceNetInetNtop`, `vprintf`, `fflush`, `sceLibcHeapGetTraceInfo`. Вместе с ними перенесены функции с общим
@@ -50,7 +50,7 @@
 переноса таких нет); `object` — неразрешённый объект; `stub` — COMMON_STUB, не вызывался; `idle` — у моста,
 импортирован, но ни разу не вызывался.
 
-Прогоны таблицы: before = s1/b_city_menu (bridge), after = s0/x_save_native (native, с ручным сохранением).
+Прогоны таблицы: before = s1/b_save_dialog (bridge), after = s0/x_save_native (native). Маршрут у обоих один: титул → Continue → карта → Настройки → Сохранение. CSV: `E:\research\r10\runs\sysrt\deps_final.csv`.
 
 | run | imports | NATIVE | OBSERVED | BRIDGE | COMMON_STUB | UNRESOLVED | LLE |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -59,9 +59,9 @@
 
 | NID | function | library/module | importers | ABI | before owner/calls | after owner/calls | class | priority | side effects | note |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `s9e3+YpRnzw` | `sceSaveDataDialogInitialize` | libSceSaveDataDialog/libSceSaveDataDialog | eboot | SysV | BRIDGE / 0 | BRIDGE / 1 | called | P1 | system UI (save list) over the game | the save-list system dialog: Settings > Save opens it [E]; drawn by the bridge's UI layer - an own one needs a system dialog UI on SecondSonPC's presenter (blocked: not a runtime function, separate task); CommonDialog state shared through the sysrt-dialog adapter |
-| `4tPhsP6FpDI` | `sceSaveDataDialogOpen` | libSceSaveDataDialog/libSceSaveDataDialog | eboot | SysV | BRIDGE / 0 | BRIDGE / 1 | called | P1 | system UI (save list) over the game | the save-list system dialog: Settings > Save opens it [E]; drawn by the bridge's UI layer - an own one needs a system dialog UI on SecondSonPC's presenter (blocked: not a runtime function, separate task); CommonDialog state shared through the sysrt-dialog adapter |
-| `KK3Bdg1RWK0` | `sceSaveDataDialogUpdateStatus` | libSceSaveDataDialog/libSceSaveDataDialog | eboot | SysV | BRIDGE / 0 | BRIDGE / 121 | called | P1 | system UI (save list) over the game | the save-list system dialog: Settings > Save opens it [E]; drawn by the bridge's UI layer - an own one needs a system dialog UI on SecondSonPC's presenter (blocked: not a runtime function, separate task); CommonDialog state shared through the sysrt-dialog adapter |
+| `s9e3+YpRnzw` | `sceSaveDataDialogInitialize` | libSceSaveDataDialog/libSceSaveDataDialog | eboot | SysV | BRIDGE / 1 | BRIDGE / 1 | called | P1 | system UI (save list) over the game | the save-list system dialog: Settings > Save opens it [E]; drawn by the bridge's UI layer - an own one needs a system dialog UI on SecondSonPC's presenter (blocked: not a runtime function, separate task); CommonDialog state shared through the sysrt-dialog adapter |
+| `4tPhsP6FpDI` | `sceSaveDataDialogOpen` | libSceSaveDataDialog/libSceSaveDataDialog | eboot | SysV | BRIDGE / 1 | BRIDGE / 1 | called | P1 | system UI (save list) over the game | the save-list system dialog: Settings > Save opens it [E]; drawn by the bridge's UI layer - an own one needs a system dialog UI on SecondSonPC's presenter (blocked: not a runtime function, separate task); CommonDialog state shared through the sysrt-dialog adapter |
+| `KK3Bdg1RWK0` | `sceSaveDataDialogUpdateStatus` | libSceSaveDataDialog/libSceSaveDataDialog | eboot | SysV | BRIDGE / 120 | BRIDGE / 121 | called | P1 | system UI (save list) over the game | the save-list system dialog: Settings > Save opens it [E]; drawn by the bridge's UI layer - an own one needs a system dialog UI on SecondSonPC's presenter (blocked: not a runtime function, separate task); CommonDialog state shared through the sysrt-dialog adapter |
 | `uoUpLGNkygk` | `sceCommonDialogInitialize` | libSceCommonDialog/libSceCommonDialog | eboot | SysV, () -> s32 | BRIDGE / 1 | NATIVE / 1 | own | P1 | module state: initialized flag read by MsgDialog/SaveData-/ErrorDialog | sysrt-dialog; eboot 0x15d7d9 ignores the result [A] |
 | `2sWzhYqFH4E` | `_Stdout` | libSceLibcInternal/libSceLibcInternal | Fios2 | data object (FILE) | UNRESOLVED / 0 | NATIVE / 0 | own | P1 | - | sysrt-libc exports the object: Fios2's fflush(_Stdout) gets a real FILE* instead of NULL [A] |
 | `MUjC4lbHrK4` | `fflush` | libSceLibcInternal/libSceLibcInternal | Fios2 | SysV, (FILE*) -> int | BRIDGE / 1 | NATIVE / 1 | own | P1 | libc stdout buffer | sysrt-libc; Fios2 0x38650 after vprintf, FILE = _Stdout slot [A] |
@@ -285,13 +285,18 @@ classes (last run): called 3, own 12, ajm 11, object 1, stub 17, idle 35
 | s0/x_save_native | native | city: титул → Continue → карта (Esc) → Настройки (F) → Сохранение (Space) | закрыт тестом, exit 0, 95,5 с | 56,7 / 38,4 | 0 | автосейв infamousssAuto1 (dis.dat + param.sfo) через 19 с после старта, SetParam 1; SaveDataDialog Open 1, UpdateStatus 121 |
 | s1/b_city_menu | bridge | city: титул → Continue → карта → Настройки → вверх/вниз → Назад (E) → Esc → ходьба | exit 0, 95,5 с | 51,7 / 25,0 | 0 | автосейв infamousssAuto1, SetParam 1 |
 | s1/b_user_calm | bridge | user: титул → Continue → стоит 120 с | exit 0, 120,4 с | 30,2 / 19,3 | 0 | автосейв Auto0 и Auto1, SetParam 2 |
-| s1/n_city_menu | native | как b_city_menu | NOT TESTED: ждёт стенд (флаг тишины pacing) | | | |
-| s1/n_user_calm | native | как b_user_calm | NOT TESTED: ждёт стенд (флаг тишины pacing) | | | |
-| s1/b_save_dialog | bridge | как x_save_native | NOT TESTED: ждёт стенд (флаг тишины pacing) | | | |
-| s2/контрольный | native | запуск → меню → загрузка → геймплей → сохранение → выход в меню | NOT TESTED: ждёт стенд (флаг тишины pacing) | | | |
+| s1/n_city_menu | native | как b_city_menu (карта, Настройки, Назад, Esc, ходьба — по скриншотам) | exit 0, 95,6 с | 52,4 / 27,0 | 0 | автосейв infamousssAuto1, SetParam 1 |
+| s1/n_user_calm | native | как b_user_calm | exit 0, 120,5 с | 29,8 / 26,4 | 0 | автосейв Auto0 и Auto1, SetParam 2 |
+| s1/b_save_dialog | bridge | как x_save_native | exit 0, 96,3 с | 56,0 / 42,8 | 0 | автосейв Auto1, SetParam 1; SaveDataDialog Open 1, UpdateStatus 120 — то же, что в native |
+| s2/n_control | native | запуск → титул → Continue (загрузка) → ходьба → автосейв → карта (Esc) → Настройки (F) → «Загрузка» (Space) | exit 0, 110,6 с; кадры шли до конца (5085) | 47,5 / 28,6 | 0 | автосейв Auto1 (dis.dat 17:33:07) + param.sfo Auto0; «Загрузка» открывает SaveDataDialog (Open 1, UpdateStatus 168), экран игры чёрный — ждёт невидимый диалог |
 
 FPS приведён только для справки: прогоны функциональные, не A/B. Стенд был занят чужими сериями, а b_user_calm
 частично шёл под флагом тишины pacing (см. SHARED_NOTES 11:09).
+
+Рекомендация для `play.cmd`: `set SSPC_R10_SYSRT=native`. Регрессий запуска, загрузки, автосохранения, меню и
+геймплея за 5 native-прогонов не найдено [E]. Владельцы функций меняются только для 12 импортов, которые
+вызываются по одному разу при старте. На производительность это не влияет: прогоны функциональные, A/B не
+делался. Откат: `SSPC_R10_SYSRT=bridge` или убрать переменную.
 
 Во всех native-прогонах:
 * сводка загрузчика: 350/49/17/1;
@@ -303,9 +308,19 @@ FPS приведён только для справки: прогоны функ
 
 ## 7. Не проверено, риски
 
-* **Ручное сохранение (Настройки → Сохранение).** Игра открывает SaveDataDialog моста и опрашивает
-  UpdateStatus (статус RUNNING). В native-прогоне на скриншотах диалога не видно, хотя прошло 30 с после Open.
-  Сравнение с bridge — в §6.2. Это функция моста, общая для обоих режимов; sysrt её не меняет.
+* **«Настройки → Сохранение» и «Настройки → Загрузка» не работают в обоих режимах; к sysrt это отношения не
+  имеет** [E].
+  * Игра открывает SaveDataDialog моста и опрашивает UpdateStatus, который всё время возвращает RUNNING.
+  * Диалог моста (ImGui) на презентере SecondSonPC не рисуется, поэтому выбрать слот нечем. При «Сохранении»
+    меню остаётся на экране, при «Загрузке» экран становится чёрным, хотя кадры идут.
+  * Для «Сохранения» bridge (b_save_dialog) и native (x_save_native) совпадают: Open 1, UpdateStatus 120/121.
+  * Для «Загрузки» прогон в режиме bridge NOT TESTED: стенд был занят сериями pacing/sched.
+  * Sysrt меняет только Initialize CommonDialog, и флаг моста выставлен в обоих режимах.
+  * Автосохранения работают во всех прогонах.
+  * Нужна отдельная задача: собственный системный диалог сохранений на презентере.
+* **«Выход в меню».** Пункта «выйти в главное меню» в списке настроек нет: его прокрутили до раздела «Экран»
+  (s2/x_exit_explore). Поэтому «выход в меню» проверен как выход из Настроек и карты обратно в игру (n_city_menu).
+  Возврат на титул не проверялся.
 * **Ошибки резолверов моста.** Прямые записи errno в `ResolverReturn` моста не зеркалируются в
   `sceNetErrnoLoc` SecondSonPC. В офлайне резолверы не вызываются [E].
 * **Форма `%p` и нулевое заполнение `%s`/`%c`** взяты из FreeBSD [H для Sony]. `%p` есть в отладочных
@@ -321,6 +336,7 @@ FPS приведён только для справки: прогоны функ
 
 * a18986e — код: реализация, адаптеры, self-test, CMake/allowlist, `tools/r10`.
 * 02bf2eb — `tools/r10/sysrt_run.ps1`, `sysrt_selftest.ps1`: ожидание флага тишины прямо перед запуском.
+* 0ae9d9a — `tools/r10/sysrt_deps.py`: причины по группам остатка.
 * Этот документ — отдельным коммитом (см. `git log -- docs/R10_SYSRT.md`).
 
 Сборка проверок: `build\bin\SecondSonPC.exe` от 09:47:43, это код a18986e. Изменения после неё касаются только
