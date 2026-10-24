@@ -10,7 +10,7 @@
 param([Parameter(Mandatory)] [string]$Name, [Parameter(Mandatory)] [string]$Configs, [Parameter(Mandatory)] [string]$Scenes,
       [string]$Worktree = "E:\SecondSonPC-r10-pacing", [string]$Out = "E:\research\r10\runs\pacing",
       [double]$Gate = 8, [double]$Dirty = 10, [int]$Tries = 3,
-      [string]$Base = "SSPC_R9_PCACHE=1;SSPC_R9_HEAP_WINDOW=1")
+      [string]$Base = "SSPC_R9_PCACHE=1;SSPC_R9_HEAP_WINDOW=1", [datetime]$Until = [datetime]::MaxValue)
 $ErrorActionPreference = "Continue"
 $launcher = "SSPC_P53_FRONTEND_THREAD=1;SSPC_CP_ASYNC_WRITES=1;SSPC_CP_ASYNC_FLIP=1;SSPC_VK_EMIT_THREAD=1;SSPC_VK_EMIT_BATCH=1;" +
             "SSPC_CP_RING=128;SSPC_NATIVE_GBUFFER=native"
@@ -23,7 +23,7 @@ $list | Format-Table -AutoSize | Out-String -Width 400 | Add-Content "$dir\serie
 
 function Wait-Stand {
     $lock = "E:\research\r10\build.lock"
-    while ((Test-Path $lock) -and ((Get-Date) - (Get-Item $lock).LastWriteTime).TotalMinutes -lt 120) { Start-Sleep -Seconds 15 }
+    while ((Test-Path $lock) -and ((Get-Date) - (Get-Item $lock).LastWriteTime).TotalMinutes -lt 30) { Start-Sleep -Seconds 15 }
     $c = New-Object System.Diagnostics.PerformanceCounter("Processor", "% Processor Time", "_Total")
     for ($k = 0; $k -lt 90; $k++) {
         [void]$c.NextValue(); $v = @()
@@ -59,6 +59,7 @@ foreach ($sc in $Scenes.Split(',', [StringSplitOptions]::RemoveEmptyEntries)) {
             if (Test-Path "$dir\$tag\stats.json") { continue }
             if (Test-Path "$dir\$tag") { Rename-Item "$dir\$tag" "$($tag)_aborted$(Get-Date -Format 'HHmmss')" }
             for ($k = 1; $k -le $Tries; $k++) {
+                if ((Get-Date) -gt $Until) { "$(Get-Date -Format 'HH:mm:ss') past -Until, stopped before $tag" | Add-Content "$dir\series.txt"; return }
                 $g = Wait-Stand
                 "$(Get-Date -Format 'HH:mm:ss') $tag (gate $g%)" | Add-Content "$dir\series.txt"
                 $envs = "$Base;$($c.Env)".Trim(';')
