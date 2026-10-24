@@ -20,9 +20,11 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "base/abi.h"
+#include "runtime/gpu/r10/work_pool.h"
 #include "runtime/gpu/shader/pipeline_state.h"
 #include "runtime/gpu/shader/shader_cache.h"
 #include "runtime/gpu/shader/shader_disk_cache.h"
@@ -71,6 +73,13 @@ struct PipelineStats {
     /// SSPC_ASYNC_PIPELINES: graphics pipelines handed to the background workers, draws skipped while one was being
     /// built, built / failed there
     u64 async_queued = 0, async_skips = 0, async_built = 0, async_failed = 0;
+    /// R9-N SSPC_PIPE_PREFETCH: compute pipelines a worker built before their dispatch was recorded (taken), of them
+    /// still being built when it was (waited for); not started yet - built by the recording thread itself (claimed);
+    /// failed on the worker (built again by the recording thread)
+    u64 prefetch_taken = 0, prefetch_waited = 0, prefetch_claimed = 0, prefetch_failed = 0;
+    u64 prefetch_wait_ns = 0;  ///< the recording thread's waits for the workers (what a frame still stalls)
+    u64 prefetch_build_ns = 0; ///< the workers' creation time of the pipelines taken
+    u64 prefetch_slowest_ns = 0;
 };
 
 class PipelineFactory {
@@ -85,6 +94,19 @@ public:
                                     const GS::Module* ps, const GS::ResourceBindingPlan* ps_plan,
                                     std::string& error);
     const PipelineObjects* Compute(const GS::Module& cs, const GS::ResourceBindingPlan& plan, std::string& error);
+
+    /// R9-N (SSPC_PIPE_PREFETCH=1|<threads>, docs/R9_NEON_DASH.md): the compute pipeline of a dispatch the frontend
+    /// just prepared, when nothing has built it yet, started on worker threads now - the frontend runs ahead of the
+    /// recording thread, so the new pipelines of a burst (an effect met the first time) are built side by side instead
+    /// of one after another. Compute takes the result, waiting for the worker if it is still building: the dispatch is
+    /// never skipped. The frontend's thread (or the processor's without one), never the recording thread.
+    void PrefetchCompute(const GS::Module& cs, const GS::ResourceBindingPlan& plan);
+    bool Prefetching() const { return prefetch_; }
+    /// Pipelines handed to the prefetch workers so far (any thread).
+    u64 PrefetchQueued() const { return pf_queued_.load(std::memory_order_relaxed); }
+    /// R10: the pool the background jobs run on (nullptr: the factory's own threads), its refused submissions.
+    const R10::WorkPool* Pool() const { return pool_; }
+    u64 PoolRefused() const { return pool_refused_.load(std::memory_order_relaxed); }
 
     const PipelineStats& Stats() const { return stats_; }
 
@@ -110,9 +132,11 @@ public:
     static GS::PipelineDesc DescribeCompute(const GS::Module& cs, const GS::ResourceBindingPlan& plan);
     /// A pipeline from its description and its stages' modules (ps: VK_NULL_HANDLE without one). Any thread: it
     /// touches nothing of the factory but the auxiliary stages' table (locked). `flags`: ShaderTrace::kPipe* (driver
-    /// feedback). false + `error`: nothing left behind in `out`.
+    /// feedback). false + `error`: nothing left behind in `out`. `create_flags`: VkPipelineCreateFlags of the create info
+    /// (R9-N: VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT for a quick first build). `on_demand`: one the game needs now
+    /// (not the precompiler's) - without the driver's pipeline cache under SSPC_DIAG_PIPE_COLD_DEMAND=1.
     bool Build(const GS::PipelineDesc& desc, VkShaderModule vs, VkShaderModule ps, PipelineObjects& out, u32& flags,
-               std::string& error);
+               std::string& error, VkPipelineCreateFlags create_flags = 0, bool on_demand = false);
     /// Destroys a pipeline's objects (a failed precompiled one, the precompiler's at the end).
     void Destroy(PipelineObjects& obj);
     VkDevice Device() const;
@@ -166,6 +190,9 @@ private:
         std::string error;
     };
     void AsyncWorker();
+    /// One queued job taken (`wait`: until one comes or the stop - the own workers; else nullptr when none - a pool task)
+    AsyncJob* PopAsync(bool wait);
+    void RunAsync(AsyncJob* j);
     bool async_ = false, async_compute_ = false;
     std::unordered_map<u64, std::unique_ptr<AsyncJob>, U64Hash> async_jobs_; ///< by key (the recording thread's)
     std::mutex async_mutex_;
@@ -173,6 +200,54 @@ private:
     std::deque<AsyncJob*> async_queue_;
     std::vector<std::thread> async_workers_;
     bool async_stop_ = false;
+
+    // R9-N SSPC_PIPE_PREFETCH (PrefetchCompute)
+    struct PrefetchJob {
+        GS::PipelineDesc desc;
+        u64 hash = 0;
+        std::vector<u32> spirv; ///< the compute stage's (a copy: the worker makes its own module)
+        u8 state = 0;           ///< 0 queued, 1 building, 2 ready, 3 failed (under pf_mutex_)
+        std::unique_ptr<PipelineObjects> obj;
+        u32 flags = 0;
+        u64 ns = 0;
+        std::string error;
+    };
+    void PrefetchWorker();
+    PrefetchJob* PopPrefetch(bool wait); ///< (as PopAsync)
+    void RunPrefetch(PrefetchJob* j);
+    /// The recording thread: the prefetched pipeline of `desc`, installed under `key` (waits for a worker still
+    /// building it). nullptr: none, failed, or not started yet (taken out of the queue: the caller builds it now).
+    const PipelineObjects* TakePrefetched(u64 key, u64 hash, const GS::PipelineDesc& desc, const GS::Module* cs);
+    /// The recording thread has (or is about to build) a pipeline of this description: not prefetched again.
+    void NoteKnown(u64 hash);
+    bool prefetch_ = false;
+    /// SSPC_DIAG_PIPE_COLD_DEMAND=1 (R9-N A/B): pipelines created on demand bypass the driver's pipeline cache file (with
+    /// __GL_SHADER_DISK_CACHE_PATH=<an empty directory>: compiled as the first time a player meets them)
+    bool cold_demand_ = false;
+    std::unordered_set<u64, U64Hash> pf_seen_; ///< (cs module, layout) keys the frontend looked at (its thread only)
+    std::mutex pf_mutex_;
+    std::condition_variable pf_cv_, pf_done_cv_;
+    std::unordered_multimap<u64, std::unique_ptr<PrefetchJob>, U64Hash> pf_jobs_; ///< by description hash, until taken
+    std::unordered_set<u64, U64Hash> pf_known_; ///< descriptions the recording thread has or builds itself
+    std::deque<PrefetchJob*> pf_queue_;
+    std::vector<std::thread> pf_workers_;
+    bool pf_stop_ = false;
+    std::atomic<u64> pf_queued_{0};
+
+    // R10 (SSPC_R10_SCHED=1, r10/work_pool.h): the async graphics and prefetch jobs run as tasks of the shared work
+    // pool instead of the threads above - drainer tasks (at most one a worker per kind) take the oldest job of their
+    // queue, one a task, and go on as a new task while it is not empty; a job is never dropped (the first version
+    // refused jobs when the pool's queue was full: on a cold cache the draws stayed skipped - docs §8). The destructor
+    // waits for the tasks submitted so far (those that find the factory dying take nothing).
+    /// A drainer task of the pool for the kind's queue (prefetch / async graphics) when fewer than the workers run.
+    void Kick(bool prefetch);
+    bool SubmitDrainer(bool prefetch);
+    bool QueuedFor(bool prefetch);
+    std::atomic<u32> pool_drainers_[2] = {}; ///< drainer tasks of each kind submitted and not ended
+    R10::WorkPool* pool_ = nullptr;
+    std::atomic<u32> pool_inflight_{0};
+    std::atomic<bool> pool_dead_{false};
+    std::atomic<u64> pool_refused_{0};
 };
 
 /// The layout signature of plans (binding numbers, kinds, counts): part of a pipeline's key.

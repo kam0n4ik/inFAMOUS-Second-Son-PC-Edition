@@ -4,6 +4,8 @@
 #include "runtime/gpu/vulkan/vk_precompile.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -14,6 +16,7 @@
 #include "base/log.h"
 #include "runtime/gpu/r9/pcache.h"
 #include "runtime/gpu/shader_trace.h"
+#include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_pipelines.h"
 #include "runtime/kernel/clock.h"
@@ -124,6 +127,12 @@ bool PipelineCacheFile::Load() {
         loaded_bytes_ = data.size();
         last_bytes_ = data.size();
         note_ = fmt::format("{:.1f} MiB loaded", static_cast<double>(data.size()) / (1 << 20));
+        // SSPC_DIAG_PCACHE_SIZE=1 (R9-N): what the driver holds of it once created
+        if (char v[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_PCACHE_SIZE", v, sizeof(v)) == 1 && v[0] == '1') {
+            size_t held = 0;
+            const VkResult q = Fn().vkGetPipelineCacheData(ctx_.Device(), cache_, &held, nullptr);
+            note_ += fmt::format(" (DIAGNOSTIC: the driver reports {} bytes, result {})", held, static_cast<int>(q));
+        }
     }
     ShaderTrace::Event(ShaderTrace::Kind::CacheLoad, t0, __rdtsc(), 1, data.size());
     return true;
@@ -336,6 +345,23 @@ bool PipelinePrecompiler::Build(Entry& e, std::vector<u32>& vs, std::vector<u32>
         e.ns = static_cast<u64>(TscMs(t1 - t0) * 1e6);
         build_ns_.fetch_add(e.ns, std::memory_order_relaxed);
         ShaderTrace::Event(ShaderTrace::Kind::Precompile, t0, t1, e.hash, 0, flags | (ok ? 0u : ShaderTrace::kPipeFailed));
+        StallTrace::Span(StallTrace::Ev::PipeBuild, t0, t1, e.hash, 0, 2); // (R10 timeline)
+        // SSPC_DIAG_PRECOMPILE_LOG=<n> (R9-N): the first n pipelines built - their time and the driver's feedback
+        static const u32 log_first = [] {
+            char v[16] = {};
+            return GetEnvironmentVariableA("SSPC_DIAG_PRECOMPILE_LOG", v, sizeof(v)) > 0
+                       ? static_cast<u32>(std::strtoul(v, nullptr, 10))
+                       : 0u;
+        }();
+        static std::atomic<u32> logged{0};
+        if (log_first != 0 && logged.load(std::memory_order_relaxed) < log_first) {
+            const u32 n = logged.fetch_add(1, std::memory_order_relaxed);
+            if (n < log_first) {
+                SSPC_LOG(GPU, Info, "DIAGNOSTIC precompile #{}: {} {:016x} {:.1f} ms, feedback {}, cache hit {}", n,
+                         d.compute ? "compute" : "graphics", e.hash, static_cast<double>(e.ns) / 1e6,
+                         (flags & ShaderTrace::kPipeFeedback) != 0, (flags & ShaderTrace::kPipeCacheHit) != 0);
+            }
+        }
         if (ok) {
             e.obj = std::move(obj);
         } else if (failed_.load(std::memory_order_relaxed) < 4) {
@@ -354,6 +380,7 @@ bool PipelinePrecompiler::Build(Entry& e, std::vector<u32>& vs, std::vector<u32>
 void PipelinePrecompiler::Worker(u32 index) {
     SetThreadDescription(GetCurrentThread(), (L"SecondSonPC:Precompile" + std::to_wstring(index)).c_str());
     ShaderTrace::NameThread("SecondSonPC:Precompile");
+    StallTrace::RegisterThread(StallTrace::Role::Worker); // (R10 timeline)
     bool lowered = false;
     std::vector<u32> vs, ps;
     while (!cancel_.load(std::memory_order_acquire)) {
@@ -383,6 +410,15 @@ void PipelinePrecompiler::Worker(u32 index) {
     if (running_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         end_tsc_.store(__rdtsc(), std::memory_order_release);
     }
+}
+
+bool PipelinePrecompiler::Has(const GS::PipelineDesc& desc, u64 hash) const {
+    for (auto [a, b] = index_.equal_range(hash); a != b; ++a) {
+        if (entries_[a->second].desc == desc) {
+            return true;
+        }
+    }
+    return false;
 }
 
 PipelineObjects* PipelinePrecompiler::Take(const GS::PipelineDesc& desc, u64 hash, bool& waited, u64& wait_ns) {

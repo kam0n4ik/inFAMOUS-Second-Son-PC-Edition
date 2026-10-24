@@ -66,6 +66,7 @@
 #include "engine/game_clock_probe.h"
 #include "runtime/gpu/r8/r8_verify_frame.h"
 #include "runtime/gpu/r9/gprof.h"
+#include "runtime/gpu/r10/latency.h"
 #include "engine/guest_hooks.h"
 #include "engine/game_fixes.h"
 #include "engine/mouse_camera.h"
@@ -693,6 +694,8 @@ void SetupFilesystem(const App::Config& cfg, const std::string& serial) {
     vfs.Mount("/data", data, false);
 }
 
+void DiagBenchAt(const App::Config& cfg, const std::string& game, std::string_view point); // (below)
+
 void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
                    const std::string& serial, u32 psf_attributes) {
     for (const auto& g : cfg.bridged_groups) {
@@ -800,6 +803,7 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         if (cfg.pc.shader_precompile_progress && cfg.test_presses.empty()) {
             no.precompile_progress = &ShowPrecompileProgress;
         }
+        DiagBenchAt(cfg, serial, "backend");
         std::string gpu_error;
         if (!Gpu::Native::Start(no, gpu_error)) {
             Fatal("--gpu-backend sspc: SecondSonPC's GPU backend did not start: " + gpu_error);
@@ -1106,6 +1110,9 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
                 e.key.scancode = ev.scancode;
                 e.key.key = SDL_GetKeyFromScancode(ev.scancode, SDL_KMOD_NONE, false);
                 e.key.down = ev.kind == Kind::KeyDown;
+                if (ev.kind == Kind::KeyDown) {
+                    Gpu::R10::Latency::Input(1, 0.0f, 0.0f); // (SSPC_R10_LATENCY: the moment it is pushed)
+                }
                 SDL_PushEvent(&e);
                 break;
             case Kind::ButtonDown:
@@ -1117,6 +1124,9 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
                 e.button.button = ev.button;
                 e.button.down = ev.kind == Kind::ButtonDown;
                 e.button.clicks = 1;
+                if (ev.kind == Kind::ButtonDown) {
+                    Gpu::R10::Latency::Input(2, 0.0f, 0.0f);
+                }
                 SDL_PushEvent(&e);
                 break;
             case Kind::Move:
@@ -1125,6 +1135,7 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
                 e.motion.which = Input::KeyboardMouse::kScriptedInputId;
                 e.motion.xrel = ev.dx;
                 e.motion.yrel = ev.dy;
+                Gpu::R10::Latency::Input(3, ev.dx, ev.dy);
                 SDL_PushEvent(&e);
                 break;
             case Kind::Mark:
@@ -1368,6 +1379,37 @@ int RunPredictShaders(const App::Config& cfg, const std::string& game) {
     return ok ? 0 : 1;
 }
 
+namespace {
+/// SSPC_DIAG_BENCH_AT=memory|backend (R9-N, docs/R9_NEON_DASH.md): the pipeline bench (SSPC_PIPE_BENCH=...,
+/// native_backend.cpp PipelineBench) run in the game's own process at that point of its start - after the guest's
+/// memory is reserved, or just before the GPU backend starts - then the process ends: which step of the start makes the
+/// driver miss its pipeline cache file (the bench of --predict-shaders, earlier in RunGame, hits it)
+void DiagBenchAt(const App::Config& cfg, const std::string& game, std::string_view point) {
+    char v[16] = {};
+    if (GetEnvironmentVariableA("SSPC_DIAG_BENCH_AT", v, sizeof(v)) == 0 || point != v) {
+        return;
+    }
+    if (point == "memory") { // (RunSspcLoader installs them later)
+        InstallShaderTranslatorAdapter();
+        Gpu::Gcn::InstallOwnTranslatorIfEnabled(true);
+    }
+    Gpu::Native::PredictShadersOptions po;
+    po.device_index = cfg.gpu_device;
+    po.game_dir = cfg.game_dir;
+    po.templates = cfg.predict_shaders;
+    po.shader_cache_dir = cfg.shader_cache_dir;
+    po.game = game;
+    po.cache_max_mib = cfg.pc.shader_cache_max_mib;
+    po.threads = cfg.pc.shader_precompile_threads;
+    po.logs_dir = cfg.logs_dir;
+    std::string summary;
+    Gpu::Native::PredictShaders(po, summary);
+    SSPC_LOG(Bridge, Warning, "DIAGNOSTIC: SSPC_DIAG_BENCH_AT={} - {}", point, summary);
+    std::fflush(nullptr);
+    std::quick_exit(0);
+}
+} // namespace
+
 void RunGame(const App::Config& cfg) {
     const bool own_loader = cfg.loader == LoaderBackend::Sspc;
     Common::SetCurrentThreadName("SecondSonPC:Main");
@@ -1503,6 +1545,7 @@ void RunGame(const App::Config& cfg) {
     }
     // Reserves the guest address space. Must precede Trace::Init (thunks are host allocations).
     Core::GetGuestVirtualMemory().Reserve();
+    DiagBenchAt(cfg, id, "memory");
     g_controllers = Common::Singleton<::Input::GameControllers>::Instance();
     // The Phase 0 path's loader. The sspc path never creates shadPS4's Core::Linker.
     Core::Linker* shad_linker = own_loader ? nullptr : Common::Singleton<Core::Linker>::Instance();

@@ -220,6 +220,9 @@ target_sources(sspc_runtime PRIVATE ${SSPC_R9_PROFILE_SOURCES})
 # R10 sysrt (docs/R10_SYSRT.md): its own list (cmake/r10/sysrt.cmake), the bridge's part in sspc_attach_bootstrap
 include(${CMAKE_SOURCE_DIR}/cmake/r10/sysrt.cmake)
 target_sources(sspc_runtime PRIVATE ${SSPC_R10_SYSRT_SOURCES})
+# R10 sched (docs/R10_CPU_GPU_SCHEDULER.md): the latency probe and the pipeline workers' pool (cmake/r10/sched.cmake)
+include(${CMAKE_SOURCE_DIR}/cmake/r10/sched.cmake)
+target_sources(sspc_runtime PRIVATE ${SSPC_R10_SCHED_SOURCES})
 # libSceVideodec (runtime/media/videodec.cpp): FFmpeg's H.264 decoder, the library the oracle uses too
 target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
 # R10 (docs/R10_AJM.md): libSceAjm, SecondSonPC's own (runtime/audio/ajm.cpp, SSPC_R10_AJM=native|verify), on its

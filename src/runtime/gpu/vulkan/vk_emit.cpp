@@ -16,6 +16,8 @@
 
 #include "base/abi.h"
 #include "base/log.h"
+#include "runtime/gpu/r10/spread.h"
+#include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_api.h"
 
 namespace SecondSon::Gpu::Vk::Emit {
@@ -135,7 +137,13 @@ void FullSync() {
 
 void Loop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuEmit");
+    R10::SpreadThisThread(R10::Heavy::Emit); // (SSPC_R10_SPREAD)
+    // (R10 timeline: this thread may start before the trace does - its role is registered once the trace is on)
+    bool trace_role = false;
     u64 r = 0;
+    // (R10 timeline: waits shorter than ~5 us count to the run around them - a span a published record is too many)
+    constexpr u64 kTraceMinWait = 20'000;
+    u64 run_t0 = __rdtsc(), run_r0 = 0;
     for (;;) {
         u64 w = g_w.load(std::memory_order_acquire);
         if (w == r) {
@@ -152,6 +160,21 @@ void Loop() {
                 }
                 g_sleeping.store(0, std::memory_order_relaxed);
                 w = g_w.load(std::memory_order_acquire);
+            }
+            if (StallTrace::On()) {
+                if (!trace_role) {
+                    StallTrace::RegisterThread(StallTrace::Role::Emit);
+                    trace_role = true;
+                }
+                const u64 t1 = __rdtsc();
+                if (t1 - t0 >= kTraceMinWait) {
+                    if (r != run_r0) {
+                        StallTrace::Span(StallTrace::Ev::EmitRun, run_t0, t0, r - run_r0);
+                    }
+                    StallTrace::Span(StallTrace::Ev::EmitWait, t0, t1);
+                    run_t0 = t1;
+                    run_r0 = r;
+                }
             }
         }
         while (r < w) {

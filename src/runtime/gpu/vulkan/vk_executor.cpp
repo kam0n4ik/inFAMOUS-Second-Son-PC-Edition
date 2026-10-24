@@ -6903,6 +6903,12 @@ void Executor::DispatchWith(const Cp::DispatchDescriptor& d, const Cp::ComputeRe
     RecordDispatch(d, cs, pc, t0);
 }
 
+void Executor::PrefetchCompute(const GS::StageView& cs) {
+    if (cs.module != nullptr && pipelines_.Prefetching()) {
+        pipelines_.PrefetchCompute(*cs.module, cs.plan);
+    }
+}
+
 void Executor::DispatchPrepared(const Cp::DispatchDescriptor& d, const Cp::ComputeRegisters* cs,
                                 const PreparedCommand& pc) {
     const u64 t0 = GS::Ticks();

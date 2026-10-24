@@ -30,7 +30,7 @@
 namespace SecondSon::Gpu::StallTrace {
 
 /// Whose thread recorded an event.
-enum class Role : u8 { Cp, Record, Present, Game, Other, Count };
+enum class Role : u8 { Cp, Record, Present, Game, Other, Frontend, Emit, Worker, Count };
 
 /// The events (spans unless named instant). The thread is the log's, not part of the type.
 enum class Ev : u16 {
@@ -86,6 +86,17 @@ enum class Ev : u16 {
     // R10 pacing (docs/R10_PACING.md): a batch's life on the recording thread and which Vulkan queue it went to
     AqSubmit,        ///< from the batch's first command (its Begin) to its vkQueueSubmit2's return (a = timeline value,
                      ///< b = the other queue's value it waits for, low 32 bits; c = AqSubmitFlags | queue mask << 8)
+    // R10 timeline (docs/R10_CPU_GPU_SCHEDULER.md; tools/r10/timeline.py): the other threads of the frame's pipeline
+    FrontWait,       ///< the frontend thread waits for a record of thread 1
+    FrontPrep,       ///< deep (records): the frontend prepares one record (b = index low 32 bits, c = kind)
+    EmitWait,        ///< the emitter thread waits for commands (spinning, then asleep)
+    EmitRun,         ///< the emitter passes a run of commands to the driver (a = bytes)
+    PipeBuild,       ///< a worker builds a pipeline (a = description hash, c = 0 async graphics, 1 compute prefetch,
+                     ///< 2 the start-up precompiler)
+    InputEvent,      ///< instant: scripted input pushed into the window's queue (a = kind 1 key, 2 button, 3 move;
+                     ///< b = |dx| + |dy| of a move)
+    PresentDone,     ///< instant: vkQueuePresentKHR returned (a = flip id)
+    SchedTask,       ///< a task of the R10 work pool (a = its class, c = priority)
     Count,
 };
 constexpr size_t kEvents = static_cast<size_t>(Ev::Count);

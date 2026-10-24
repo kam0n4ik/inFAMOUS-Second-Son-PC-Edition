@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 #include <fmt/format.h>
@@ -120,6 +121,7 @@ u64 LayoutSignature(std::span<const GS::ResourceBindingPlan* const> plans) {
 
 PipelineFactory::PipelineFactory(DeviceContext& ctx, const GS::DeviceProfile& profile)
     : ctx_(ctx), profile_(profile) {
+    pool_ = R10::WorkPool::Get(); // (R10 SSPC_R10_SCHED=1: the jobs below run on the shared pool, no threads of their own)
     if (char v[8] = {}; GetEnvironmentVariableA("SSPC_DIAG_SHARED_LAYOUTS", v, sizeof(v)) == 2 && std::string_view(v) == "on") {
         share_layouts_ = true;
         SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_DIAG_SHARED_LAYOUTS=on - one pipeline layout per binding signature");
@@ -128,41 +130,224 @@ PipelineFactory::PipelineFactory(DeviceContext& ctx, const GS::DeviceProfile& pr
                         !share_layouts_) {
         async_ = true;
         async_compute_ = v[0] == '2'; // (=2: compute pipelines too - their dispatches skipped until ready)
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 3 && pool_ == nullptr; ++i) {
             async_workers_.emplace_back([this] { AsyncWorker(); });
         }
-        SSPC_LOG(GPU, Warning, "SSPC_ASYNC_PIPELINES={} - new {} pipelines are built on 3 background threads; their "
+        SSPC_LOG(GPU, Warning, "SSPC_ASYNC_PIPELINES={} - new {} pipelines are built on {}; their "
                                "draws{} are skipped until ready (no stall on the driver's compiler)",
-                 v[0], async_compute_ ? "graphics and compute" : "graphics", async_compute_ ? " and dispatches" : "");
+                 v[0], async_compute_ ? "graphics and compute" : "graphics",
+                 pool_ != nullptr ? "the R10 work pool" : "3 background threads",
+                 async_compute_ ? " and dispatches" : "");
     }
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_PIPE_COLD_DEMAND", v, sizeof(v)) == 1 && v[0] == '1') {
+        cold_demand_ = true;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_PIPE_COLD_DEMAND=1 - pipelines created on demand bypass the "
+                               "driver's pipeline cache file");
+    }
+    // R9-N SSPC_PIPE_PREFETCH=1 (half the logical processors, 2..6 workers) | <workers>: PrefetchCompute
+    if (char v[8] = {}; GetEnvironmentVariableA("SSPC_PIPE_PREFETCH", v, sizeof(v)) > 0 && v[0] != '0' && !share_layouts_) {
+        u32 n = static_cast<u32>(std::strtoul(v, nullptr, 10));
+        if (n <= 1) {
+            n = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 6u);
+        }
+        n = std::min(n, 12u);
+        prefetch_ = true;
+        for (u32 i = 0; i < n && pool_ == nullptr; ++i) {
+            pf_workers_.emplace_back([this] { PrefetchWorker(); });
+        }
+        SSPC_LOG(GPU, Info, "SSPC_PIPE_PREFETCH: new compute pipelines are built on {} from the moment "
+                            "the frontend prepares their dispatch (the recording thread waits for one still building; "
+                            "no dispatch is skipped)",
+                 pool_ != nullptr ? fmt::format("the R10 work pool ({} workers)", pool_->Workers())
+                                  : fmt::format("{} worker threads", n));
+    }
+}
+
+void PipelineFactory::PrefetchWorker() {
+    StallTrace::RegisterThread(StallTrace::Role::Worker);
+    while (PrefetchJob* j = PopPrefetch(true)) {
+        RunPrefetch(j);
+    }
+}
+
+PipelineFactory::PrefetchJob* PipelineFactory::PopPrefetch(bool wait) {
+    std::unique_lock lk{pf_mutex_};
+    if (wait) {
+        pf_cv_.wait(lk, [&] { return pf_stop_ || !pf_queue_.empty(); });
+    }
+    if (pf_stop_ || pf_queue_.empty()) {
+        return nullptr;
+    }
+    PrefetchJob* j = pf_queue_.front();
+    pf_queue_.pop_front();
+    j->state = 1;
+    return j;
+}
+
+void PipelineFactory::RunPrefetch(PrefetchJob* j) {
+    const VkDevice dev = ctx_.Device();
+    // (the job's description and SPIR-V are only read until it is published ready/failed below)
+    auto obj = std::make_unique<PipelineObjects>();
+    u32 flags = 0;
+    std::string error;
+    bool ok = false;
+    const VkShaderModuleCreateInfo ci{.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                      .codeSize = j->spirv.size() * 4,
+                                      .pCode = j->spirv.data()};
+    VkShaderModule m = VK_NULL_HANDLE;
+    const u64 t0 = NowNs();
+    const u64 tsc0 = __rdtsc();
+    if (Fn().vkCreateShaderModule(dev, &ci, nullptr, &m) == VK_SUCCESS) {
+        ok = Build(j->desc, m, VK_NULL_HANDLE, *obj, flags, error, 0, true);
+        Fn().vkDestroyShaderModule(dev, m, nullptr); // (a pipeline does not need its modules once created)
+    } else {
+        error = "vkCreateShaderModule refused the compute stage";
+    }
+    const u64 ns = NowNs() - t0;
+    StallTrace::Span(StallTrace::Ev::PipeBuild, tsc0, __rdtsc(), j->hash, 0, 1); // (R10 timeline)
+    {
+        std::scoped_lock lk{pf_mutex_};
+        j->flags = flags;
+        j->ns = ns;
+        if (ok) {
+            j->obj = std::move(obj);
+        } else {
+            j->error = std::move(error);
+        }
+        j->spirv = {};
+        j->state = ok ? 2 : 3;
+    }
+    pf_done_cv_.notify_all();
 }
 
 void PipelineFactory::AsyncWorker() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    for (;;) {
-        AsyncJob* j = nullptr;
-        {
-            std::unique_lock lk{async_mutex_};
-            async_cv_.wait(lk, [&] { return async_stop_ || !async_queue_.empty(); });
-            if (async_stop_) {
-                return;
-            }
-            j = async_queue_.front();
-            async_queue_.pop_front();
-        }
-        j->state.store(1, std::memory_order_relaxed);
-        auto obj = std::make_unique<PipelineObjects>();
-        const u64 t0 = NowNs();
-        const bool ok = Build(j->desc, j->vs, j->ps, *obj, j->flags, j->error);
-        j->ns = NowNs() - t0;
-        if (ok) {
-            j->obj = std::move(obj);
-        }
-        j->state.store(ok ? 2 : 3, std::memory_order_release);
+    StallTrace::RegisterThread(StallTrace::Role::Worker);
+    while (AsyncJob* j = PopAsync(true)) {
+        RunAsync(j);
     }
 }
 
+PipelineFactory::AsyncJob* PipelineFactory::PopAsync(bool wait) {
+    std::unique_lock lk{async_mutex_};
+    if (wait) {
+        async_cv_.wait(lk, [&] { return async_stop_ || !async_queue_.empty(); });
+    }
+    if (async_stop_ || async_queue_.empty()) {
+        return nullptr;
+    }
+    AsyncJob* j = async_queue_.front();
+    async_queue_.pop_front();
+    return j;
+}
+
+void PipelineFactory::RunAsync(AsyncJob* j) {
+    j->state.store(1, std::memory_order_relaxed);
+    auto obj = std::make_unique<PipelineObjects>();
+    const u64 t0 = NowNs();
+    const u64 tsc0 = __rdtsc();
+    const bool ok = Build(j->desc, j->vs, j->ps, *obj, j->flags, j->error, 0, true);
+    j->ns = NowNs() - t0;
+    StallTrace::Span(StallTrace::Ev::PipeBuild, tsc0, __rdtsc(), j->hash, 0, 0); // (R10 timeline)
+    if (ok) {
+        j->obj = std::move(obj);
+    }
+    j->state.store(ok ? 2 : 3, std::memory_order_release);
+}
+
+bool PipelineFactory::QueuedFor(bool prefetch) {
+    if (prefetch) {
+        std::scoped_lock lk{pf_mutex_};
+        return !pf_queue_.empty();
+    }
+    std::scoped_lock lk{async_mutex_};
+    return !async_queue_.empty();
+}
+
+void PipelineFactory::Kick(bool prefetch) {
+    // at most one drainer a worker per kind: a new job only starts one when fewer run (the others take it in turn)
+    std::atomic<u32>& d = pool_drainers_[prefetch ? 1 : 0];
+    const u32 limit = pool_->Workers();
+    for (u32 n = d.load(std::memory_order_acquire); n < limit;) {
+        if (d.compare_exchange_weak(n, n + 1, std::memory_order_acq_rel)) {
+            if (!SubmitDrainer(prefetch)) {
+                d.fetch_sub(1, std::memory_order_acq_rel); // (the jobs stay queued: the next one queued kicks again)
+            }
+            return;
+        }
+    }
+}
+
+bool PipelineFactory::SubmitDrainer(bool prefetch) {
+    pool_inflight_.fetch_add(1, std::memory_order_acq_rel);
+    const auto task = [this, prefetch](R10::Scratch&) {
+        const bool dead = pool_dead_.load(std::memory_order_acquire);
+        if (!dead) {
+            if (prefetch) {
+                if (PrefetchJob* j = PopPrefetch(false)) {
+                    RunPrefetch(j);
+                }
+            } else if (AsyncJob* j = PopAsync(false)) {
+                RunAsync(j);
+            }
+        }
+        // one job a task: the drainer goes on as a new task behind the others of its worker (both kinds in turn)
+        std::atomic<u32>& d = pool_drainers_[prefetch ? 1 : 0];
+        if (dead || !QueuedFor(prefetch) || !SubmitDrainer(prefetch)) {
+            d.fetch_sub(1, std::memory_order_acq_rel);
+            // (a job queued after the check above and before this drainer left: started again here)
+            if (!dead && QueuedFor(prefetch)) {
+                Kick(prefetch);
+            }
+        }
+        if (pool_inflight_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            pool_inflight_.notify_all();
+        }
+    };
+    // both kinds Normal: a compute pipeline its dispatch waits for and a graphics one whose draws are skipped until
+    // ready are taken in turn (cold run of 10-24: High for compute starved the graphics ones - the world stayed missing)
+    if (pool_->Submit(R10::Prio::Normal, prefetch ? 1u : 0u, task)) {
+        return true;
+    }
+    pool_refused_.fetch_add(1, std::memory_order_relaxed);
+    pool_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+    return false;
+}
+
 PipelineFactory::~PipelineFactory() {
+    if (pool_ != nullptr) { // (R10: the tasks submitted so far end first - those not started take nothing)
+        pool_dead_.store(true, std::memory_order_release);
+        for (u32 n; (n = pool_inflight_.load(std::memory_order_acquire)) != 0;) {
+            pool_inflight_.wait(n, std::memory_order_acquire);
+        }
+        for (auto& [h, j] : pf_jobs_) {
+            if (j->obj) {
+                Destroy(*j->obj);
+            }
+        }
+        pf_jobs_.clear();
+        for (auto& [k, j] : async_jobs_) {
+            if (j->obj) {
+                Destroy(*j->obj);
+            }
+        }
+        async_jobs_.clear();
+    }
+    if (!pf_workers_.empty()) { // (R9-N: a pipeline being built finishes first; those never taken are destroyed)
+        {
+            std::scoped_lock lk{pf_mutex_};
+            pf_stop_ = true;
+        }
+        pf_cv_.notify_all();
+        for (std::thread& t : pf_workers_) {
+            t.join();
+        }
+        for (auto& [h, j] : pf_jobs_) {
+            if (j->obj) {
+                Destroy(*j->obj);
+            }
+        }
+    }
     if (!async_workers_.empty()) { // (before anything they use goes: a pipeline being built finishes first)
         {
             std::scoped_lock lk{async_mutex_};
@@ -411,7 +596,9 @@ GS::PipelineDesc PipelineFactory::DescribeCompute(const GS::Module& cs, const GS
 }
 
 bool PipelineFactory::Build(const GS::PipelineDesc& desc, VkShaderModule vs_mod, VkShaderModule ps_mod,
-                            PipelineObjects& out, u32& flags, std::string& error) {
+                            PipelineObjects& out, u32& flags, std::string& error, VkPipelineCreateFlags create_flags,
+                            bool on_demand) {
+    const VkPipelineCache cache = on_demand && cold_demand_ ? VK_NULL_HANDLE : cache_;
     flags = desc.compute ? ShaderTrace::kPipeCompute : 0u;
     out.compute = desc.compute;
     if (!MakeLayout(desc.bindings, desc.compute, out, error)) {
@@ -432,12 +619,13 @@ bool PipelineFactory::Build(const GS::PipelineDesc& desc, VkShaderModule vs_mod,
                                                        .pPipelineStageCreationFeedbacks = stage_feedback.data()};
         const VkComputePipelineCreateInfo ci{.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                              .pNext = &fci,
+                                             .flags = create_flags,
                                              .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                                                        .module = vs_mod,
                                                        .pName = "main"},
                                              .layout = out.layout};
-        const VkResult r = f.vkCreateComputePipelines(ctx_.Device(), cache_, 1, &ci, nullptr, &out.pipeline);
+        const VkResult r = f.vkCreateComputePipelines(ctx_.Device(), cache, 1, &ci, nullptr, &out.pipeline);
         if (r != VK_SUCCESS) {
             out.pipeline = VK_NULL_HANDLE;
             return fail(fmt::format("vkCreateComputePipelines failed ({})", static_cast<int>(r)));
@@ -607,6 +795,7 @@ bool PipelineFactory::Build(const GS::PipelineDesc& desc, VkShaderModule vs_mod,
     const VkPipelineVertexInputStateCreateInfo vi{.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     const VkGraphicsPipelineCreateInfo ci{.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
                                           .pNext = &fci,
+                                          .flags = create_flags,
                                           .stageCount = static_cast<u32>(stages.size()),
                                           .pStages = stages.data(),
                                           .pVertexInputState = &vi,
@@ -619,7 +808,7 @@ bool PipelineFactory::Build(const GS::PipelineDesc& desc, VkShaderModule vs_mod,
                                           .pColorBlendState = &blend,
                                           .pDynamicState = &dynamic,
                                           .layout = out.layout};
-    const VkResult r = f.vkCreateGraphicsPipelines(ctx_.Device(), cache_, 1, &ci, nullptr, &out.pipeline);
+    const VkResult r = f.vkCreateGraphicsPipelines(ctx_.Device(), cache, 1, &ci, nullptr, &out.pipeline);
     if (r != VK_SUCCESS) {
         out.pipeline = VK_NULL_HANDLE;
         return fail(fmt::format("vkCreateGraphicsPipelines failed ({})", static_cast<int>(r)));
@@ -635,6 +824,110 @@ bool Transient(const GS::Module* m) {
     return m != nullptr && m->id >= 0x40000000u;
 }
 } // namespace
+
+void PipelineFactory::PrefetchCompute(const GS::Module& cs, const GS::ResourceBindingPlan& plan) {
+    if (!prefetch_ || Transient(&cs) || cs.result.spirv.empty()) {
+        return;
+    }
+    const GS::ResourceBindingPlan* plans[1] = {&plan};
+    if (!pf_seen_.insert(Mix(Mix(0xC5, cs.id), LayoutSignature(plans))).second) {
+        return; // (Compute's key: looked at before)
+    }
+    auto job = std::make_unique<PrefetchJob>();
+    job->desc = DescribeCompute(cs, plan);
+    job->hash = job->desc.Hash();
+    if (pre_ && pre_->Has(job->desc, job->hash)) {
+        return; // (the start-up precompiler's)
+    }
+    job->spirv = cs.result.spirv;
+    {
+        std::scoped_lock lk{pf_mutex_};
+        if (pf_known_.contains(job->hash)) {
+            return;
+        }
+        for (auto [a, b] = pf_jobs_.equal_range(job->hash); a != b; ++a) {
+            if (a->second->desc == job->desc) {
+                return;
+            }
+        }
+        pf_queue_.push_back(job.get());
+        const u64 hash = job->hash;
+        pf_jobs_.emplace(hash, std::move(job));
+    }
+    pf_queued_.fetch_add(1, std::memory_order_relaxed);
+    if (pool_ != nullptr) {
+        Kick(true); // (no drainer free: a running one takes it; the recording thread claims one not started)
+    } else {
+        pf_cv_.notify_one();
+    }
+}
+
+void PipelineFactory::NoteKnown(u64 hash) {
+    std::scoped_lock lk{pf_mutex_};
+    pf_known_.insert(hash);
+}
+
+const PipelineObjects* PipelineFactory::TakePrefetched(u64 key, u64 hash, const GS::PipelineDesc& desc,
+                                                       const GS::Module* cs) {
+    std::unique_lock lk{pf_mutex_};
+    auto it = pf_jobs_.end();
+    for (auto [a, b] = pf_jobs_.equal_range(hash); a != b; ++a) {
+        if (a->second->desc == desc) {
+            it = a;
+            break;
+        }
+    }
+    if (it == pf_jobs_.end()) {
+        return nullptr;
+    }
+    PrefetchJob* j = it->second.get();
+    pf_known_.insert(hash);
+    if (j->state == 0) { // no worker reached it yet: built by the caller now, not after the jobs queued before it
+        std::erase(pf_queue_, j);
+        pf_jobs_.erase(it);
+        ++stats_.prefetch_claimed;
+        return nullptr;
+    }
+    if (j->state == 1) {
+        const u64 t0 = NowNs();
+        const u64 tsc0 = __rdtsc();
+        pf_done_cv_.wait(lk, [j] { return j->state >= 2; });
+        const u64 waited = NowNs() - t0;
+        ++stats_.prefetch_waited;
+        stats_.prefetch_wait_ns += waited;
+        StallTrace::SpanEndingNow(StallTrace::Ev::PipelineCreate, waited); // (P4.12: the frame's stall)
+        ShaderTrace::Event(ShaderTrace::Kind::PipelinePrebuilt, tsc0, __rdtsc(), hash, 0,
+                           ShaderTrace::kPipeCompute | ShaderTrace::kPipeWaited);
+    }
+    std::unique_ptr<PrefetchJob> job = std::move(it->second);
+    pf_jobs_.erase(it);
+    lk.unlock();
+    if (job->state == 3) {
+        ++stats_.prefetch_failed;
+        return nullptr; // (built again by the caller, which reports a failure as its own)
+    }
+    ++stats_.prefetch_taken;
+    ++stats_.compute;
+    stats_.prefetch_build_ns += job->ns;
+    stats_.prefetch_slowest_ns = std::max(stats_.prefetch_slowest_ns, job->ns);
+    if ((job->flags & ShaderTrace::kPipeFeedback) != 0) {
+        ++stats_.feedback;
+        stats_.cache_hits += (job->flags & ShaderTrace::kPipeCacheHit) != 0 ? 1 : 0;
+    }
+    if (ctx_.Caps().debug_utils) {
+        ctx_.Name(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<u64>(job->obj->pipeline),
+                  fmt::format("cs module {}", cs->id).c_str());
+    }
+    const PipelineObjects* raw = job->obj.get();
+    owned_.push_back(std::move(job->obj));
+    pipelines_.emplace(key, raw);
+    by_desc_.emplace(hash, std::pair{desc, raw});
+    created_.fetch_add(1, std::memory_order_relaxed);
+    if (disk_ != nullptr && !Transient(cs)) {
+        disk_->AddPipeline(desc, hash, job->ns); // (the manifest the next run precompiles)
+    }
+    return raw;
+}
 
 const PipelineObjects* PipelineFactory::Obtain(u64 key, const GS::PipelineDesc& desc, const GS::Module* vs,
                                                const GS::Module* ps, u32 pipeline_id, std::string& error) {
@@ -681,6 +974,13 @@ const PipelineObjects* PipelineFactory::Obtain(u64 key, const GS::PipelineDesc& 
         }
         return nullptr;
     };
+    // R9-N: started by a prefetch worker when the frontend prepared the dispatch
+    if (prefetch_ && desc.compute) {
+        if (const PipelineObjects* p = TakePrefetched(key, hash, desc, vs)) {
+            return p;
+        }
+        NoteKnown(hash); // (built below: the frontend does not start it again)
+    }
     const bool async = async_ && (!desc.compute || async_compute_);
     if (async) {
         if (const auto it = async_jobs_.find(key); it != async_jobs_.end()) {
@@ -745,7 +1045,11 @@ const PipelineObjects* PipelineFactory::Obtain(u64 key, const GS::PipelineDesc& 
             std::scoped_lock lk{async_mutex_};
             async_queue_.push_back(raw);
         }
-        async_cv_.notify_one();
+        if (pool_ == nullptr) {
+            async_cv_.notify_one();
+        } else {
+            Kick(false); // (R10: queued in any case - a drainer of the pool takes it; never dropped)
+        }
         ++stats_.async_queued;
         ++stats_.async_skips;
         error = "async pipeline queued (SSPC_ASYNC_PIPELINES)";
@@ -755,7 +1059,7 @@ const PipelineObjects* PipelineFactory::Obtain(u64 key, const GS::PipelineDesc& 
     u32 flags = 0;
     const u64 t0 = NowNs();
     const u64 tsc0 = __rdtsc();
-    const bool ok = Build(desc, vs_mod, ps_mod, *obj, flags, error);
+    const bool ok = Build(desc, vs_mod, ps_mod, *obj, flags, error, 0, true);
     const u64 ns = NowNs() - t0;
     CountCreation(stats_, ns, [&] {
         return desc.compute ? fmt::format("compute (cs module {})", vs->id)
