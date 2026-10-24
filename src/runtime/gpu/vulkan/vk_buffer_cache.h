@@ -171,6 +171,7 @@ public:
     /// Before the batch is submitted: binds the memory its commands need (vkQueueBindSparse, the queue's lock held by
     /// the caller); `wait_value` of `wait` is what the batch waits for (0: nothing to wait for).
     bool SubmitBinds(VkSemaphore& wait, u64& wait_value);
+    bool HasPendingBinds() const { return !pending_binds_.empty(); } ///< (R11: SubmitBinds would call the driver)
     /// FrameBreak AQ: the binds' semaphore and the value of the last binds submitted (0: none, or waited on the host) -
     /// a batch on another queue than the one after them waits for it (it may use the blocks they bound).
     VkSemaphore BindTimeline() const { return host_wait_binds_ ? VK_NULL_HANDLE : bind_timeline_; }

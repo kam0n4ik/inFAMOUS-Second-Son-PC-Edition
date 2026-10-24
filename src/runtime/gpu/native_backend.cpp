@@ -1932,6 +1932,7 @@ void Backend::Stop() {
         frontend_->Stop();
     }
     if (ctx_) {
+        Vk::Emit::DrainSubmits(); // (R11 SSPC_R11_ASYNC_SUBMIT: the submitter's last jobs, before the queue's lock)
         std::scoped_lock lock{ctx_->QueueMutex()};
         Vk::Fn().vkDeviceWaitIdle(ctx_->Device());
     }
@@ -2536,6 +2537,17 @@ std::string Backend::Report() {
         out += fmt::format("batch submissions by cause: full {}, held fence {}, processor idle {}, synchronize {}, "
                            "flip {}\n",
                            s.flushes_full, s.flushes_fence, s.flushes_idle, s.flushes_sync, s.flushes_flip);
+        // R11 t2 (docs/R11_T2.md): the recording thread's time in Flush, the early submissions, the async ones
+        out += fmt::format("R11 batch ends: {} batches, {:.0f} ms in Flush on the recording thread, vkQueueSubmit2 "
+                           "{:.0f} ms there; early submissions (SSPC_R11_EARLY_SUBMIT) {} ({:.0f} commands each), GPU "
+                           "checks {} ({:.1f} ms); submitter thread (SSPC_R11_ASYNC_SUBMIT) {} batches, {:.0f} ms in "
+                           "vkQueueSubmit2\n",
+                           s.batches, static_cast<double>(s.r11_flush_ns) / 1e6, static_cast<double>(s.submit_ns) / 1e6,
+                           s.r11_early,
+                           s.r11_early != 0 ? static_cast<double>(s.r11_early_commands) / static_cast<double>(s.r11_early)
+                                            : 0.0,
+                           s.r11_early_checks, static_cast<double>(s.r11_early_check_ns) / 1e6, s.r11_async,
+                           executor_->R11AsyncSubmitMs());
         if (cp_ != nullptr) {
             const u64 w = cp_->Registers().Writes(), c = cp_->Registers().Changes();
             out += fmt::format("register writes {}, of them changing a value {} ({:.1f} %)\n", w, c,

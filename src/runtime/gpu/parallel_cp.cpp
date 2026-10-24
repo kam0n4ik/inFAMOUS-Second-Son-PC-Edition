@@ -2021,6 +2021,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
             } else {
                 exec_.Draw(r.draw);
             }
+            exec_.R11EarlySubmitPoint(); // (R11 SSPC_R11_EARLY_SUBMIT: between records)
             break;
         case Kind::Dispatch:
             if (frontend_ != nullptr) {
@@ -2032,6 +2033,7 @@ u64 ParallelCp::Execute(Record& r, u64 index, u64 avail) {
             } else {
                 exec_.DispatchWith(r.dispatch, r.has_cs ? &r.cs : nullptr);
             }
+            exec_.R11EarlySubmitPoint();
             break;
         case Kind::CacheAction:
             exec_.CacheAction(r.cache);
