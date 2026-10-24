@@ -294,12 +294,16 @@ void InstallWatch(u64 base) {
 constexpr ProbeSite kIntegrateSite{{0x14d6f0, 0x593, 0x724cebb9e1f76f99ull}, 17};
 constexpr u64 kCameraAngles = 0x330;  // float yaw, pitch
 constexpr u64 kCameraLocks = 0x7c0;   // u32: bit 0 the yaw input is off, bit 1 the pitch input (cut-scenes, moves)
-constexpr u64 kPitchLimits = 0x1c0;   // float min, max in both params; the second one's +0x210 narrows them (0x14c270)
-constexpr u64 kPitchLimits2 = 0x210;
+// float min, max in both params: the stick's limits (0x14a810 at 0x14c111: the narrower of the two). The second
+// params' +0x210 ([-0.15, +0.20] rad on foot) narrows them only for the automatic camera (0x14c270, blended in by
+// camera +0x498) - the stick goes past it (SSPC_MOUSE_CAMERA=observe on the stand, 10-24: a full stick down for 3 s
+// reached -1.45 rad, up past +0.6)
+constexpr u64 kPitchLimits = 0x1c0;
+constexpr u64 kPitchLimitsAuto = 0x210;
 constexpr u64 kOptions = 0xefacf8;    // the game's options: +0x6d5 / +0x6d6 the camera's x / y inversion (bytes)
 // mouse right = the stick right = yaw input > 0 = the yaw falls; mouse up = the stick up = pitch input > 0 = the
 // pitch falls (SSPC_MOUSE_CAMERA=observe on the stand, 10-24: a full stick for 0.3 s turned 0.27 rad, the stick of a
-// slow mouse - 60 counts in 1 s - 0.002 rad; the pitch keeps within [-0.15, +0.20] rad on foot)
+// slow mouse - 60 counts in 1 s - 0.002 rad)
 constexpr double kYawPerCount = -0.001; // rad (1000 counts ~ 57 deg at sensitivity 1)
 constexpr double kPitchPerCount = 0.001;
 
@@ -313,7 +317,8 @@ struct CameraStats {
     double input_yaw = 0.0, input_pitch = 0.0;  // the stick inputs (observe)
     double turned_yaw = 0.0, turned_pitch = 0.0; // what the integrator turned on frames with a stick input
     double mouse_yaw = 0.0, mouse_pitch = 0.0;   // what the mouse turned (direct)
-    float pitch = 0.0f, pitch_min = 0.0f, pitch_max = 0.0f;
+    float pitch = 0.0f, pitch_min = 0.0f, pitch_max = 0.0f; // the stick's limits
+    float auto_min = 0.0f, auto_max = 0.0f;                // the automatic camera's
 };
 std::mutex g_stats_lock;
 CameraStats g_stats;
@@ -328,13 +333,9 @@ SSPC_SYSV_ABI void IntegrateProbe(u64 camera, u64 params, u64 params2, u64 arg3,
     const u32 locks = *reinterpret_cast<const u32*>(camera + kCameraLocks);
     const auto* p1 = reinterpret_cast<const float*>(params + kPitchLimits);
     const auto* p2 = reinterpret_cast<const float*>(params2 + kPitchLimits);
-    const auto* p3 = reinterpret_cast<const float*>(params2 + kPitchLimits2);
-    // (0x14c270: the narrowest of the three; crossed limits meet at one pitch)
-    const float lo12 = std::max(p1[0], p2[0]), hi12 = std::min(p1[1], p2[1]);
-    float lo = std::max(lo12, p3[0]), hi = std::min(hi12, p3[1]);
-    if (hi < lo) {
-        lo = hi = std::max(std::min(p3[0], hi12), lo12);
-    }
+    const auto* p3 = reinterpret_cast<const float*>(params2 + kPitchLimitsAuto);
+    // (as the stick: the narrower of the two; crossed limits meet at the lower one)
+    const float lo = std::max(p1[0], p2[0]), hi = std::max(lo, std::min(p1[1], p2[1]));
     double mouse_yaw = 0.0, mouse_pitch = 0.0;
     if (g_direct) {
         double dx = 0.0, dy = 0.0;
@@ -370,6 +371,8 @@ SSPC_SYSV_ABI void IntegrateProbe(u64 camera, u64 params, u64 params2, u64 arg3,
     s.pitch = angles[1];
     s.pitch_min = lo;
     s.pitch_max = hi;
+    s.auto_min = p3[0];
+    s.auto_max = p3[1];
 }
 
 void ReportCamera() {
@@ -386,9 +389,10 @@ void ReportCamera() {
         }
         SSPC_LOG(Engine, Info,
                  "mouse camera 1 s: {} frames; stick on {}: input yaw {:+.3f} pitch {:+.3f} -> turned yaw {:+.4f} "
-                 "pitch {:+.4f} rad; mouse turned yaw {:+.4f} pitch {:+.4f} rad; pitch {:+.3f} in [{:+.3f}, {:+.3f}]",
+                 "pitch {:+.4f} rad; mouse turned yaw {:+.4f} pitch {:+.4f} rad; pitch {:+.3f} in [{:+.3f}, {:+.3f}] "
+                 "(automatic camera [{:+.3f}, {:+.3f}])",
                  s.frames, s.moved, s.input_yaw, s.input_pitch, s.turned_yaw, s.turned_pitch, s.mouse_yaw,
-                 s.mouse_pitch, s.pitch, s.pitch_min, s.pitch_max);
+                 s.mouse_pitch, s.pitch, s.pitch_min, s.pitch_max, s.auto_min, s.auto_max);
     }
 }
 
