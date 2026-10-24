@@ -7,10 +7,10 @@ param([Parameter(Mandatory)] [string]$Out, [Parameter(Mandatory)] [string]$Confi
       [string]$Base = "SSPC_R9_PCACHE=1;SSPC_R9_HEAP_WINDOW=1", [switch]$NoTrace)
 $ErrorActionPreference = "Continue"
 # (a build of another agent started before the quiet flag runs on: wait for its lock - stale after 120 min - and for
-# a quiet machine, < 8 % of the CPUs over 10 s, before each run)
+# a quiet machine, < 8 % of the CPUs over 10 s, before each run; a lock older than 30 min is stale)
 function Wait-Stand {
     $lock = "E:\research\r10\build.lock"
-    while ((Test-Path $lock) -and ((Get-Date) - (Get-Item $lock).LastWriteTime).TotalMinutes -lt 120) { Start-Sleep -Seconds 15 }
+    while ((Test-Path $lock) -and ((Get-Date) - (Get-Item $lock).LastWriteTime).TotalMinutes -lt 30) { Start-Sleep -Seconds 15 }
     $c = New-Object System.Diagnostics.PerformanceCounter("Processor", "% Processor Time", "_Total")
     for ($k = 0; $k -lt 60; $k++) {
         [void]$c.NextValue(); $v = @()
