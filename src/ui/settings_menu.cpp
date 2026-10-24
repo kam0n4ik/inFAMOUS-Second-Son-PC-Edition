@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 
 #include "input/binding_rules.h"
+#include "settings/experiments.h"
 #include "settings/registry.h"
 
 namespace SecondSon::Ui {
@@ -87,7 +88,7 @@ std::string Caps(std::string_view utf8) {
 }
 
 constexpr Page kPages[] = {Page::Graphics, Page::Display, Page::Controls, Page::Keys,
-                           Page::Audio,    Page::Game,    Page::Advanced};
+                           Page::Audio,    Page::Game,    Page::Advanced, Page::Experiments};
 constexpr u64 kConfirmCommandNs = 5'000'000'000;
 
 using A = Input::Action;
@@ -302,6 +303,16 @@ void DrawPageIcon(DrawList& out, Page page, float cx, float cy, float s, Color c
         }
         break;
     }
+    case Page::Experiments: // a flask: neck, body, liquid
+        L(-2.5f, -8, -2.5f, -2.5f);
+        L(2.5f, -8, 2.5f, -2.5f);
+        L(-4, -8, 4, -8);
+        L(-2.5f, -2.5f, -8, 7);
+        L(2.5f, -2.5f, 8, 7);
+        L(-8, 7, 8, 7);
+        out.FillTriangle(cx - 6.2f * k, cy + 4 * k, cx + 6.2f * k, cy + 4 * k, cx + 7.8f * k, cy + 6.8f * k, c);
+        out.FillTriangle(cx - 6.2f * k, cy + 4 * k, cx + 7.8f * k, cy + 6.8f * k, cx - 7.8f * k, cy + 6.8f * k, c);
+        break;
     case Page::Count:
         break;
     }
@@ -318,9 +329,9 @@ void Chevron(DrawList& out, float cx, float cy, float s, Color c, bool up = fals
 
 std::string_view PageLabel(Page page, bool ru) {
     constexpr std::array<std::string_view, kPageCount> kEn{"Graphics", "Display", "Controls", "Key bindings",
-                                                          "Audio",    "Game",    "Advanced"};
+                                                          "Audio",    "Game",    "Advanced", "Experiments"};
     constexpr std::array<std::string_view, kPageCount> kRu{"Графика", "Экран", "Управление", "Клавиши",
-                                                          "Звук",    "Игра",  "Дополнительно"};
+                                                          "Звук",    "Игра",  "Дополнительно", "Эксперименты"};
     const auto i = std::min(static_cast<size_t>(page), kPageCount - 1);
     return ru ? kRu[i] : kEn[i];
 }
@@ -344,6 +355,8 @@ Page PageOf(Category category) {
         return Page::Game;
     case Category::Shaders:
         return Page::Advanced;
+    case Category::Experiments:
+        return Page::Experiments;
     case Category::Count:
         break;
     }
@@ -531,6 +544,18 @@ void SettingsMenu::RebuildRows() {
         AddInfo("Graphics backend", "Графический бэкенд", "info.backend");
         AddInfo("Settings file", "Файл настроек", "info.settings");
         break;
+    case Page::Experiments: {
+        // the launcher's switches, by group; each applies from the next start (Reset: as the launcher set it)
+        std::string_view group;
+        for (const auto& e : Settings::Experiments()) {
+            if (e.group_en != group) {
+                group = e.group_en;
+                AddHeader(e.group_en, e.group_ru);
+            }
+            setting(Settings::ExperimentId(e.env));
+        }
+        break;
+    }
     case Page::Count:
         break;
     }

@@ -315,6 +315,7 @@ set(SSPC_PC_SETTINGS_SOURCES
     src/input/binding_rules.cpp
     src/input/device_tracker.cpp
     src/input/gamepad_tuning.cpp
+    src/settings/experiments.cpp
     src/settings/registry.cpp
     src/settings/settings_checks.cpp
     src/settings/settings_service.cpp

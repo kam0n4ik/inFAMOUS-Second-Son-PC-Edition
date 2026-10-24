@@ -22,6 +22,7 @@
 #include "input/device_tracker.h"
 #include "input/gamepad_tuning.h"
 #include "input/keyboard_mouse.h"
+#include "settings/experiments.h"
 #include "settings/registry.h"
 #include "settings/settings_service.h"
 #include "settings/user_store.h"
@@ -124,6 +125,39 @@ void Registry(const CheckFn& check) {
     check(g, "binding: F10 (hotkey) refused",
           cross != nullptr && !Validate(*cross, Value{Bindings{Key(SDL_SCANCODE_F10)}}, e), e);
     check(g, "binding: empty list accepted (unbound)", cross != nullptr && Validate(*cross, Value{Bindings{}}, e), e);
+
+    // experiments: a changed one reaches the environment at start, the others keep the launcher's value
+    {
+        const auto keep = [](const char* name) {
+            const char* v = std::getenv(name);
+            return std::string(v != nullptr ? v : "");
+        };
+        const std::string spread = keep("SSPC_R10_SPREAD"), ring = keep("SSPC_CP_RING");
+        const std::string draws = keep("SSPC_R10_NATIVE_DRAWS"), sources = keep("SSPC_R10_NATIVE_DRAWS_SOURCES");
+        _putenv_s("SSPC_CP_RING", "128");
+        auto x = TestConfig();
+        ReadExperiments(x);
+        const Desc* sp = Find(ExperimentId("SSPC_R10_SPREAD"));
+        const Desc* nd = Find(ExperimentId("SSPC_R10_NATIVE_DRAWS"));
+        const Desc* rg = Find(ExperimentId("SSPC_CP_RING"));
+        bool ok = sp != nullptr && nd != nullptr && rg != nullptr && sp->category == Category::Experiments &&
+                  rg->get(x, *rg) == Value{std::string("128")};
+        if (ok) {
+            sp->set(x, *sp, Value{true});
+            nd->set(x, *nd, Value{true});
+            Overrides o;
+            o[std::string(sp->id)] = true;
+            o[std::string(nd->id)] = true;
+            const auto set = ExportExperiments(x, o);
+            ok = set.size() == 3 && keep("SSPC_R10_SPREAD") == "1" && keep("SSPC_R10_NATIVE_DRAWS") == "native" &&
+                 keep("SSPC_R10_NATIVE_DRAWS_SOURCES") == "shadow" && keep("SSPC_CP_RING") == "128";
+        }
+        _putenv_s("SSPC_R10_SPREAD", spread.c_str());
+        _putenv_s("SSPC_CP_RING", ring.c_str());
+        _putenv_s("SSPC_R10_NATIVE_DRAWS", draws.c_str());
+        _putenv_s("SSPC_R10_NATIVE_DRAWS_SOURCES", sources.c_str());
+        check(g, "experiments: the user's choice reaches the environment, the launcher's stays", ok, "");
+    }
 }
 
 void UserFile(const CheckFn& check, const fs::path& dir) {

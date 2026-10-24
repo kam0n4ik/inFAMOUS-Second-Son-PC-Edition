@@ -114,6 +114,7 @@
 #include "runtime/gpu/vulkan/vk_stability_tests.h"
 #include "runtime/language.h"
 #include "runtime/system/system_service.h"
+#include "settings/experiments.h"
 #include "settings/settings_service.h"
 #include "settings/user_store.h"
 
@@ -273,6 +274,8 @@ int main(int argc, char* argv[]) {
     }
     // PC settings: SecondSonPC.toml is the defaults; the user settings file (the in-game menu's) overrides them,
     // then the command line overrides both for this run. Automated and no-game runs use SecondSonPC.toml alone.
+    // The experiments' defaults are the launcher's environment (settings/experiments.h).
+    Settings::ReadExperiments(*config);
     const App::Config toml_defaults = *config;
     std::filesystem::path user_settings_file = Settings::DefaultUserFile();
     bool user_settings = true, explicit_settings = false;
@@ -296,6 +299,9 @@ int main(int argc, char* argv[]) {
         user_report = Settings::LoadUserFile(user_settings_file, user_overrides, &user_kept);
         Settings::ApplyOverrides(*config, user_overrides);
     }
+    // the experiments the user changed, into the environment before any subsystem reads it (logged below)
+    const std::vector<std::string> experiments_set =
+        user_settings ? Settings::ExportExperiments(*config, user_overrides) : std::vector<std::string>{};
     bool stock_bootstrap = false;
     bool gpu_stability_test = false;
     bool legacy_bridge_kernel = false; // --legacy-bridge-kernel: the bridge's kernel groups, not SecondSonPC's
@@ -669,6 +675,9 @@ int main(int argc, char* argv[]) {
         }
         for (const auto& w : user_report.warnings) {
             SSPC_LOG(App, Warning, "user settings: {}", w);
+        }
+        for (const auto& e : experiments_set) {
+            SSPC_LOG(App, Warning, "EXPERIMENT from the settings menu (Experiments): {}", e);
         }
     } else {
         SSPC_LOG(App, Info, "user settings: not used in this run (SecondSonPC.toml alone, changes not saved)");

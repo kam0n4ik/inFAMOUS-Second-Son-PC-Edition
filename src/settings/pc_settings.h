@@ -3,6 +3,7 @@
 // them in one member (Config::pc) so the older sections stay as they are.
 #pragma once
 
+#include <map>
 #include <string>
 
 #include "base/abi.h"
@@ -65,6 +66,10 @@ struct PcSettings {
                                             // window with the progress; once per templates/predictor/driver)
     u32 shader_cache_max_mib = 2048;        // the shader cache file's size limit
     u32 shader_precompile_threads = 0;      // 0: automatic (half the logical processors, at most 6)
+
+    // [Experiments] (settings/experiments.h): the runtime's SSPC_* switches, variable -> its value ("" = not set);
+    // the launcher's environment at start, then the user's choices (from the next start)
+    std::map<std::string, std::string, std::less<>> experiments;
 };
 
 } // namespace SecondSon::Settings

@@ -34,7 +34,7 @@ enum class Nav : u8 {
 };
 
 /// The window's pages (the navigation on its left). Each lists settings of one or more registry categories.
-enum class Page : u8 { Graphics, Display, Controls, Keys, Audio, Game, Advanced, Count };
+enum class Page : u8 { Graphics, Display, Controls, Keys, Audio, Game, Advanced, Experiments, Count };
 constexpr size_t kPageCount = static_cast<size_t>(Page::Count);
 std::string_view PageLabel(Page page, bool ru);
 /// The page a registry category is shown on.

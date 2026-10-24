@@ -19,7 +19,7 @@ struct Config;
 namespace SecondSon::Settings {
 
 enum class Category : u8 {
-    Display, Graphics, Audio, Controls, Keyboard, Gamepad, Interface, Game, Shaders, Upscaling, Count
+    Display, Graphics, Audio, Controls, Keyboard, Gamepad, Interface, Game, Shaders, Upscaling, Experiments, Count
 };
 constexpr size_t kCategoryCount = static_cast<size_t>(Category::Count);
 

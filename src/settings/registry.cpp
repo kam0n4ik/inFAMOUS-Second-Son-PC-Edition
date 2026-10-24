@@ -12,6 +12,7 @@
 #include "app/config.h"
 #include "input/binding_rules.h"
 #include "runtime/language.h"
+#include "settings/experiments.h"
 
 namespace SecondSon::Settings {
 
@@ -211,7 +212,29 @@ void SetBinding(Config& c, const Desc& d, const Value& v) {
 struct Registry {
     std::vector<Desc> all;
     std::array<std::string, Input::kActionCount> binding_ids;
+    std::vector<std::string> experiment_ids; // "experiments.<variable>", filled before their settings (no moves)
 };
+
+// ---- experiments (settings/experiments.h): the setting's key is the variable's name
+
+Value GetExperiment(const Config& c, const Desc& d) {
+    const Experiment* e = FindExperiment(d.key);
+    const auto it = c.pc.experiments.find(d.key);
+    const std::string_view v = it != c.pc.experiments.end() ? std::string_view(it->second) : std::string_view{};
+    if (d.type == Type::Bool) {
+        return e != nullptr && v == e->on;
+    }
+    return std::string(v.empty() && e != nullptr ? e->unset_shows : v);
+}
+void SetExperiment(Config& c, const Desc& d, const Value& x) {
+    const Experiment* e = FindExperiment(d.key);
+    if (e == nullptr) {
+        return;
+    }
+    c.pc.experiments.insert_or_assign(std::string(d.key), d.type == Type::Bool
+                                                              ? std::string(std::get<bool>(x) ? e->on : e->off)
+                                                              : std::get<std::string>(x));
+}
 
 constexpr std::string_view kNeedsBridgePresenterEn =
     "Drawn by the bridge's (shadPS4) presenter; SecondSonPC's own backend (--gpu-backend sspc) gets it in P4.6.";
@@ -932,6 +955,30 @@ void Build(Registry& r) {
         },
         .legacy_parse = true,
     });
+
+    // ------------------------------------------------------------------ Experiments (settings/experiments.h)
+    // Read once by their subsystems at start: all Restart. Not SecondSonPC.toml keys (legacy_parse: its parser skips
+    // them) - the launcher's environment is their default, the user file their override.
+    const auto experiments = Experiments();
+    r.experiment_ids.reserve(experiments.size());
+    for (const auto& e : experiments) {
+        r.experiment_ids.push_back(ExperimentId(e.env));
+    }
+    for (size_t i = 0; i < experiments.size(); ++i) {
+        const Experiment& e = experiments[i];
+        std::string_view requires_on;
+        for (size_t j = 0; j < experiments.size() && !e.requires_env.empty(); ++j) {
+            if (experiments[j].env == e.requires_env) {
+                requires_on = r.experiment_ids[j];
+            }
+        }
+        v.push_back(Desc{
+            .id = r.experiment_ids[i], .table = "Experiments", .key = e.env, .category = Category::Experiments,
+            .type = e.type, .apply = Apply::Restart, .choices = e.choices, .en = e.en, .ru = e.ru,
+            .help_en = e.help_en, .help_ru = e.help_ru, .get = GetExperiment, .set = SetExperiment,
+            .legacy_parse = true, .requires_on = requires_on,
+        });
+    }
 }
 
 const Registry& Instance() {
@@ -980,17 +1027,19 @@ const Desc* FindByKey(std::string_view table, std::string_view key) {
 std::string_view CategoryId(Category category) {
     constexpr std::array<std::string_view, kCategoryCount> kIds{"display",  "graphics", "audio",     "controls",
                                                                 "keyboard", "gamepad",  "interface", "game",
-                                                                "shaders",  "upscaling"};
+                                                                "shaders",  "upscaling", "experiments"};
     return kIds[static_cast<size_t>(category)];
 }
 
 std::string_view CategoryLabel(Category category, bool ru) {
     constexpr std::array<std::string_view, kCategoryCount> kEn{"Display", "Graphics", "Audio",     "Mouse",
                                                                "Keys",    "Controller", "Interface", "Game",
-                                                               "Shaders & cache", "Upscaling & frame generation"};
+                                                               "Shaders & cache", "Upscaling & frame generation",
+                                                               "Experiments"};
     constexpr std::array<std::string_view, kCategoryCount> kRu{"Экран",   "Графика",   "Звук",      "Мышь",
                                                                "Клавиши", "Геймпад",   "Интерфейс", "Игра",
-                                                               "Шейдеры и кэш", "Масштабирование и генерация кадров"};
+                                                               "Шейдеры и кэш", "Масштабирование и генерация кадров",
+                                                               "Эксперименты"};
     return (ru ? kRu : kEn)[static_cast<size_t>(category)];
 }
 
