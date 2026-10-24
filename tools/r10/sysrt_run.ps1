@@ -17,8 +17,17 @@ param(
 $ErrorActionPreference = "Stop"
 if (-not $Worktree) { $Worktree = Split-Path (Split-Path (Split-Path $MyInvocation.MyCommand.Path)) } # (tools\r10\..)
 $logs = "$Worktree\logs"
-# (R10_RULES: no game while another agent's measured series holds the quiet flag; r9run itself waits for the game lock)
-while (Test-Path "E:\research\r10\quiet.flag") { Start-Sleep -Seconds 20 }
+# (R10_RULES: no game while another agent's measured series holds the quiet flag. r9run waits for the game lock only,
+# and a flag taken while it waits must still stop this run: the flag is checked again once the stand is free, right
+# before r9run takes the lock.)
+$gameLock = "E:\research\deep_perf\game.lock"
+for (;;) {
+    while ((& "E:\research\r10\tools\stand_quiet.ps1" -Wait) -ne "free") { }
+    $busy = (Get-Process SecondSonPC -ErrorAction SilentlyContinue) -or ((Test-Path $gameLock) -and
+            ((Get-Date) - (Get-Item $gameLock).LastWriteTime).TotalMinutes -lt 15)
+    if (-not $busy -and -not (Test-Path "E:\research\r10\quiet.flag")) { break }
+    Start-Sleep -Seconds 10
+}
 # (a stale calls.json of an earlier run must not pass for this one's when the game dies before writing it)
 foreach ($f in "calls.json", "call_order.txt") { Remove-Item "$logs\$f" -ErrorAction SilentlyContinue }
 $envs = "SSPC_R10_SYSRT=$Mode"

@@ -10,8 +10,12 @@ param(
 $ErrorActionPreference = "Stop"
 $lock = "E:\research\deep_perf\game.lock"
 $quiet = "E:\research\r10\quiet.flag"
-while ((Test-Path $quiet) -or (Get-Process SecondSonPC -ErrorAction SilentlyContinue) -or ((Test-Path $lock) -and
-       ((Get-Date) - (Get-Item $lock).LastWriteTime).TotalMinutes -lt 15)) { Start-Sleep -Seconds 10 }
+for (;;) { # (the quiet flag first - stand_quiet.ps1 -Wait - then the stand, then the flag again just before the lock)
+    while ((& "E:\research\r10\tools\stand_quiet.ps1" -Wait) -ne "free") { }
+    if (-not ((Get-Process SecondSonPC -ErrorAction SilentlyContinue) -or ((Test-Path $lock) -and
+              ((Get-Date) - (Get-Item $lock).LastWriteTime).TotalMinutes -lt 15)) -and -not (Test-Path $quiet)) { break }
+    Start-Sleep -Seconds 10
+}
 New-Item -ItemType Directory -Force $lock | Out-Null
 "$(Get-Date -Format 'HH:mm:ss') sysrt selftest" | Set-Content -Encoding ASCII "$lock\owner.txt"
 $report = "$Worktree\logs\selftest.txt"
