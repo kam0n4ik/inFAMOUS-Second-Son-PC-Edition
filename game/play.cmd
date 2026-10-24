@@ -35,7 +35,7 @@ set SSPC_R9_PCACHE=1
 set SSPC_R9_HEAP_WINDOW=1
 if defined SSPC_PLAY_EXPERIMENTAL (
     rem play_experimental.cmd: REA-3 and AQ (docs/R9_REA3_FIX.md) with R10's main queue free of the lane's
-    rem unrelated batches (docs/R10_PACING.md) - faster and even, but Neon Dash's 1 % low below play.cmd's
+    rem unrelated batches (docs/R10_PACING.md) - faster and even, but Neon Dash has a lower 1-percent low
     set SSPC_REA_DEFER_WAIT_B=1
     set SSPC_FB_ASYNC_COMPUTE=1
     set SSPC_R10_AQ_MAIN_FREE=1
