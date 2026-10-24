@@ -375,21 +375,32 @@ public:
     At9Decoder(const At9Decoder&) = delete;
     At9Decoder& operator=(const At9Decoder&) = delete;
 
+    // A reset decoder is usable only when its config bytes are valid and LibAtrac9 took them; otherwise every frame
+    // answers "not initialized" (LibAtrac9 itself would run on a handle with no frame config).
     void Reset() {
         Atrac9ReleaseHandle(handle_);
         handle_ = Atrac9GetHandle();
         info_ = {};
-        if (handle_ != nullptr && Atrac9InitDecoder(handle_, config_) == 0) {
+        initialized_ = false;
+        if (handle_ != nullptr && ValidConfig(config_) && Atrac9InitDecoder(handle_, config_) == 0) {
             Atrac9GetCodecInfo(handle_, &info_);
+            initialized_ = info_.channels > 0 && info_.frameSamples > 0 && info_.superframeSize > 0;
         }
         num_frames_ = 0;
-        superframe_remain_ = static_cast<u32>(info_.superframeSize);
+        superframe_remain_ = initialized_ ? static_cast<u32>(info_.superframeSize) : 0;
     }
-    void Initialize(const u8 config[4]) {
+    // Returns false (the instance stays uninitialized) when the config bytes are not a valid ATRAC9 config.
+    bool Initialize(const u8 config[4]) {
         std::memcpy(config_, config, 4);
         Reset();
+        if (!initialized_) {
+            SSPC_LOG(Audio, Warning, "AJM: ATRAC9 config {:02x} {:02x} {:02x} {:02x} rejected", config[0], config[1],
+                     config[2], config[3]);
+            pcm_.clear();
+            return false;
+        }
         pcm_.assign(static_cast<size_t>(info_.frameSamples) * info_.channels * PcmSize(format_), 0);
-        initialized_ = true;
+        return true;
     }
     u32 MinimumInputSize() const {
         return superframe_remain_;
@@ -421,9 +432,17 @@ public:
     DecodeResult Process(InputCursor& in, OutputCursor& out, Gapless& gapless);
 
 private:
+    // The config word (LibAtrac9 ReadConfigData, MSB first): header 0xFE; sample rate index 4 bits, channel config
+    // index 3 bits, a validation bit that must be 0. LibAtrac9 indexes its 6-entry ChannelConfigs table with the
+    // index unchecked, so 6 and 7 are refused here.
+    static bool ValidConfig(const u8 c[4]) {
+        return c[0] == 0xFE && ((c[1] >> 1) & 7) < 6 && (c[1] & 1) == 0;
+    }
+    // (LibAtrac9's bit reader keeps the length in bits in an int: a frame never needs more than this)
+    static constexpr u64 kMaxDecodeInput = 0x0FFFFFFF;
     int DecodeTo(const u8* src, u64 size, u8* dst, int* used) {
         const int planar = (flags_ & kAt9NonInterleaved) != 0;
-        const int n = static_cast<int>(std::min<u64>(size, 0x7FFFFFFF));
+        const int n = static_cast<int>(std::min<u64>(size, kMaxDecodeInput));
         switch (format_) {
         case Encoding::S16:
             return Atrac9Decode(handle_, src, n, reinterpret_cast<short*>(dst), used, planar);
@@ -483,7 +502,9 @@ bool At9Decoder::ParseRiff(InputCursor& in, Gapless& gapless) {
             if (fmt[0] != 0xFE || fmt[1] != 0xFF || std::memcmp(fmt + 24, kGuid, 16) != 0) {
                 return false;
             }
-            Initialize(fmt + 44);
+            if (!Initialize(fmt + 44)) {
+                return false;
+            }
         } else if (chunk[0] == 0x74636166 && chunk[1] == 12) { // "fact": sample length, encoder delay
             u32 fact[3];
             if (!read(fact, 12)) {
@@ -586,7 +607,7 @@ DecodeResult At9Decoder::Process(InputCursor& in, OutputCursor& out, Gapless& ga
         while (num_frames_ % per_superframe != 0) {
             u64 a = 0;
             const u8* s = in.Peek(std::max<u32>(superframe_remain_, 1), &a, staging_);
-            if (s == nullptr || Atrac9Decode(handle_, s, static_cast<int>(std::min<u64>(a, 0x7FFFFFFF)),
+            if (s == nullptr || Atrac9Decode(handle_, s, static_cast<int>(std::min<u64>(a, kMaxDecodeInput)),
                                              reinterpret_cast<short*>(pcm_.data()), &used,
                                              (flags_ & kAt9NonInterleaved) != 0) != 0) {
                 break;
@@ -700,8 +721,8 @@ void Instance::Execute(const Job& job) {
     if (control & kControlReset) {
         ResetState();
     }
-    if (in_init != nullptr) {
-        decoder_.Initialize(in_init);
+    if (in_init != nullptr && !decoder_.Initialize(in_init)) {
+        r.result |= kResInvalidData;
     }
     if (in_gapless != nullptr) {
         const SidebandGapless p = *in_gapless;
@@ -866,6 +887,10 @@ s32 ParseBatch(Context& ctx, u8* batch, u32 size, std::vector<Job>& jobs, BatchE
         bool have_flags = false;
         const u32 end = at + body;
         while (at < end) {
+            if (end - at < 8) { // (every sub-chunk is at least a header and a size)
+                SetBatchError(error, kErrMalformedBatch, chunk, at, job.ra);
+                return kErrMalformedBatch;
+            }
             u32 h;
             std::memcpy(&h, batch + at, 4);
             const u32 ident = IdentOf(h);
@@ -1006,7 +1031,14 @@ u8* EncodeRunSplit(u8* buffer, u32 instance, u64 flags, const AjmBuffer* in, u64
 }
 
 // ---- the native exports
-SSPC_SYSV_ABI s32 Initialize(s64 reserved, u32* out_context) {
+// An exception (std::bad_alloc from a container) never unwinds into the guest's SysV frames: the export answers
+// SCE_AJM_ERROR_OUT_OF_MEMORY instead.
+s32 ExportFailed() {
+    std::fprintf(stderr, "AJM: an export failed on an exception (out of memory)\n");
+    return kErrOutOfMemory;
+}
+
+SSPC_SYSV_ABI s32 Initialize(s64 reserved, u32* out_context) try {
     if (out_context == nullptr || reserved != 0) {
         return kErrInvalidParameter;
     }
@@ -1016,9 +1048,11 @@ SSPC_SYSV_ABI s32 Initialize(s64 reserved, u32* out_context) {
     *out_context = id;
     SSPC_LOG(Audio, Info, "AJM: context {} (own AJM)", id);
     return kOk;
+} catch (...) { // (no C++ exception crosses into the guest)
+    return ExportFailed();
 }
 
-SSPC_SYSV_ABI s32 Finalize(u32 context) {
+SSPC_SYSV_ABI s32 Finalize(u32 context) try {
     std::lock_guard lock(g_mutex);
     const auto it = g_contexts.find(context);
     if (it == g_contexts.end()) {
@@ -1028,9 +1062,11 @@ SSPC_SYSV_ABI s32 Finalize(u32 context) {
              it->second->instances.size(), it->second->batches.size());
     g_contexts.erase(it);
     return kOk;
+} catch (...) { // (no C++ exception crosses into the guest)
+    return ExportFailed();
 }
 
-SSPC_SYSV_ABI s32 ModuleRegister(u32 context, u32 codec, s64 reserved) {
+SSPC_SYSV_ABI s32 ModuleRegister(u32 context, u32 codec, s64 reserved) try {
     if (reserved != 0) {
         return kErrInvalidParameter;
     }
@@ -1051,9 +1087,11 @@ SSPC_SYSV_ABI s32 ModuleRegister(u32 context, u32 codec, s64 reserved) {
     }
     ctx->registered[codec] = true;
     return kOk;
+} catch (...) { // (no C++ exception crosses into the guest)
+    return ExportFailed();
 }
 
-SSPC_SYSV_ABI s32 ModuleUnregister(u32 context, u32 codec) {
+SSPC_SYSV_ABI s32 ModuleUnregister(u32 context, u32 codec) try {
     std::lock_guard lock(g_mutex);
     Context* ctx = FindContext(context);
     if (ctx == nullptr) {
@@ -1067,9 +1105,11 @@ SSPC_SYSV_ABI s32 ModuleUnregister(u32 context, u32 codec) {
     }
     ctx->registered[codec] = false;
     return kOk;
+} catch (...) { // (no C++ exception crosses into the guest)
+    return ExportFailed();
 }
 
-SSPC_SYSV_ABI s32 InstanceCreate(u32 context, u32 codec, u64 flags, u32* out_instance) {
+SSPC_SYSV_ABI s32 InstanceCreate(u32 context, u32 codec, u64 flags, u32* out_instance) try {
     std::lock_guard lock(g_mutex);
     Context* ctx = FindContext(context);
     if (ctx == nullptr) {
@@ -1100,9 +1140,11 @@ SSPC_SYSV_ABI s32 InstanceCreate(u32 context, u32 codec, u64 flags, u32* out_ins
     *out_instance = id;
     SSPC_LOG(Audio, Debug, "AJM: instance {:#x} (flags {:#x})", id, flags);
     return kOk;
+} catch (...) { // (no C++ exception crosses into the guest)
+    return ExportFailed();
 }
 
-SSPC_SYSV_ABI s32 InstanceDestroy(u32 context, u32 instance) {
+SSPC_SYSV_ABI s32 InstanceDestroy(u32 context, u32 instance) try {
     std::lock_guard lock(g_mutex);
     Context* ctx = FindContext(context);
     if (ctx == nullptr) {
@@ -1112,6 +1154,8 @@ SSPC_SYSV_ABI s32 InstanceDestroy(u32 context, u32 instance) {
         return kErrInvalidInstance;
     }
     return kOk;
+} catch (...) { // (no C++ exception crosses into the guest)
+    return ExportFailed();
 }
 
 SSPC_SYSV_ABI void* BatchJobControlBufferRa(void* buffer, u32 instance, u64 flags, void* side_in, u64 side_in_size,
@@ -1157,7 +1201,7 @@ s32 StartLocked(Context& ctx, u8* batch, u32 size, BatchError* error, u32* out_i
 }
 
 SSPC_SYSV_ABI s32 BatchStartBuffer(u32 context, u8* batch, u32 size, s32 priority, BatchError* error, u32* out_id);
-SSPC_SYSV_ABI s32 BatchWait(u32 context, u32 batch, u32 timeout, BatchError* error) {
+SSPC_SYSV_ABI s32 BatchWait(u32 context, u32 batch, u32 timeout, BatchError* error) try {
     (void)timeout; // (a batch is done when sceAjmBatchStartBuffer returns)
     (void)error;
     std::lock_guard lock(g_mutex);
@@ -1172,6 +1216,8 @@ SSPC_SYSV_ABI s32 BatchWait(u32 context, u32 batch, u32 timeout, BatchError* err
     const s32 r = it->second;
     ctx->batches.erase(it);
     return r;
+} catch (...) { // (no C++ exception crosses into the guest)
+    return ExportFailed();
 }
 
 // The game calls it after a failed start or wait, with its SceAjmBatchInfo and the batch's error (eboot 0x872c70).
@@ -1182,7 +1228,7 @@ struct BatchInfo {
     void* current_job;
     void* current_ra;
 };
-SSPC_SYSV_ABI s32 BatchErrorDump(const BatchInfo* info, const BatchError* error) {
+SSPC_SYSV_ABI s32 BatchErrorDump(const BatchInfo* info, const BatchError* error) try {
     if (error == nullptr) {
         return kErrInvalidParameter;
     }
@@ -1191,6 +1237,8 @@ SSPC_SYSV_ABI s32 BatchErrorDump(const BatchInfo* info, const BatchError* error)
              info != nullptr ? info->buffer : nullptr, info != nullptr ? info->offset : 0,
              info != nullptr ? info->size : 0);
     return kOk;
+} catch (...) { // (no C++ exception crosses into the guest)
+    return ExportFailed();
 }
 
 // ======================= verify: the oracle on the same input =======================
@@ -1276,7 +1324,7 @@ s32 VerifyStart(u32 context, u8* batch, u32 size, s32 priority, BatchError* erro
         jobs = std::move(probe);
     }
     const auto cit = g_context_map.find(context);
-    // shadows: the game's output buffers as they are now (so untouched bytes compare equal), its sideband zeroed
+    // shadows: the game's output buffers and output sideband as they are now (so untouched bytes compare equal)
     std::vector<std::vector<std::vector<u8>>> out_shadow(jobs.size());
     std::vector<std::vector<u8>> side_shadow(jobs.size());
     std::vector<u8> shadow_batch(static_cast<size_t>(size) + 64 * jobs.size() + 64);
@@ -1293,7 +1341,9 @@ s32 VerifyStart(u32 context, u8* batch, u32 size, s32 priority, BatchError* erro
             }
             oinst = iit->second;
         }
-        side_shadow[j].assign(job.sideband_out.size, 0);
+        if (job.sideband_out.address != nullptr) { // (as the outputs: bytes neither side writes compare equal)
+            side_shadow[j].assign(job.sideband_out.address, job.sideband_out.address + job.sideband_out.size);
+        }
         std::array<AjmBuffer, 8> outs{};
         for (u32 i = 0; i < job.num_outputs; ++i) {
             const AjmBuffer& o = job.outputs[i];
@@ -1426,7 +1476,7 @@ s32 VerifyStart(u32 context, u8* batch, u32 size, s32 priority, BatchError* erro
     return rc;
 }
 
-SSPC_SYSV_ABI s32 BatchStartBuffer(u32 context, u8* batch, u32 size, s32 priority, BatchError* error, u32* out_id) {
+SSPC_SYSV_ABI s32 BatchStartBuffer(u32 context, u8* batch, u32 size, s32 priority, BatchError* error, u32* out_id) try {
     if (g_mode == Mode::Verify) {
         return VerifyStart(context, batch, size, priority, error, out_id);
     }
@@ -1438,23 +1488,45 @@ SSPC_SYSV_ABI s32 BatchStartBuffer(u32 context, u8* batch, u32 size, s32 priorit
     std::vector<Job> jobs;
     jobs.reserve(16);
     return StartLocked(*ctx, batch, size, error, out_id, jobs);
+} catch (...) { // (no C++ exception crosses into the guest)
+    return ExportFailed();
 }
 
 // verify wrappers of the state functions: the own result is the game's; the oracle follows it
 void SelfTest();
 
+// (the own call's result is returned whatever happens on the oracle's side; an exception there is a verify failure)
+void OracleFailed() {
+    std::lock_guard lock(g_mutex);
+    ++g_vs.oracle_failures;
+}
+
 SSPC_SYSV_ABI s32 VInitialize(s64 reserved, u32* out_context) {
     const s32 r = Initialize(reserved, out_context);
     if (r == kOk) {
-        u32 o = 0;
-        if (reinterpret_cast<FnInit>(g_oracle[kOInit])(0, &o) == kOk) {
-            std::lock_guard lock(g_mutex);
-            g_context_map[*out_context] = o;
+        bool failed = false;
+        try {
+            u32 o = 0;
+            if (reinterpret_cast<FnInit>(g_oracle[kOInit])(0, &o) == kOk) {
+                std::lock_guard lock(g_mutex);
+                g_context_map[*out_context] = o;
+            } else {
+                failed = true;
+            }
+        } catch (...) {
+            failed = true;
         }
-        static bool once = false;
-        if (!once) {
-            once = true;
-            SelfTest(); // (its own context: the game's sees nothing of it)
+        if (failed) {
+            OracleFailed();
+        }
+        // (SelfTest calls VInitialize itself: the exchange makes that inner call skip it)
+        static std::atomic<bool> once{false};
+        if (!once.exchange(true)) {
+            try {
+                SelfTest(); // (its own context: the game's sees nothing of it)
+            } catch (...) {
+                SSPC_LOG(Audio, Error, "R10 AJM selftest: stopped by an exception");
+            }
         }
     }
     return r;
@@ -1462,11 +1534,29 @@ SSPC_SYSV_ABI s32 VInitialize(s64 reserved, u32* out_context) {
 SSPC_SYSV_ABI s32 VFinalize(u32 context) {
     const s32 r = Finalize(context);
     std::lock_guard lock(g_mutex);
-    if (const auto it = g_context_map.find(context); it != g_context_map.end()) {
+    const auto it = g_context_map.find(context);
+    // the context's oracle instances and dump files go with it (erasing allocates nothing)
+    for (auto iit = g_instance_map.begin(); iit != g_instance_map.end();) {
+        if (iit->first.first != context) {
+            ++iit;
+            continue;
+        }
+        if (it != g_context_map.end()) {
+            reinterpret_cast<FnDestroy>(g_oracle[kODestroy])(it->second, iit->second);
+        }
+        iit = g_instance_map.erase(iit);
+    }
+    for (auto d = g_dumps.begin(); d != g_dumps.end();) {
+        d = d->first.first == context ? g_dumps.erase(d) : std::next(d);
+    }
+    if (it != g_context_map.end()) {
         reinterpret_cast<FnFinalize>(g_oracle[kOFinalize])(it->second);
         g_context_map.erase(it);
     }
-    LogVerify("finalize");
+    try {
+        LogVerify("finalize");
+    } catch (...) {
+    }
     return r;
 }
 SSPC_SYSV_ABI s32 VModuleRegister(u32 context, u32 codec, s64 reserved) {
@@ -1487,14 +1577,22 @@ SSPC_SYSV_ABI s32 VModuleUnregister(u32 context, u32 codec) {
 }
 SSPC_SYSV_ABI s32 VInstanceCreate(u32 context, u32 codec, u64 flags, u32* out_instance) {
     const s32 r = InstanceCreate(context, codec, flags, out_instance);
-    std::lock_guard lock(g_mutex);
-    if (const auto it = g_context_map.find(context); r == kOk && it != g_context_map.end()) {
-        u32 o = 0;
-        if (reinterpret_cast<FnCreate>(g_oracle[kOCreate])(it->second, codec, flags, &o) == kOk) {
-            g_instance_map[{context, *out_instance}] = o;
-        } else {
-            ++g_vs.oracle_failures;
+    bool failed = false;
+    try {
+        std::lock_guard lock(g_mutex);
+        if (const auto it = g_context_map.find(context); r == kOk && it != g_context_map.end()) {
+            u32 o = 0;
+            if (reinterpret_cast<FnCreate>(g_oracle[kOCreate])(it->second, codec, flags, &o) == kOk) {
+                g_instance_map[{context, *out_instance}] = o; // (may throw: the instance then goes unverified)
+            } else {
+                failed = true;
+            }
         }
+    } catch (...) {
+        failed = true;
+    }
+    if (failed) {
+        OracleFailed();
     }
     return r;
 }
@@ -1518,6 +1616,72 @@ SSPC_SYSV_ABI s32 VInstanceDestroy(u32 context, u32 instance) {
 // game's Wwise source builds them (0xc00000001001: MultipleFrames, Stream | Format; 0x38 bytes of sideband) of
 // whole superframes into a 0x1000-sample ring (two output buffers where it wraps); every 7th job also takes its input
 // as two buffers. A second pass decodes the whole file with RIFF parsing and gapless sideband.
+// The selftest's error cases, on the own AJM alone (a context the oracle does not know, so it is never asked): config
+// bytes LibAtrac9 must not see (channel config index 6/7, a set validation bit, a wrong header) leave the instance
+// uninitialized - the control job answers "invalid data", a run job after it "not initialized", nothing is decoded -
+// and a job whose last sub-chunk is cut short is a malformed batch.
+void NegativeTest() {
+    u32 ctx = 0;
+    if (Initialize(0, &ctx) != kOk || ModuleRegister(ctx, kCodecAt9, 0) != kOk) {
+        SSPC_LOG(Audio, Error, "R10 AJM selftest (errors): no context");
+        return;
+    }
+    u32 ok = 0, total = 0;
+    alignas(16) std::array<u8, 0x200> batch{};
+    BatchError err{};
+    u32 id = 0;
+    std::vector<u8> in(0x400, 0x5A);
+    std::vector<s16> pcm(0x800, 0x1234);
+    static constexpr u8 kBad[][4] = {{0xFE, 0x7E, 0x00, 0x00},  // 48 kHz, channel config 7
+                                     {0xFE, 0x7C, 0x00, 0x00},  // channel config 6
+                                     {0xFE, 0x75, 0x00, 0x00},  // validation bit set
+                                     {0x00, 0x74, 0x00, 0x00}}; // no 0xFE header
+    for (const auto& cfg : kBad) {
+        u32 inst = 0;
+        if (InstanceCreate(ctx, kCodecAt9, (2ull << 3) | 1, &inst) != kOk) {
+            break;
+        }
+        u64 init = 0;
+        std::memcpy(&init, cfg, 4);
+        SidebandResult cres{-1, -1};
+        u8* end = static_cast<u8*>(BatchJobControlBufferRa(batch.data(), inst, 0x6001, &init, 8, &cres, 8, nullptr));
+        const bool control_ok = BatchStartBuffer(ctx, batch.data(), static_cast<u32>(end - batch.data()), 0x28, &err,
+                                                 &id) == kOk &&
+                                BatchWait(ctx, id, 0xFFFFFFFFu, &err) == kOk && (cres.result & kResInvalidData) != 0;
+        struct alignas(8) Side {
+            SidebandResult res;
+            SidebandStream stream;
+        } side{};
+        AjmBuffer i{in.data(), in.size()};
+        AjmBuffer o{reinterpret_cast<u8*>(pcm.data()), pcm.size() * 2};
+        end = static_cast<u8*>(BatchJobRunSplitBufferRa(batch.data(), inst, 0x800000001001ull, &i, 1, &o, 1, &side,
+                                                        sizeof(side), nullptr));
+        const bool run_ok = BatchStartBuffer(ctx, batch.data(), static_cast<u32>(end - batch.data()), 0x28, &err,
+                                             &id) == kOk &&
+                            BatchWait(ctx, id, 0xFFFFFFFFu, &err) == kOk &&
+                            (side.res.result & kResNotInitialized) != 0 && side.stream.output_written == 0 &&
+                            pcm[0] == 0x1234;
+        total += 2;
+        ok += (control_ok ? 1 : 0) + (run_ok ? 1 : 0);
+        (void)InstanceDestroy(ctx, inst);
+    }
+    { // a job of 4 body bytes: its one sub-chunk has no room for a header and a size
+        u32 inst = 0;
+        if (InstanceCreate(ctx, kCodecAt9, (2ull << 3) | 1, &inst) == kOk) {
+            batch.fill(0);
+            const u32 h = Header(kIdentJob, inst);
+            const u32 body = 4;
+            std::memcpy(batch.data(), &h, 4);
+            std::memcpy(batch.data() + 4, &body, 4);
+            ++total;
+            ok += BatchStartBuffer(ctx, batch.data(), 16, 0x28, &err, &id) == kErrMalformedBatch ? 1 : 0;
+            (void)InstanceDestroy(ctx, inst);
+        }
+    }
+    (void)Finalize(ctx);
+    SSPC_LOG(Audio, Warning, "R10 AJM selftest (errors): {}/{} cases as expected", ok, total);
+}
+
 void SelfTest() {
     const char* path = std::getenv("SSPC_R10_AJM_SELFTEST");
     if (path == nullptr || *path == 0) {
@@ -1558,7 +1722,11 @@ void SelfTest() {
         SSPC_LOG(Audio, Error, "R10 AJM selftest: {} is not an ATRAC9 RIFF file", path);
         return;
     }
-    const VerifyStats before = g_vs;
+    VerifyStats before;
+    {
+        std::lock_guard lock(g_mutex);
+        before = g_vs;
+    }
     u32 ctx = 0;
     if (VInitialize(0, &ctx) != kOk || VModuleRegister(ctx, kCodecAt9, 0) != kOk) {
         SSPC_LOG(Audio, Error, "R10 AJM selftest: no context");
@@ -1626,7 +1794,11 @@ void SelfTest() {
         ++n;
     }
     (void)VInstanceDestroy(ctx, inst);
-    const u64 pass1_frames = g_vs.frames - before.frames;
+    u64 pass1_frames = 0;
+    {
+        std::lock_guard lock(g_mutex);
+        pass1_frames = g_vs.frames - before.frames;
+    }
 
     // pass 2: the whole file, RIFF parsed by the decoder, gapless sideband (Result, Stream, Format, Gapless, MFrame)
     u32 inst2 = 0;
@@ -1659,7 +1831,11 @@ void SelfTest() {
     SSPC_LOG(Audio, Warning, "R10 AJM selftest {}: {} ch, superframe {} bytes / {} samples, {} game-style jobs ({} "
                              "frames); then the RIFF/gapless pass",
              path, channels, block, block_samples, n, pass1_frames);
-    LogVerify("selftest");
+    {
+        std::lock_guard lock(g_mutex);
+        LogVerify("selftest");
+    }
+    NegativeTest();
 }
 
 template <typename F>
