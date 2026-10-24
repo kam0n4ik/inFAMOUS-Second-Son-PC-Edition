@@ -50,6 +50,7 @@
 #include "runtime/gpu/shader/shader_disk_cache.h"
 #include "runtime/gpu/shader/shader_frontend.h"
 #include "runtime/gpu/shader/shader_translator.h"
+#include "runtime/gpu/r10/latency.h"
 #include "runtime/gpu/static/static_predictor.h"
 #include "runtime/gpu/upscale/upscale_settings.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
@@ -1957,6 +1958,7 @@ void Backend::Stop() {
     Gprof::Stop(); // (R9; the backend's threads stopped - the game's may still run, the sampler stops first)
     FrameLog::Write(options_.logs_dir / "gpu_frames.csv");
     StallTrace::Stop(); // (P4.12; the backend's threads and the present thread stopped)
+    R10::Latency::Stop(options_.logs_dir); // (R10: SSPC_R10_LATENCY=1)
     ShaderTrace::Stop(); // (P4.14)
     if (Inspector::On() && executor_) {
         Inspector::WriteFile("pipelines.csv", executor_->InspectorPipelines());

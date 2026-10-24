@@ -30,7 +30,7 @@
 namespace SecondSon::Gpu::StallTrace {
 
 /// Whose thread recorded an event.
-enum class Role : u8 { Cp, Record, Present, Game, Other, Count };
+enum class Role : u8 { Cp, Record, Present, Game, Other, Frontend, Emit, Worker, Count };
 
 /// The events (spans unless named instant). The thread is the log's, not part of the type.
 enum class Ev : u16 {
@@ -83,6 +83,20 @@ enum class Ev : u16 {
     GameEarlySubmit, ///< P5.4 SSPC_P54_EARLY_SUBMIT: the frame handed on inside sceGnmSubmitDone (a = DCBs, b = buffer)
     CpQueueSlice,    ///< P5.4: thread 1 steps one queue in a round (a = queue, b = packets, c = how it stopped: 0 nothing
                      ///< left, 1 blocked, 2 the round's cap, 3 faulted)
+    // R10 pacing (docs/R10_PACING.md): a batch's life on the recording thread and which Vulkan queue it went to
+    AqSubmit,        ///< from the batch's first command (its Begin) to its vkQueueSubmit2's return (a = timeline value,
+                     ///< b = the other queue's value it waits for, low 32 bits; c = AqSubmitFlags | queue mask << 8)
+    // R10 timeline (docs/R10_CPU_GPU_SCHEDULER.md; tools/r10/timeline.py): the other threads of the frame's pipeline
+    FrontWait,       ///< the frontend thread waits for a record of thread 1
+    FrontPrep,       ///< deep (records): the frontend prepares one record (b = index low 32 bits, c = kind)
+    EmitWait,        ///< the emitter thread waits for commands (spinning, then asleep)
+    EmitRun,         ///< the emitter passes a run of commands to the driver (a = bytes)
+    PipeBuild,       ///< a worker builds a pipeline (a = description hash, c = 0 async graphics, 1 compute prefetch,
+                     ///< 2 the start-up precompiler)
+    InputEvent,      ///< instant: scripted input pushed into the window's queue (a = kind 1 key, 2 button, 3 move;
+                     ///< b = |dx| + |dy| of a move)
+    PresentDone,     ///< instant: vkQueuePresentKHR returned (a = flip id)
+    SchedTask,       ///< a task of the R10 work pool (a = its class, c = priority)
     Count,
 };
 constexpr size_t kEvents = static_cast<size_t>(Ev::Count);
@@ -147,7 +161,19 @@ void RegisterThread(Role role);
 
 /// The GPU's batch with timeline value `value` completed: its submission (TSC before the lock, after the call) and its
 /// GPU start/end (the device's timestamp ticks; 0 when not timed), the frame it was recorded in (flip markers then).
-void GpuBatch(u64 value, u64 submit_t0, u64 submit_t1, u64 gpu_t0, u64 gpu_t1, u32 frame);
+/// `flags`: bit 0 - executed on the async compute lane (AQ), kept in the record (R10).
+void GpuBatch(u64 value, u64 submit_t0, u64 submit_t1, u64 gpu_t0, u64 gpu_t1, u32 frame, u32 flags = 0);
+/// AqSubmit's c (R10): why a batch waited for the other queue.
+enum AqSubmitFlags : u16 {
+    kAqLane = 1,         ///< on the async compute lane
+    kAqWaitMain = 2,     ///< a lane batch waits for a main batch (b = its value)
+    kAqWhyRange = 4,     ///< ... a guest range conflict with a main batch in flight
+    kAqWhyAll = 8,       ///< ... every main batch before it (a wait met by a held fence / wait_all)
+    kAqWhyShared = 16,   ///< ... GDS / LDS / ranges not known (overflow)
+    kAqWhyImages = 32,   ///< ... it bound images
+    kAqWaitLane = 64,    ///< a main batch waits for the lane's last batch (b = its value)
+    kAqBinds = 128,      ///< it waits for sparse binds
+};
 
 /// P4.14: the waits go to the shader stall trace too (shader_trace.h; its SSPC_SHADER_STALL_TRACE), whether or not this
 /// trace runs. Before the backend's threads.

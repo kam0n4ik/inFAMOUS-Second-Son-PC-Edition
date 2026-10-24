@@ -16,6 +16,7 @@
 #include "base/log.h"
 #include "runtime/gpu/r9/pcache.h"
 #include "runtime/gpu/shader_trace.h"
+#include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_pipelines.h"
 #include "runtime/kernel/clock.h"
@@ -344,6 +345,7 @@ bool PipelinePrecompiler::Build(Entry& e, std::vector<u32>& vs, std::vector<u32>
         e.ns = static_cast<u64>(TscMs(t1 - t0) * 1e6);
         build_ns_.fetch_add(e.ns, std::memory_order_relaxed);
         ShaderTrace::Event(ShaderTrace::Kind::Precompile, t0, t1, e.hash, 0, flags | (ok ? 0u : ShaderTrace::kPipeFailed));
+        StallTrace::Span(StallTrace::Ev::PipeBuild, t0, t1, e.hash, 0, 2); // (R10 timeline)
         // SSPC_DIAG_PRECOMPILE_LOG=<n> (R9-N): the first n pipelines built - their time and the driver's feedback
         static const u32 log_first = [] {
             char v[16] = {};
@@ -378,6 +380,7 @@ bool PipelinePrecompiler::Build(Entry& e, std::vector<u32>& vs, std::vector<u32>
 void PipelinePrecompiler::Worker(u32 index) {
     SetThreadDescription(GetCurrentThread(), (L"SecondSonPC:Precompile" + std::to_wstring(index)).c_str());
     ShaderTrace::NameThread("SecondSonPC:Precompile");
+    StallTrace::RegisterThread(StallTrace::Role::Worker); // (R10 timeline)
     bool lowered = false;
     std::vector<u32> vs, ps;
     while (!cancel_.load(std::memory_order_acquire)) {

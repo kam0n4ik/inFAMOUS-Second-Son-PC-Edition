@@ -17,6 +17,7 @@
 
 #include "base/log.h"
 #include "runtime/gpu/png_writer.h"
+#include "runtime/gpu/r10/latency.h"
 #include "runtime/gpu/stall_trace.h"
 #include "runtime/gpu/upscale/fsr_framegen.h"
 #include "runtime/gpu/vulkan/vk_reflex.h"
@@ -253,6 +254,12 @@ struct Presenter::Impl {
         bool submitted = false, acquire_pending = false, present_pending = false;
         s32 frame = -1; ///< the frame its commands read
         OwnedBuffer overlay; ///< the FPS counter's pixels (free once the slot's fence signalled)
+        // R10 latency probe (SSPC_R10_LATENCY=1): the texel grid of the frame this slot presented, read when the
+        // slot's fence is met next
+        OwnedBuffer probe;
+        u64 probe_flip = 0, probe_tsc = 0;
+        u32 probe_bpp = 0; ///< 0: nothing copied
+        bool probe_pending = false;
     };
     // the FPS counter (P4.6; SSPC_FPS_OVERLAY=0 hides it): presented frames over the last half second
     bool overlay_on = true;
@@ -333,6 +340,12 @@ struct Presenter::Impl {
                 fr.fence = VK_NULL_HANDLE;
                 fr.state.store(0, std::memory_order_release);
             }
+        }
+        if (s.probe_pending) { // (R10: the slot's last present completed - its grid is in the buffer)
+            s.probe_pending = false;
+            R10::Latency::Present(s.probe_flip, s.probe_tsc,
+                                  s.probe_bpp != 0 ? static_cast<const u8*>(s.probe.mapped) : nullptr,
+                                  s.probe_bpp != 0 ? s.probe_bpp : 4);
         }
         return true;
     }
@@ -906,6 +919,7 @@ Presenter::~Presenter() {
     m.fg.reset();
     for (auto& s : m.slots) {
         DestroyBuffer(m.ctx, s.overlay);
+        DestroyBuffer(m.ctx, s.probe);
         if (s.acquire_fence != VK_NULL_HANDLE) {
             f.vkDestroyFence(m.ctx.Device(), s.acquire_fence, nullptr);
         }
@@ -1196,6 +1210,51 @@ void Presenter::Present(s32 frame, u64 flip_id) {
         f.vkCmdBlitImage(s.cb, fr->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swap,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
     }
+    // R10 latency probe (SSPC_R10_LATENCY=1, r10/latency.h): a 16 x 9 grid of the frame's texels into the slot's host
+    // buffer (the frame stays in TRANSFER_SRC as for the blit: a read after a read, no barrier before)
+    s.probe_bpp = 0;
+    if (R10::Latency::On() && show) {
+        const u32 bpp = fr->format == VK_FORMAT_R16G16B16A16_SFLOAT || fr->format == VK_FORMAT_R16G16B16A16_UNORM ? 8u
+                        : (fr->format == VK_FORMAT_B8G8R8A8_UNORM || fr->format == VK_FORMAT_B8G8R8A8_SRGB ||
+                           fr->format == VK_FORMAT_R8G8B8A8_UNORM || fr->format == VK_FORMAT_R8G8B8A8_SRGB ||
+                           fr->format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                           fr->format == VK_FORMAT_A2R10G10B10_UNORM_PACK32)
+                            ? 4u
+                            : 0u;
+        if (bpp != 0 && s.probe.buffer == VK_NULL_HANDLE) {
+            std::string err;
+            if (!CreateBuffer(m.ctx, u64{R10::Latency::kGrid} * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, s.probe, err,
+                              true)) {
+                SSPC_LOG(GPU, Warning, "R10 latency probe: no readback buffer ({})", err);
+            }
+        }
+        if (bpp != 0 && s.probe.mapped != nullptr && fr->width >= R10::Latency::kGridW &&
+            fr->height >= R10::Latency::kGridH) {
+            std::array<VkBufferImageCopy, R10::Latency::kGrid> regions{};
+            for (u32 y = 0; y < R10::Latency::kGridH; ++y) {
+                for (u32 x = 0; x < R10::Latency::kGridW; ++x) {
+                    const u32 i = y * R10::Latency::kGridW + x;
+                    regions[i] = {.bufferOffset = u64{i} * bpp,
+                                  .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                  .imageOffset = {static_cast<s32>(fr->width * (2 * x + 1) / (2 * R10::Latency::kGridW)),
+                                                  static_cast<s32>(fr->height * (2 * y + 1) / (2 * R10::Latency::kGridH)),
+                                                  0},
+                                  .imageExtent = {1, 1, 1}};
+                }
+            }
+            f.vkCmdCopyImageToBuffer(s.cb, fr->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.probe.buffer,
+                                     static_cast<u32>(regions.size()), regions.data());
+            const VkMemoryBarrier2 to_host{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                           .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                           .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+            const VkDependencyInfo hdep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                        .pMemoryBarriers = &to_host};
+            f.vkCmdPipelineBarrier2(s.cb, &hdep);
+            s.probe_bpp = bpp;
+        }
+    }
     // the FPS counter over the frame, top left (P4.6): the shown frames of the last second, the text renewed twice a
     // second; SSPC_FPS_OVERLAY=0 hides it
     static const bool overlay_env = [] {
@@ -1358,6 +1417,12 @@ void Presenter::Present(s32 frame, u64 flip_id) {
                 if (reflex) {
                     Reflex::PresentMarker(false, flip_id);
                 }
+            }
+            StallTrace::Instant(StallTrace::Ev::PresentDone, flip_id); // (R10 timeline)
+            if (R10::Latency::On()) {
+                s.probe_flip = show ? flip_id : 0;
+                s.probe_tsc = __rdtsc();
+                s.probe_pending = true;
             }
             // WSI errors below still enqueue semaphore waits and the present fence.
             s.present_pending = !m.fg && (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR ||

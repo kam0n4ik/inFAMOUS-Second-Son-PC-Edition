@@ -1249,7 +1249,8 @@ void Executor::Retire(Batch& b) {
                         mine.pop_front();
                     }
                 }
-                StallTrace::GpuBatch(b.value, b.submit_t0, b.submit_t1, ts[0], ts[1], b.trace_frame); // (P4.12)
+                StallTrace::GpuBatch(b.value, b.submit_t0, b.submit_t1, ts[0], ts[1], b.trace_frame,
+                                     b.lane != 0 ? 1u : 0u); // (P4.12; R10: the lane)
                 if (insp_catalog_ != nullptr) {
                     // the frame's GPU time: the union of its batches' intervals (one queue; a batch's start may come
                     // before the previous one's end - its top-of-pipe timestamp)

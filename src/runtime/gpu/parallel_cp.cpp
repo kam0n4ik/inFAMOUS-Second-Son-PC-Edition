@@ -1620,7 +1620,9 @@ void ParallelCp::FrontStep(Record& r, u64 index) {
 
 void ParallelCp::FrontLoop() {
     SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuFrontend");
+    StallTrace::RegisterThread(StallTrace::Role::Frontend); // (R10 timeline)
     R8_CP_PROF_THREAD(Front);
+    const bool trace_prep = StallTrace::DeepRecords();
     u64 k = fhead_.load(std::memory_order_relaxed);
     for (;;) {
         u64 t = tail_.load(std::memory_order_acquire);
@@ -1656,7 +1658,11 @@ void ParallelCp::FrontLoop() {
                 f_waiting_.store(0, std::memory_order_relaxed);
                 t = tail_.load(std::memory_order_acquire);
             }
-            Bump(fc_.idle, __rdtsc() - w0);
+            const u64 w1 = __rdtsc();
+            Bump(fc_.idle, w1 - w0);
+            if (w1 - w0 >= 20'000) { // (R10 timeline: waits of ~5 us and more)
+                StallTrace::Span(StallTrace::Ev::FrontWait, w0, w1, 0, static_cast<u32>(k));
+            }
         }
         const u64 b0 = __rdtsc();
         Record& r = slots_[k & slot_mask_];
@@ -1676,6 +1682,9 @@ void ParallelCp::FrontLoop() {
             FrontCloseRun(k); // (nothing joins any more: the held first draw is published, this record below)
         }
         Bump(fc_.busy, __rdtsc() - b0);
+        if (trace_prep && !stop) {
+            StallTrace::Span(StallTrace::Ev::FrontPrep, b0, __rdtsc(), 0, static_cast<u32>(k), static_cast<u16>(r.kind));
+        }
         ++k;
         // (the record's preparation published to thread 2 - front mode: up to a held run's first draw)
         const u64 publish = f_run_open_ ? f_run_lead_ : k;

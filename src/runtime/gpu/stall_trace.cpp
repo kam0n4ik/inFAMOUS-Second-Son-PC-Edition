@@ -159,8 +159,9 @@ ThreadLog* MakeLog(Role role) {
     l->fframe.reset(new u32[kFrames]);
     std::fill_n(l->fframe.get(), kFrames, ~0u);
     if ((detail::g_mode.load(std::memory_order_relaxed) & 3) == 2) {
-        l->cap = role == Role::Record ? g.opt.events : role == Role::Cp ? std::max<u64>(g.opt.events / 4, 1u << 18)
-                                                                        : u64{1} << 18;
+        l->cap = role == Role::Record || role == Role::Frontend ? g.opt.events
+                 : role == Role::Cp || role == Role::Emit       ? std::max<u64>(g.opt.events / 4, 1u << 18)
+                                                                : u64{1} << 18;
         l->ev.reset(new Event[l->cap]); // (not zeroed: pages are touched as events land)
     }
     if (role == Role::Cp || role == Role::Record) {
@@ -441,7 +442,10 @@ const char* EvName(Ev e) {
         "PipelineCreate", "ShaderTranslate", "FlipAcquire", "CopyFallback", "VblankWait", "NotReady", "Present",
         "PresentFence", "PresentAcquire", "PresentSubmit", "GameSubmitLock", "GameIdleWait", "GameSubmitFlip",
         "GameSubmitFrame", "GameComputeWait", "GameSubmitDone", "GameDingDong", "FenceHeld", "FenceWrite",
-        "GameEarlySubmit", "CpQueueSlice",
+        "GameEarlySubmit", "CpQueueSlice", "AqSubmit",
+        // R10 timeline
+        "FrontWait", "FrontPrep", "EmitWait", "EmitRun", "PipeBuild", "InputEvent", "PresentDone",
+        "SchedTask",
     };
     static_assert(std::size(kNames) == kEvents);
     const size_t i = static_cast<size_t>(e);
@@ -449,7 +453,7 @@ const char* EvName(Ev e) {
 }
 
 const char* RoleName(Role r) {
-    static constexpr const char* kNames[] = {"CP", "Record", "Present", "Game", "Other"};
+    static constexpr const char* kNames[] = {"CP", "Record", "Present", "Game", "Other", "Frontend", "Emit", "Worker"};
     const size_t i = static_cast<size_t>(r);
     return i < std::size(kNames) ? kNames[i] : "?";
 }
@@ -516,7 +520,7 @@ void RegisterThread(Role role) {
     }
 }
 
-void GpuBatch(u64 value, u64 submit_t0, u64 submit_t1, u64 gpu_t0, u64 gpu_t1, u32 frame) {
+void GpuBatch(u64 value, u64 submit_t0, u64 submit_t1, u64 gpu_t0, u64 gpu_t1, u32 frame, u32 flags) {
     if ((detail::g_mode.load(std::memory_order_relaxed) & 3) == 0) {
         return;
     }
@@ -545,7 +549,7 @@ void GpuBatch(u64 value, u64 submit_t0, u64 submit_t1, u64 gpu_t0, u64 gpu_t1, u
     g.gpu_last_frame = frame;
     if (Deep() && InWindow(submit_t0, submit_t1)) {
         if (g.batches.size() < g.batches.capacity()) {
-            g.batches.push_back({value, submit_t0, submit_t1, gpu_t0, gpu_t1, frame, 0});
+            g.batches.push_back({value, submit_t0, submit_t1, gpu_t0, gpu_t1, frame, flags});
         } else {
             ++g.batches_dropped;
         }

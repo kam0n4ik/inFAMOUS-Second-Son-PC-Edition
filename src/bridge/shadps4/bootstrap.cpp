@@ -65,6 +65,7 @@
 #include "engine/game_clock_probe.h"
 #include "runtime/gpu/r8/r8_verify_frame.h"
 #include "runtime/gpu/r9/gprof.h"
+#include "runtime/gpu/r10/latency.h"
 #include "engine/guest_hooks.h"
 #include "engine/game_fixes.h"
 #include "engine/mouse_camera.h"
@@ -1107,6 +1108,9 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
                 e.key.scancode = ev.scancode;
                 e.key.key = SDL_GetKeyFromScancode(ev.scancode, SDL_KMOD_NONE, false);
                 e.key.down = ev.kind == Kind::KeyDown;
+                if (ev.kind == Kind::KeyDown) {
+                    Gpu::R10::Latency::Input(1, 0.0f, 0.0f); // (SSPC_R10_LATENCY: the moment it is pushed)
+                }
                 SDL_PushEvent(&e);
                 break;
             case Kind::ButtonDown:
@@ -1118,6 +1122,9 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
                 e.button.button = ev.button;
                 e.button.down = ev.kind == Kind::ButtonDown;
                 e.button.clicks = 1;
+                if (ev.kind == Kind::ButtonDown) {
+                    Gpu::R10::Latency::Input(2, 0.0f, 0.0f);
+                }
                 SDL_PushEvent(&e);
                 break;
             case Kind::Move:
@@ -1126,6 +1133,7 @@ void StartTestInput(const std::string& spec, const std::filesystem::path& logs_d
                 e.motion.which = Input::KeyboardMouse::kScriptedInputId;
                 e.motion.xrel = ev.dx;
                 e.motion.yrel = ev.dy;
+                Gpu::R10::Latency::Input(3, ev.dx, ev.dy);
                 SDL_PushEvent(&e);
                 break;
             case Kind::Mark:
