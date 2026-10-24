@@ -57,6 +57,41 @@ NOTES = {
     "Need_sceLibcInternal": ("data object (link marker)", "-", "P3", "link marker of libSceLibcInternal; its "
                              "slot (Fios2 0x60068) is read by no instruction (data_refs.py) [A]"),
 }
+# Reasons for whole groups of the remainder, by library or name prefix: (side effects, note).
+GROUP_NOTES = [
+    ("sceSaveDataDialog", "system UI (save list) over the game", "the save-list system dialog: Settings > Save opens it "
+     "[E]; drawn by the bridge's UI layer - an own one needs a system dialog UI on SecondSonPC's presenter (blocked: "
+     "not a runtime function, separate task); CommonDialog state shared through the sysrt-dialog adapter"),
+    ("sceMsgDialog", "system UI", "system message dialog; CommonDialog state shared through the sysrt-dialog adapter"),
+    ("sceErrorDialog", "system UI", "system error dialog; CommonDialog state shared through the sysrt-dialog adapter"),
+    ("sceNetEpoll", "host sockets", "offline: NetCtl (NATIVE) reports no network, the game opens no socket [E]; pools "
+     "and errno shared through the sysrt-net adapter"),
+    ("sceNetResolver", "host DNS", "offline, never started [E]; the bridge's resolvers take SecondSonPC's pool ids "
+     "(sysrt-net adapter)"),
+    ("sceNet", "host sockets", "offline: NetCtl (NATIVE) reports no network, the game opens no socket [E]; errno "
+     "shared through the sysrt-net adapter"),
+    ("sceKernelConvert", "-", "time zone conversion, never called [E]"),
+    ("sceKernelGetPrtAperture", "GPU memory", "partially resident textures: GPU memory (Phase 4)"),
+    ("msync", "memory", "memory API, never called [E]"),
+    ("sceKernelMlock", "memory", "memory API, never called [E]"),
+]
+STUB_NOTE = ("returns 0, logged", "imported by {imp}, never called in any run [E] (the loader logs each COMMON_STUB "
+             "call); exit/crash paths and Fios2's unused helpers")
+
+
+def note_for(name: str, kind: str, cls: str, importers: str) -> tuple[str, str, str, str]:
+    if name in NOTES:
+        return NOTES[name]
+    abi = "SysV" if kind == "Function" else "data object"
+    prio = "P1" if cls == "called" else "P3"
+    if cls == "stub":
+        return abi, STUB_NOTE[0], prio, STUB_NOTE[1].format(imp=importers)
+    if cls == "ajm":
+        return abi, "", prio, "libSceAjm: R10 agent ajm"
+    for prefix, effects, note in GROUP_NOTES:
+        if name.startswith(prefix):
+            return abi, effects, prio, note
+    return abi, "", prio, ""
 
 
 def parse_table(root: Path) -> list[dict]:
@@ -150,8 +185,7 @@ def main() -> int:
             cls = "object"
         else:
             cls = "called" if called else "idle"
-        abi, effects, prio, note = NOTES.get(r["name"], ("SysV" if r["kind"] == "Function" else "data object",
-                                                          "", "P1" if cls == "called" else "P3", ""))
+        abi, effects, prio, note = note_for(r["name"], r["kind"], cls, r["importers"])
         out_rows.append({"nid": r["nid"], "name": r["name"], "library": r["lib"], "module": r["mod"],
                          "kind": r["kind"], "importers": r["importers"], "abi": abi, "owners": owners,
                          "calls": calls, "class": cls, "effects": effects, "priority": prio, "note": note,
