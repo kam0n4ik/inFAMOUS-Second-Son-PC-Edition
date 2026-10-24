@@ -110,6 +110,9 @@ foreach ($l in @(@("ngx\LICENSE.txt", "NVIDIA-DLSS-SDK.txt"), @("ffx-api\LICENSE
         Copy-Item $from (Join-Path $dist "licenses\$($l[1])")
     }
 }
+# LibAtrac9 (MIT), compiled into the executable by SecondSonPC's own AJM (src/runtime/audio/ajm.cpp)
+New-Item -ItemType Directory -Force (Join-Path $dist "licenses") | Out-Null
+Copy-Item (Join-Path $root "third_party\LibAtrac9\LICENSE") (Join-Path $dist "licenses\LibAtrac9.txt")
 $zip = Join-Path $root "dist\SecondSonPC-win64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path (Join-Path $dist "*") -DestinationPath $zip

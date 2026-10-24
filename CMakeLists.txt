@@ -219,6 +219,16 @@ endforeach()
 target_sources(sspc_runtime PRIVATE ${SSPC_R9_PROFILE_SOURCES})
 # libSceVideodec (runtime/media/videodec.cpp): FFmpeg's H.264 decoder, the library the oracle uses too
 target_link_libraries(sspc_runtime PRIVATE FFmpeg::ffmpeg)
+# R10 (docs/R10_AJM.md): libSceAjm, SecondSonPC's own (runtime/audio/ajm.cpp, SSPC_R10_AJM=native|verify), on its
+# own copy of LibAtrac9 (third_party/LibAtrac9, MIT). Every external symbol of the copy is renamed (SspcAt9_*) by a
+# force-included header, so it never meets the bridge's LibAtrac9 at link time and keeps its own global tables.
+file(GLOB SSPC_ATRAC9_SOURCES ${CMAKE_SOURCE_DIR}/third_party/LibAtrac9/src/*.c)
+add_library(sspc_atrac9 STATIC ${SSPC_ATRAC9_SOURCES})
+target_compile_definitions(sspc_atrac9 PRIVATE SSPC_ATRAC9_BUILD _CRT_SECURE_NO_WARNINGS)
+target_compile_options(sspc_atrac9 PRIVATE "/FI${CMAKE_SOURCE_DIR}/third_party/LibAtrac9/sspc_atrac9_prefix.h" -w)
+target_include_directories(sspc_atrac9 INTERFACE ${CMAKE_SOURCE_DIR}/third_party/LibAtrac9) # <src/libatrac9.h>
+target_sources(sspc_runtime PRIVATE src/runtime/audio/ajm.cpp)
+target_link_libraries(sspc_runtime PRIVATE sspc_atrac9)
 # P4.1: the Vulkan headers (header-only, from the bridge's externals) for SecondSonPC's Vulkan foundation
 # (src/runtime/gpu/vulkan). No loader is linked: the system vulkan-1.dll is loaded at run time, as the bridge does.
 target_link_libraries(sspc_runtime PRIVATE Vulkan::Headers)

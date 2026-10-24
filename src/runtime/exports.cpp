@@ -30,6 +30,7 @@ std::span<const Runtime::Export> VideodecExports(); // runtime/media/videodec.cp
 
 namespace SecondSon::Audio {
 std::span<const Runtime::Export> AudioOutExports(); // runtime/audio/audio_out.cpp
+std::span<const Runtime::Export> AjmExports();      // runtime/audio/ajm.cpp (R10: empty unless SSPC_R10_AJM)
 }
 
 namespace SecondSon::Runtime {
@@ -100,6 +101,7 @@ std::vector<Export> Collect() {
                              Kernel::MutexExports(), Kernel::CondvarExports(), Kernel::RwlockExports(),
                              Kernel::DirectMemoryExports(), Kernel::ProcessExports(), Kernel::Threads::ThreadExports(),
                              Kernel::Signals::SignalExports(), Kernel::GuestErrno::Exports(),
+                             Audio::AjmExports(), // R10 (empty unless SSPC_R10_AJM=native|verify)
                              Kernel::MemoryApi::Exports(), Kernel::Clock::Exports(),
                              Net::NetUtilExports(), Np::NpManagerExports(), Offline::OfflineExports(), Libc::LibcMemExports(), Gpu::Gnm::GnmExports(), Gpu::VideoOut::Exports(),
                              std::span<const Export>(kFilesystemObservers)}) {
