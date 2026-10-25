@@ -73,6 +73,7 @@
 #include "engine/job_system.h"
 #include "engine/particles/smoke_quality.h"
 #include "engine/render/post_effects.h"
+#include "engine/render/reflections.h"
 #include "engine/render/frame_trace.h"
 #include "engine/render/draw_census.h"
 #include "engine/render/draw_runs.h"
@@ -901,6 +902,9 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     Engine::Render::PostFx::Install(linker.GetModule(eboot_index)->Base(),
                                     {.motion_blur = cfg.pc.motion_blur,
                                      .motion_blur_strength = cfg.pc.motion_blur_strength});
+    // R12 reflections (both backends; docs/R12_REFLECTIONS.md): the game's own unless [Graphics] reflectionQuality
+    // (SSPC_REFLECTION_QUALITY); diagnostics SSPC_R12_REFL_STATS / _DIAG
+    Engine::Render::Reflections::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.reflection_quality);
     // Upscaling (docs/UPSCALING_FRAME_GENERATION.md): with DLSS / FSR the game's scene renders at the quality's render
     // size (the engine's own render size, written before it starts); the display and the UI keep the plan's size.
     {

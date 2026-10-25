@@ -130,6 +130,10 @@ constexpr Choice kParticleResolutions[] = {
     {"half", "Half", "Половина"},
     {"quarter", "Quarter", "Четверть"},
 };
+constexpr Choice kReflectionQualities[] = { // (R12 refl; docs/R12_REFLECTIONS.md)
+    {"original", "Original", "Исходное"},
+    {"low", "Low (no screen-space reflections)", "Низкое (без экранных отражений)"},
+};
 constexpr Choice kUpscalers[] = {
     {"off", "Off (Render scale)", "Выключено (масштаб рендеринга)"},
     {"dlss", "NVIDIA DLSS", "NVIDIA DLSS"},
@@ -561,6 +565,21 @@ void Build(Registry& r) {
             c.pc.motion_blur_strength = static_cast<u32>(std::get<s64>(x));
         },
         .requires_on = "graphics.motionBlur",
+    });
+    // ------------------------------------------------------------------ Graphics: reflections (R12 refl)
+    v.push_back(Desc{
+        .id = "graphics.reflectionQuality", .table = "Graphics", .key = "reflectionQuality",
+        .category = Category::Graphics, .type = Type::Choice, .apply = Apply::Live, .choices = kReflectionQualities,
+        .en = "Reflection quality", .ru = "Качество отражений",
+        .help_en = "Original: as in the game. Low: without the game's screen-space reflections (what is on screen "
+                   "mirrored in wet roads, puddles, glass and water: buildings, signs, lamps and headlights). The "
+                   "lights themselves, their highlights on wet surfaces, the wetness and the sky's reflections stay. "
+                   "Applies at once.",
+        .help_ru = "«Исходное» — как в игре. «Низкое» — без экранных отражений игры (то, что видно на экране, "
+                   "в мокрой дороге, лужах, стёклах и воде: дома, вывески, фонари и фары). Сами источники света, "
+                   "их блики на мокром, мокрота и отражение неба остаются. Применяется сразу.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.reflection_quality; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.reflection_quality = std::get<std::string>(x); },
     });
     // (film grain: the pass and its parameter exist, but no place played so far sets it - not offered; depth of
     // field: see kMissing; R11_POSTFX.md)

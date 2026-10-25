@@ -17,6 +17,7 @@
 #include "core/emulator_settings.h"
 #include "engine/particles/smoke_quality.h"
 #include "engine/render/post_effects.h"
+#include "engine/render/reflections.h"
 #include "engine/render/render_resolution.h"
 #include "runtime/gpu/native_backend.h"
 #include "runtime/gpu/upscale/upscale_settings.h"
@@ -155,6 +156,8 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
                 Engine::Render::PostFx::SetMotionBlur(c.pc.motion_blur); // the game's post effects, either backend
             } else if (d->id == "graphics.motionBlurStrength") {
                 Engine::Render::PostFx::SetMotionBlurStrength(c.pc.motion_blur_strength);
+            } else if (d->id == "graphics.reflectionQuality") {
+                Engine::Render::Reflections::SetQuality(c.pc.reflection_quality); // at the game's next frame
             } else if (d->id == "graphics.renderScale" && !bridge_presenter) {
                 Engine::Render::SetRenderScale(Engine::Render::ParseRenderScale(c.pc.render_scale));
                 upscaling = true; // (the scene size switches at the game's next frame, as the upscalers')
