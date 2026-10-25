@@ -1269,6 +1269,18 @@ void Executor::Poll() {
     PollCollect(completed);
 }
 
+bool Executor::PollIfCompleted() {
+    if (Failed() || in_flight_.empty()) {
+        return false;
+    }
+    // (AQ: a lane batch may complete before the oldest - Poll decides; the caller's interval bounds the cost)
+    if (!aq_ && timeline_.QueryCompleted() < in_flight_.front().value) {
+        return false;
+    }
+    Poll();
+    return true;
+}
+
 void Executor::Retire(Batch& b) {
     {
         if (cp_ != nullptr && !defer_completions_ && !b.clock_fences.empty() && b.query_slot != ~0u) {

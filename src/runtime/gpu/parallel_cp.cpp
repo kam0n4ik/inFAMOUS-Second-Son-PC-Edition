@@ -1795,6 +1795,17 @@ void ParallelCp::Loop() {
         u64 extra = 0;
         if (!stop) {
             extra = Execute(r, h, t);
+            if (r11_poll_ticks_ != 0) {
+                // R11 SSPC_R11_FAST_LABEL: a completed batch's labels go to thread 1 now, not at the next round end or
+                // fence record (the executor keeps them: CP-9)
+                const u64 now = __rdtsc();
+                if (now - r11_last_poll_ >= r11_poll_ticks_) {
+                    r11_last_poll_ = now;
+                    if (exec_.PollIfCompleted()) {
+                        add(r11_polls_, 1);
+                    }
+                }
+            }
             if (lazy) {
                 exec_.ServeKeptBack();
             }

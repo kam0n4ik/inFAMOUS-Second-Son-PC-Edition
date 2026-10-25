@@ -217,6 +217,10 @@ public:
     /// CP-9 (SSPC_CP_NODRAIN_FENCE=1): thread 2 submits a held fence's batch right after the fence's record and polls
     /// (the label's work reaches the GPU without waiting for the round's end).
     void SetFlushAtFence(bool on) { flush_at_fence_ = on; }
+    /// R11 (SSPC_R11_FAST_LABEL=1, with CP-9 only - the executor keeps the completions for thread 1): thread 2 polls the
+    /// GPU between its records, at most every `ticks` TSC ticks, when the oldest batch in flight completed. Before Start.
+    void SetR11FastPoll(u64 ticks) { r11_poll_ticks_ = ticks; }
+    u64 R11Polls() const { return r11_polls_.load(std::memory_order_relaxed); }
     u64 WritesQueued() const { return writes_queued_; }
     u64 WriteFallbacks() const { return write_fallbacks_.load(std::memory_order_relaxed); }
     /// Thread 1: a write on the GPU's timeline may be pending over [addr, addr + bytes) - one queued and not executed
@@ -617,6 +621,9 @@ private:
     u64 zpass_fallback_count_ = 0; ///< thread 2: the counts a refused queued query's DB records get (only growing)
     u64 writes_queued_ = 0;
     bool flush_at_fence_ = false;
+    u64 r11_poll_ticks_ = 0;          ///< R11 SSPC_R11_FAST_LABEL (0: off)
+    u64 r11_last_poll_ = 0;           ///< (thread 2)
+    std::atomic<u64> r11_polls_{0};   ///< thread 2's polls between records that collected a completed batch
     std::atomic<u64> write_fallbacks_{0};
     void* copy_ctx_ = nullptr;
     // thread 1: timeline copies queued since the queue was last idle; the executor's pending timeline writes then
