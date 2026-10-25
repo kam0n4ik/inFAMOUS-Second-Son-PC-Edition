@@ -73,6 +73,7 @@
 #include "engine/job_system.h"
 #include "engine/particles/smoke_quality.h"
 #include "engine/render/post_effects.h"
+#include "engine/render/weather.h"
 #include "engine/render/frame_trace.h"
 #include "engine/render/draw_census.h"
 #include "engine/render/light_census.h"
@@ -898,6 +899,8 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // particleResolution (SSPC_SMOKE_QUALITY / SSPC_PARTICLE_RES).
     Engine::Particles::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.smoke_quality,
                                cfg.pc.particle_resolution);
+    // R12 weather (diagnostics, SSPC_R12_WEATHER only): the stand's reproducible weather states (docs/R12_WEATHER.md)
+    Engine::Render::Weather::InstallFromEnvironment(linker.GetModule(eboot_index)->Base(), cfg.logs_dir);
     // R11 post effects (both backends): the game's own unless [Graphics] motionBlur / motionBlurStrength (SSPC_POSTFX_*;
     // film grain and depth of field only SSPC_POSTFX_FILM_GRAIN / SSPC_POSTFX_DOF; docs/R11_POSTFX.md)
     Engine::Render::PostFx::Install(linker.GetModule(eboot_index)->Base(),

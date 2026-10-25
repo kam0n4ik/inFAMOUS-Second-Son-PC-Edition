@@ -41,6 +41,7 @@ add_library(sspc_runtime STATIC
     src/engine/render/native_state.cpp
     src/engine/render/pass_graph.cpp
     src/engine/render/post_effects.cpp
+    src/engine/render/weather.cpp
     src/engine/ui/game_menu.cpp
     src/engine/render/display_plan.cpp
     src/engine/render/render_resolution.cpp
