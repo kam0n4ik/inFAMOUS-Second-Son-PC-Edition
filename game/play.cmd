@@ -46,6 +46,9 @@ if defined SSPC_PLAY_EXPERIMENTAL (
     set SSPC_REA_DEFER_WAIT_B=1
     set SSPC_FB_ASYNC_COMPUTE=1
     set SSPC_R10_AQ_MAIN_FREE=1
+    rem R11: texture-sampling compute on the lane and order waits only across epochs (docs/R11_NEON.md)
+    set SSPC_R11_AQ_IMAGES=1
+    set SSPC_R11_AQ_ORDER_EPOCH=1
 )
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set STAMP=%%i
 if exist "%~dp0userdata\home" if defined STAMP xcopy /e /i /q /y "%~dp0userdata\home" "%~dp0userdata\savedata_backups\%STAMP%" >nul

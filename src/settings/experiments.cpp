@@ -153,6 +153,26 @@ constexpr Experiment kExperiments[] = {
      .help_ru = "Эксперимент (play_experimental.cmd), вместе с REA-3 и AQ. Графика ждёт только тот compute, от "
                 "которого зависит. Сохранение 31,6 → 37,6 FPS, бой 46,6 → 53,0 FPS и меньше провалов; в Neon Dash "
                 "1 % low ниже (16,3 против 18,9). 20-минутный прогон не проверен."},
+    {.env = "SSPC_R11_AQ_IMAGES", .group_en = kQueueEn, .group_ru = kQueueRu, .on = "1", .off = "0",
+     .requires_env = "SSPC_FB_ASYNC_COMPUTE", .en = "AQ: compute that samples textures (R11)",
+     .ru = "AQ: compute с текстурами в своей очереди (R11)",
+     .help_en = "Experiment (play_experimental.cmd). A dispatch that only samples textures already in place goes to "
+                "the compute queue instead of splitting the batch (Neon Dash splits 28285 -> about 8000). With "
+                "MAIN_FREE: save 31.7 -> 39.0 FPS, fight 45.8 -> 52.5 FPS; Neon Dash's 1 % low not better than "
+                "play.cmd. 27-minute run without errors.",
+     .help_ru = "Эксперимент (play_experimental.cmd). Dispatch, который только читает готовые текстуры, идёт в "
+                "очередь compute, а не разрезает батч (в Neon Dash разрезов 28285 → около 8000). Вместе с MAIN_FREE: "
+                "сохранение 31,7 → 39,0 FPS, бой 45,8 → 52,5 FPS; 1 % low в Neon Dash не лучше play.cmd. 27 минут "
+                "без ошибок."},
+    {.env = "SSPC_R11_AQ_ORDER_EPOCH", .group_en = kQueueEn, .group_ru = kQueueRu, .on = "1", .off = "0",
+     .requires_env = "SSPC_R10_AQ_MAIN_FREE", .en = "MAIN_FREE: order waits only across frames' epochs (R11)",
+     .ru = "MAIN_FREE: ожидание порядка только между эпохами (R11)",
+     .help_en = "Experiment (play_experimental.cmd). A graphics batch does not wait for the compute queue's batch of "
+                "the same guest epoch when it holds only that queue's dispatches (about 4500 waits a run fewer). "
+                "Measured together with the option above.",
+     .help_ru = "Эксперимент (play_experimental.cmd). Батч графики не ждёт батч очереди compute той же гостевой "
+                "эпохи, если в нём только dispatch этой очереди (около 4500 ожиданий за прогон меньше). Замерено "
+                "вместе с пунктом выше."},
     {.env = "SSPC_R11_FAST_LABEL", .group_en = kQueueEn, .group_ru = kQueueRu, .on = "1", .off = "0",
      .requires_env = "SSPC_CP_ROUND_NODRAIN", .en = "Completed compute seen sooner (R11)",
      .ru = "Готовый compute виден раньше (R11)",
