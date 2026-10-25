@@ -2744,10 +2744,17 @@ std::string Backend::Report() {
                                "served for other threads {} (on the recording thread itself {}); exact invalidations "
                                "of a hidden block {}, dropped (unmapped) {}; written back by a GPU reader of the host "
                                "import {}, the executor's CPU-side reads {}, the processor {}, a request {}\n",
-                               buffers_->Lazy() == 1 ? "on" : "verify", b.lazy_deferred, b.lazy_would_defer,
+                               buffers_->Lazy() == 1 ? "on" : buffers_->Lazy() == 3 ? "R12 light index list only"
+                                                                                   : "verify",
+                               b.lazy_deferred, b.lazy_would_defer,
                                b.lazy_flushes, b.lazy_flush_blocks, b.lazy_flush_runs, b.lazy_flush_plain, tracker_.HiddenFaults(),
                                es.lazy_served, es.lazy_inline, b.lazy_unsynced_inval, b.lazy_dropped,
                                b.lazy_flush_by[0], b.lazy_flush_by[1], b.lazy_flush_by[2], b.lazy_flush_by[3]);
+        }
+        if (buffers_->Lazy() == 3) {
+            out += fmt::format("R12 light index list kept in video memory: {} range(s) registered; heap-size host-import "
+                               "readings that left its blocks kept back {}\n",
+                               buffers_->GpuOnlyRanges(), buffers_->GpuOnlyHeapSkips());
         }
         out += fmt::format("uploads by bindings (P4.9): prepares that uploaded {}, pages brought along with their block's "
                            "first missing page {} (blocks not importable whole {})\n",

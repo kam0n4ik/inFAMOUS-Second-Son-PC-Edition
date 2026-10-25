@@ -130,6 +130,15 @@ constexpr Experiment kExperiments[] = {
      .help_ru = "Эксперимент, выключено. Новые compute-конвейеры начинают собираться, как только подготовлен их "
                 "dispatch. С пустым кэшем шейдеров (первое прохождение, новый драйвер) Neon Dash 12,9 → 26,1 FPS, "
                 "самый долгий фриз 5,5 → 2,5 с (один прогон); с прогретым кэшем ничего не меняет."},
+    {.env = "SSPC_R12_LIGHT_LIST_KEEP", .group_en = kPipeEn, .group_ru = kPipeRu, .on = "1", .off = "0",
+     .en = "Light index list stays in video memory (R12)", .ru = "Список источников света — только в видеопамяти (R12)",
+     .help_en = "Experiment, off. The per-tile light list the GPU builds every frame (6.25 MiB) is no longer copied "
+                "back to the CPU's memory: only the GPU reads it (0 CPU reads measured); a CPU access still gets it "
+                "written back first. The picture is the same. Measurements: docs/R12_LIGHTS.md.",
+     .help_ru = "Эксперимент, выключено. Список источников света по тайлам, который видеокарта строит каждый кадр "
+                "(6,25 МиБ), больше не копируется обратно в память процессора: его читает только видеокарта "
+                "(чтений процессором — 0); при обращении процессора он сначала записывается обратно. Картинка та же. "
+                "Замеры — docs/R12_LIGHTS.md."},
 
     // ---- GPU queues and frame pacing (play_experimental.cmd)
     {.env = "SSPC_REA_DEFER_WAIT_B", .group_en = kQueueEn, .group_ru = kQueueRu, .on = "1", .off = "0",

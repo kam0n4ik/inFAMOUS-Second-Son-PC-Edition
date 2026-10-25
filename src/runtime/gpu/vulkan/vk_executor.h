@@ -308,7 +308,7 @@ public:
     /// Lazy write-back stays off (no recording thread of its own to serve the tracker's faults).
     void DisableLazy() { buffers_.DisableLazy(); }
     bool KeptBack(u64 addr, u64 size) const { return buffers_.KeptBack(addr, size); }
-    bool Lazy() const { return buffers_.Lazy() == 1; }
+    bool Lazy() const { return buffers_.Lazy() == 1 || buffers_.Lazy() == 3; } // (3: R12's light index list only)
     bool OnRecordThread() const;
     /// The parallel processor's recording thread (its own fault on a hidden block is served in place).
     void SetRecordThread();

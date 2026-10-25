@@ -153,6 +153,14 @@ public:
     /// written back as before). 0 off.
     int Lazy() const { return lazy_; }
     void DisableLazy() { lazy_ = 0; }
+    /// R12 lights (SSPC_R12_LIGHT_LIST_KEEP=1, mode 3 of FB-7's kept-back write-back): only blocks wholly inside the
+    /// ranges registered here are kept back - the tiled lighting's per-tile light index list, written by one compute
+    /// shader and read by pixel shaders through their own V# (video memory), never by the CPU (SSPC_DIAG_READ_WATCH: 0
+    /// reads). Heap-size host-import readings (vertex fetch over the 2.5 GiB heap whose range covers the list) do not
+    /// write these blocks back (REA-2's assumption, here for this range only); every other reader does, as in FB-7.
+    void AddGpuOnlyRange(u64 addr, u64 size);
+    bool InGpuOnlyRange(u64 block) const;
+    size_t GpuOnlyRanges() const { return gpu_only_.size(); }
     /// Some block of [addr, addr + size) may be kept back (hidden: until its write-back completed). Any thread.
     bool KeptBack(u64 addr, u64 size) const;
     bool AnyDeferred() const { return deferred_count_ != 0; }
@@ -160,7 +168,9 @@ public:
     /// never kept back again (a CPU read). true: some. GPU thread.
     /// `why` (counted): 0 a GPU reader of the host import, 1 the executor's CPU-side reads and syncs, 2 the processor,
     /// 3 another thread's request (a CPU access).
-    bool FlushDeferred(u64 addr, u64 size, VkCommandBuffer cb, u64 seq, bool eager, u32 why);
+    /// `skip_gpu_only` (R12 mode 3): the blocks of the registered GPU-only ranges stay kept back (a heap reading).
+    bool FlushDeferred(u64 addr, u64 size, VkCommandBuffer cb, u64 seq, bool eager, u32 why, bool skip_gpu_only = false);
+    u64 GpuOnlyHeapSkips() const { return gpu_only_heap_skips_; }
     /// SSPC_DIAG_MEASURE=skip_wb only: the batch's written ranges forgotten (no write-back).
     void DropWriteBack() {
         written_.clear();
@@ -220,7 +230,9 @@ private:
         bool eager = false;    ///< FB-7: a CPU read wanted it: never kept back again
         u32 version = 0;       ///< CITY-OPT: bumped whenever pages stop being valid or the GPU writes it
     };
-    int lazy_ = 0; ///< FB-7: 0 off, 1 on, 2 verify
+    int lazy_ = 0; ///< FB-7: 0 off, 1 on, 2 verify, 3 R12: only the registered GPU-only ranges (AddGpuOnlyRange)
+    std::vector<std::pair<u64, u64>> gpu_only_; ///< R12 mode 3: [begin, end) of the light index lists
+    u64 gpu_only_heap_skips_ = 0;               ///< R12 mode 3: heap readings that left those blocks kept back
     u64 deferred_count_ = 0;
     std::set<u64> deferred_set_; ///< the kept-back blocks (FlushDeferred finds those of a range)
     std::vector<std::pair<u64, u64>> unhide_pending_; ///< (block address, submission): shown once it completed
@@ -247,7 +259,7 @@ private:
     void ApplyInvalidations();
     bool EnsureBound(u64 first_block, u64 last_block);
     bool Upload(u64 addr, u64 size, VkCommandBuffer cb, u64 seq);
-    void FlushWritten(u64 addr, u64 size, VkCommandBuffer cb, u64 seq);
+    void FlushWritten(u64 addr, u64 size, VkCommandBuffer cb, u64 seq, bool skip_gpu_only = false);
 
     DeviceContext& ctx_;
     GuestBuffers& guest_;
