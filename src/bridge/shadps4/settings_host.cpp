@@ -16,6 +16,7 @@
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "engine/particles/smoke_quality.h"
+#include "engine/render/post_effects.h"
 #include "engine/render/render_resolution.h"
 #include "runtime/gpu/native_backend.h"
 #include "runtime/gpu/upscale/upscale_settings.h"
@@ -145,6 +146,14 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
                 Engine::Particles::SetSmokeQuality(c.pc.smoke_quality); // the game's emitters, either backend
             } else if (d->id == "graphics.particleResolution") {
                 Engine::Particles::SetParticleResolution(c.pc.particle_resolution);
+            } else if (d->id == "graphics.motionBlur") {
+                Engine::Render::PostFx::SetMotionBlur(c.pc.motion_blur); // the game's post effects, either backend
+            } else if (d->id == "graphics.motionBlurStrength") {
+                Engine::Render::PostFx::SetMotionBlurStrength(c.pc.motion_blur_strength);
+            } else if (d->id == "graphics.filmGrain") {
+                Engine::Render::PostFx::SetFilmGrain(c.pc.film_grain);
+            } else if (d->id == "graphics.depthOfField") {
+                Engine::Render::PostFx::SetDepthOfField(c.pc.depth_of_field);
             } else if (d->id == "graphics.renderScale" && !bridge_presenter) {
                 Engine::Render::SetRenderScale(Engine::Render::ParseRenderScale(c.pc.render_scale));
                 upscaling = true; // (the scene size switches at the game's next frame, as the upscalers')

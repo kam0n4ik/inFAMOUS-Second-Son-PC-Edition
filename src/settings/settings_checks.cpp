@@ -859,7 +859,9 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
           contains(graphics, "graphics.renderScale") && !contains(graphics, "graphics.textures") &&
               !contains(graphics, "graphics.fsr") && !contains(graphics, "upscaling.output") &&
               !contains(graphics, "upscaling.frameGenMultiplier") && contains(graphics, "graphics.smokeQuality") &&
-              contains(graphics, "info.render"),
+              contains(graphics, "info.render") && contains(graphics, "graphics.motionBlur") &&
+              contains(graphics, "graphics.motionBlurStrength") && contains(graphics, "graphics.filmGrain") &&
+              contains(graphics, "graphics.depthOfField"),
           fmt::format("{} rows", graphics.size()));
 
     // only what this system runs: DLSS is offered greyed with the reason, DLSS frame generation not at all
@@ -997,12 +999,70 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
 
 } // namespace
 
+/// R11 postfx: the game's post effects (motion blur, its strength, film grain, depth of field) as settings.
+void PostFxChecks(const CheckFn& check, const fs::path& dir) {
+    const auto g = "Settings.postfx";
+    const auto defaults = TestConfig();
+    Service s;
+    const auto file = dir / "postfx.toml";
+    std::error_code ec;
+    fs::remove(file, ec);
+    s.Init(defaults, {}, defaults, file, Capability::Window | Capability::LiveVolume);
+    std::vector<std::string> applied;
+    s.AddApplier([&applied](const App::Config&, std::span<const Desc* const> changed) {
+        for (const auto* d : changed) {
+            applied.emplace_back(d->id);
+        }
+    });
+    const Desc* mb = Find("graphics.motionBlur");
+    const Desc* st = Find("graphics.motionBlurStrength");
+    const Desc* fg = Find("graphics.filmGrain");
+    const Desc* dof = Find("graphics.depthOfField");
+    check(g, "the four settings exist, live, in [Graphics], no longer unavailable",
+          mb && st && fg && dof && mb->apply == Apply::Live && st->apply == Apply::Live && fg->apply == Apply::Live &&
+              dof->apply == Apply::Live && mb->table == "Graphics" && st->key == "motionBlurStrength" &&
+              s.Available(*mb).available && s.Available(*dof).available,
+          "");
+    if (!(mb && st && fg && dof)) {
+        return;
+    }
+    check(g, "defaults: the game's own (motion blur on at 100 %, film grain on, depth of field on)",
+          std::get<bool>(s.Get(*mb)) && std::get<s64>(s.Get(*st)) == 100 && std::get<bool>(s.Get(*fg)) &&
+              std::get<bool>(s.Get(*dof)) && !s.IsOverridden(*mb),
+          "");
+    check(g, "motion blur off: applied live, the strength greyed (requires it)",
+          s.Set(*mb, Value{false}) == SetResult::Ok && !s.Current().pc.motion_blur && st->requires_on == mb->id &&
+              applied == std::vector<std::string>{"graphics.motionBlur"},
+          "");
+    check(g, "strength: 50 % taken, 5 % and 120 % refused",
+          s.Set(*st, Value{s64{50}}) == SetResult::Ok && s.Current().pc.motion_blur_strength == 50 &&
+              s.Set(*st, Value{s64{5}}) == SetResult::Invalid && s.Set(*st, Value{s64{120}}) == SetResult::Invalid,
+          "");
+    s.Set(*fg, Value{false});
+    s.Set(*dof, Value{false});
+    const bool flushed = s.Flush(5000);
+    Overrides on_disk;
+    const auto rep = LoadUserFile(file, on_disk);
+    auto restarted = defaults;
+    ApplyOverrides(restarted, on_disk);
+    check(g, "saved and restored at the next start",
+          flushed && rep.status == LoadReport::Status::Loaded && !restarted.pc.motion_blur &&
+              restarted.pc.motion_blur_strength == 50 && !restarted.pc.film_grain && !restarted.pc.depth_of_field,
+          fmt::format("{} keys", on_disk.size()));
+    s.ResetCategory(Category::Graphics);
+    check(g, "reset Graphics: back to the game's own",
+          s.Current().pc.motion_blur && s.Current().pc.motion_blur_strength == 100 && s.Current().pc.film_grain &&
+              s.Current().pc.depth_of_field && !s.IsOverridden(*mb) && !s.IsOverridden(*st),
+          "");
+}
+
 void RunChecks(const CheckFn& check, const std::filesystem::path& scratch) {
     std::error_code ec;
     std::filesystem::create_directories(scratch, ec);
     Registry(check);
     UserFile(check, scratch);
     ServiceChecks(check, scratch);
+    PostFxChecks(check, scratch);
     ConfigChecks(check, scratch);
     BindingChecks(check);
     KeyboardMouseChecks(check);

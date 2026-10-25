@@ -513,6 +513,48 @@ void Build(Registry& r) {
         .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.pc.fov); },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.fov = static_cast<u32>(std::get<s64>(x)); },
     });
+    // ------------------------------------------------------------------ Graphics: post effects (R11 postfx)
+    v.push_back(Desc{
+        .id = "graphics.motionBlur", .table = "Graphics", .key = "motionBlur", .category = Category::Graphics,
+        .type = Type::Bool, .apply = Apply::Live, .en = "Motion blur", .ru = "Размытие в движении",
+        .help_en = "The game's own blur of fast movement (the camera and objects). Off: a sharp picture; the motion "
+                   "data of the game's anti-aliasing and of DLSS / FSR does not change. Applies at once.",
+        .help_ru = "Собственное размытие игры при быстром движении (камеры и объектов). «Выкл.» — чёткая картинка; "
+                   "данные движения для сглаживания игры и для DLSS / FSR не меняются. Применяется сразу.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.motion_blur; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.motion_blur = std::get<bool>(x); },
+    });
+    v.push_back(Desc{
+        .id = "graphics.motionBlurStrength", .table = "Graphics", .key = "motionBlurStrength",
+        .category = Category::Graphics, .type = Type::Int, .apply = Apply::Live, .min = 10, .max = 100, .ui_min = 10,
+        .ui_max = 100, .step = 10, .unit = "%", .en = "Motion blur strength", .ru = "Сила размытия",
+        .help_en = "The length of the game's motion blur: 100 % is the game's own. Applies at once.",
+        .help_ru = "Длина размытия в движении: 100 % — как в игре. Применяется сразу.",
+        .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.pc.motion_blur_strength); },
+        .set = [](Config& c, const Desc&, const Value& x) {
+            c.pc.motion_blur_strength = static_cast<u32>(std::get<s64>(x));
+        },
+        .requires_on = "graphics.motionBlur",
+    });
+    v.push_back(Desc{
+        .id = "graphics.filmGrain", .table = "Graphics", .key = "filmGrain", .category = Category::Graphics,
+        .type = Type::Bool, .apply = Apply::Live, .en = "Film grain", .ru = "Зернистость",
+        .help_en = "The game's own film grain, which some places and scenes add. Off: none. Applies at once.",
+        .help_ru = "Собственная зернистость игры («плёнка»), которую добавляют некоторые места и сцены. «Выкл.» — без "
+                   "неё. Применяется сразу.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.film_grain; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.film_grain = std::get<bool>(x); },
+    });
+    v.push_back(Desc{
+        .id = "graphics.depthOfField", .table = "Graphics", .key = "depthOfField", .category = Category::Graphics,
+        .type = Type::Bool, .apply = Apply::Live, .en = "Depth of field", .ru = "Глубина резкости",
+        .help_en = "The game's own out-of-focus blur (bokeh) of near or far objects, mostly in cut-scenes. Off: "
+                   "everything in focus. Applies at once.",
+        .help_ru = "Собственное размытие игры вне фокуса (боке) у близких или дальних объектов, в основном в "
+                   "кат-сценах. «Выкл.» — всё в фокусе. Применяется сразу.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.depth_of_field; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.depth_of_field = std::get<bool>(x); },
+    });
     // ------------------------------------------------------------------ Upscaling & frame generation
     v.push_back(Desc{
         .id = "upscaling.upscaler", .table = "Graphics", .key = "upscaler", .category = Category::Upscaling,
@@ -644,12 +686,6 @@ void Build(Registry& r) {
         {"graphics.antiAliasing", "Anti-aliasing", "Сглаживание",
          "The game does its own anti-aliasing; a separate option needs backend work (P4.6+).",
          "Сглаживание выполняет сама игра; отдельная настройка требует работы в бэкенде (P4.6+).", 0},
-        {"graphics.motionBlur", "Motion blur", "Размытие в движении",
-         "The game has no such option; turning it off means changing the game's shaders (not researched).",
-         "В игре нет такого параметра; отключение — правка шейдеров игры (не исследовано).", 0},
-        {"graphics.depthOfField", "Depth of field", "Глубина резкости",
-         "The game has no such option; turning it off means changing the game's shaders (not researched).",
-         "В игре нет такого параметра; отключение — правка шейдеров игры (не исследовано).", 0},
     };
     for (const auto& m : kMissing) {
         v.push_back(Desc{.id = m.id, .category = Category::Graphics, .type = Type::Bool, .apply = Apply::Unavailable,

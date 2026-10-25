@@ -72,6 +72,7 @@
 #include "engine/mouse_camera.h"
 #include "engine/job_system.h"
 #include "engine/particles/smoke_quality.h"
+#include "engine/render/post_effects.h"
 #include "engine/render/frame_trace.h"
 #include "engine/render/draw_census.h"
 #include "engine/render/draw_runs.h"
@@ -892,6 +893,13 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // particleResolution (SSPC_SMOKE_QUALITY / SSPC_PARTICLE_RES).
     Engine::Particles::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.smoke_quality,
                                cfg.pc.particle_resolution);
+    // R11 post effects (both backends): the game's own unless [Graphics] motionBlur / motionBlurStrength / filmGrain /
+    // depthOfField (SSPC_POSTFX_*; docs/R11_POSTFX.md)
+    Engine::Render::PostFx::Install(linker.GetModule(eboot_index)->Base(),
+                                    {.motion_blur = cfg.pc.motion_blur,
+                                     .motion_blur_strength = cfg.pc.motion_blur_strength,
+                                     .film_grain = cfg.pc.film_grain,
+                                     .depth_of_field = cfg.pc.depth_of_field});
     // Upscaling (docs/UPSCALING_FRAME_GENERATION.md): with DLSS / FSR the game's scene renders at the quality's render
     // size (the engine's own render size, written before it starts); the display and the UI keep the plan's size.
     {

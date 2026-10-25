@@ -475,6 +475,11 @@ void SettingsMenu::RebuildRows() {
         AddHeader("Fire and smoke", "Огонь и дым");
         setting("graphics.smokeQuality");
         setting("graphics.particleResolution");
+        AddHeader("Effects", "Эффекты"); // (R11 postfx: the game's own post-processing)
+        setting("graphics.motionBlur");
+        setting("graphics.motionBlurStrength");
+        setting("graphics.filmGrain");
+        setting("graphics.depthOfField");
         const size_t before = rows_.size();
         AddHeader("The bridge's frame (shadPS4)", "Кадр моста (shadPS4)");
         setting("graphics.fsr");
