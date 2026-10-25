@@ -453,6 +453,12 @@ public:
             presenter_->SetFrameGen(on);
         }
     }
+    bool SetPresentMode(const std::string& present_mode) {
+        if (presenter_) {
+            presenter_->SetPresentMode(present_mode);
+        }
+        return presenter_ != nullptr;
+    }
 
 private:
     std::unique_ptr<GS::ShaderFrontend> frontend_;
@@ -2821,6 +2827,29 @@ void SetFrameGen(bool on) {
 
 void SetFpsCounter(bool on) {
     Vk::SetFpsCounterShown(on);
+}
+
+bool SetPresentMode(const std::string& present_mode) {
+    return g_backend != nullptr && g_backend->SetPresentMode(present_mode);
+}
+
+PresentModes GetPresentModes() {
+    const Vk::PresentModeInfo i = Vk::GetPresentModeInfo();
+    PresentModes out;
+    out.known = i.known;
+    if (i.known) {
+        for (const VkPresentModeKHR m : {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR,
+                                         VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR}) {
+            if ((i.supported & (1u << static_cast<u32>(m))) != 0) {
+                out.supported += fmt::format("{}{}", out.supported.empty() ? "" : ", ", Vk::PresentModeName(m));
+            }
+        }
+        out.current = Vk::PresentModeName(i.current);
+        out.wanted = Vk::PresentModeName(i.wanted);
+        out.immediate = (i.supported & (1u << VK_PRESENT_MODE_IMMEDIATE_KHR)) != 0;
+        out.mailbox = (i.supported & (1u << VK_PRESENT_MODE_MAILBOX_KHR)) != 0;
+    }
+    return out;
 }
 
 bool SetFrameLimit(const std::string& limit) {

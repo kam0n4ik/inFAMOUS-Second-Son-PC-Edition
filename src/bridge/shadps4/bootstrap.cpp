@@ -813,7 +813,8 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
         {
             // the settings menu: what the upscaling rows can do with this GPU (known now the device exists)
             namespace Cap = Settings::Capability;
-            u32 caps = Settings::Instance().Capabilities() | Cap::RenderScale | Cap::FrameLimiter | Cap::FpsCounter;
+            u32 caps = Settings::Instance().Capabilities() | Cap::RenderScale | Cap::FrameLimiter | Cap::FpsCounter |
+                       Cap::PresentModeSwitch; // (R11: the vertical sync switches while running)
             if (Gpu::Upscale::GetStatus().dlss_available) {
                 caps |= Cap::Dlss;
             }

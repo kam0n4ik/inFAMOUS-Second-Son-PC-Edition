@@ -4,12 +4,14 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <vector>
 
 #include <fmt/format.h>
 
 #include "app/config.h"
+#include "engine/render/display_plan.h"
 #include "input/binding_rules.h"
 #include "runtime/language.h"
 #include "settings/experiments.h"
@@ -26,14 +28,17 @@ constexpr Choice kFullscreenModes[] = {
     {"borderless", "Borderless", "Без рамки"},
     {"exclusive", "Exclusive", "Эксклюзивный"},
 };
+// [Display] presentMode (the stored values stay those of SecondSonPC.toml: "fifo" | "immediate" | "mailbox")
 constexpr Choice kPresentModes[] = {
-    {"fifo", "On (FIFO)", "Вкл. (FIFO)"},
-    {"mailbox", "Fast (Mailbox)", "Быстрая (Mailbox)"},
-    {"immediate", "Off (Immediate)", "Выкл. (Immediate)"},
+    {"fifo", "On", "Вкл."},
+    {"immediate", "Off", "Выкл."},
+    {"mailbox", "Off, without tearing (Mailbox)", "Выкл., без разрывов (Mailbox)"},
 };
 constexpr Choice kFrameRateLimits[] = {
     {"console", "60 (PS4 vblank)", "60 (кадр по vblank PS4)"},
     {"30", "30", "30"},
+    {"40", "40", "40"},
+    {"50", "50", "50"},
     {"60", "60", "60"},
     {"90", "90", "90"},
     {"120", "120", "120"},
@@ -148,6 +153,20 @@ constexpr Choice kFrameGenMultipliers[] = {
     {"4", "x4 (DLSS, RTX 50)", "×4 (DLSS, RTX 50)"},
 };
 
+/// [Display] frameRateLimit beyond the list: any whole number of frames per second the limiter takes
+/// (VideoOut::ParsePacing: 20..1000).
+bool AcceptsFrameRate(std::string_view s) {
+    u32 n = 0;
+    const auto r = std::from_chars(s.data(), s.data() + s.size(), n);
+    return !s.empty() && r.ec == std::errc{} && r.ptr == s.data() + s.size() && n >= 20 && n <= 1000;
+}
+
+/// [Display] resolution beyond the list: any "WxH" the display plan takes (a display's own size, 1366x768).
+bool AcceptsResolution(std::string_view s) {
+    Engine::Render::Size size;
+    return Engine::Render::ParseSize(s, size);
+}
+
 // ---- labels of the keyboard/mouse actions (index = Input::Action)
 
 struct ActionText {
@@ -254,23 +273,24 @@ void Build(Registry& r) {
         .help_ru = "Окно на весь экран. F11 переключает режим во время игры.",
         .get = [](const Config& c, const Desc&) -> Value { return c.fullscreen; },
         .set = [](Config& c, const Desc&, const Value& x) { c.fullscreen = std::get<bool>(x); },
-        .legacy_parse = true,
+        .legacy_parse = true, .own_row = false, // (R11: the menu's "Window mode" row, with fullscreenMode)
     });
     v.push_back(Desc{
         .id = "display.fullscreenMode", .table = "Display", .key = "fullscreenMode", .category = Category::Display,
         .type = Type::Choice, .apply = Apply::Live, .needs = Capability::Window, .choices = kFullscreenModes,
         .en = "Full screen type", .ru = "Тип полноэкранного режима",
-        .help_en = "Borderless: a window over the desktop, quick Alt+Tab. Exclusive: the display is given to the game "
-                   "at its current resolution.",
-        .help_ru = "«Без рамки» — окно поверх рабочего стола, быстрый Alt+Tab. «Эксклюзивный» — дисплей отдаётся "
-                   "игре в его текущем разрешении.",
+        .help_en = "Borderless: a window over the desktop, quick Alt+Tab. Exclusive (SecondSonPC.toml only): SDL's full "
+                   "screen at the desktop's display mode - no Vulkan exclusive mode; it minimizes on Alt+Tab.",
+        .help_ru = "«Без рамки» — окно поверх рабочего стола, быстрый Alt+Tab. «Эксклюзивный» (только из "
+                   "SecondSonPC.toml) — полноэкранный режим SDL в режиме рабочего стола, без эксклюзивного режима "
+                   "Vulkan; при Alt+Tab окно сворачивается.",
         .get = [](const Config& c, const Desc&) -> Value {
             return std::string(c.exclusive_fullscreen ? "exclusive" : "borderless");
         },
         .set = [](Config& c, const Desc&, const Value& x) {
             c.exclusive_fullscreen = std::get<std::string>(x) == "exclusive";
         },
-        .legacy_parse = true, .requires_on = "display.fullscreen",
+        .legacy_parse = true, .requires_on = "display.fullscreen", .own_row = false, // (the "Window mode" row)
     });
     v.push_back(Desc{
         .id = "display.width", .table = "Display", .key = "width", .category = Category::Display, .type = Type::Int,
@@ -296,22 +316,28 @@ void Build(Registry& r) {
         .id = "display.monitor", .table = "Display", .key = "monitor", .category = Category::Display,
         .type = Type::Text, .apply = Apply::Live, .needs = Capability::Window, .en = "Display",
         .ru = "Монитор",
-        .help_en = "The display the game window opens on. Empty: the primary display.",
-        .help_ru = "Монитор, на котором открывается окно игры. Пусто — основной монитор.",
+        .help_en = "The display the game window is on (the list: the system's displays, their desktop size and refresh "
+                   "rate). Applies at once; the full screen covers that display.",
+        .help_ru = "Монитор, на котором находится окно игры (в списке — мониторы системы, их разрешение рабочего стола и "
+                   "частота). Применяется сразу; полноэкранный режим занимает этот монитор.",
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.monitor; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.monitor = std::get<std::string>(x); },
     });
     v.push_back(Desc{
         .id = "display.presentMode", .table = "Display", .key = "presentMode", .category = Category::Display,
-        .type = Type::Choice, .apply = Apply::Restart, .needs = Capability::Window,
+        .type = Type::Choice, .apply = Apply::Live, .needs = Capability::Window,
         .choices = kPresentModes, .en = "Vertical sync", .ru = "Вертикальная синхронизация",
-        .help_en = "How frames are shown (Vulkan present mode). FIFO: classic sync, no tearing. Mailbox: no tearing, "
-                   "lower latency. Immediate: no sync, tearing possible. Takes effect after a restart: changing it "
-                   "while playing means recreating the swapchain inside the graphics backend.",
-        .help_ru = "Способ показа кадров (Vulkan present mode). FIFO — классическая синхронизация без разрывов; "
-                   "Mailbox — без разрывов и с меньшей задержкой; Immediate — без синхронизации, возможны разрывы. "
-                   "Вступает в силу после перезапуска: смена на лету требует пересоздания swapchain в графическом "
-                   "бэкенде.",
+        .help_en = "On: a frame waits for the display's refresh (Vulkan FIFO) - no tearing, at most the refresh rate. "
+                   "Off: shown at once (IMMEDIATE) - tearing possible, no limit; where the display does not offer it, "
+                   "Mailbox is used. Off, without tearing: the newest frame at the next refresh (MAILBOX), the frame "
+                   "rate not limited by the display. The Frame rate limit applies in every mode. SecondSonPC's own "
+                   "backend applies it at once (the swapchain is recreated); the shadPS4 bridge after a restart.",
+        .help_ru = "«Вкл.» — кадр ждёт обновления монитора (Vulkan FIFO): без разрывов, не выше частоты монитора. "
+                   "«Выкл.» — кадр показывается сразу (IMMEDIATE): возможны разрывы, без ограничения; если монитор "
+                   "этого не поддерживает, используется Mailbox. «Выкл., без разрывов» — новейший кадр на ближайшем "
+                   "обновлении (MAILBOX), частота кадров монитором не ограничивается. «Ограничение FPS» действует в "
+                   "любом режиме. Собственный бэкенд SecondSonPC применяет сразу (swapchain пересоздаётся), мост "
+                   "shadPS4 — после перезапуска.",
         .get = [](const Config& c, const Desc&) -> Value {
             return std::string(c.present_mode == "Fifo" ? "fifo" : c.present_mode == "Immediate" ? "immediate"
                                                                                                     : "mailbox");
@@ -320,7 +346,7 @@ void Build(Registry& r) {
             const auto& s = std::get<std::string>(x);
             c.present_mode = s == "fifo" ? "Fifo" : s == "immediate" ? "Immediate" : "Mailbox";
         },
-        .legacy_parse = true,
+        .legacy_parse = true, .live_needs = Capability::PresentModeSwitch, // (the bridge: from the next start)
     });
     v.push_back(Desc{
         .id = "display.showFps", .table = "Display", .key = "showFps", .category = Category::Display,
@@ -340,17 +366,20 @@ void Build(Registry& r) {
         .type = Type::Choice, .apply = Apply::Live, .needs = Capability::FrameLimiter, .choices = kFrameRateLimits,
         .en = "Frame rate limit", .ru = "Ограничение FPS",
         .help_en = "60 (PS4 vblank): as the console - a frame is shown only at a 60 Hz vblank, so a frame that takes "
-                   "17 ms waits until 33 ms. A number or Unlimited: a frame is shown as soon as it is ready (the game's "
-                   "clock is real time: the world does not run faster). Above the display's refresh rate only with "
-                   "Vertical sync Mailbox or Off. The game's own 30 fps lock (Options - Game) still applies.",
+                   "17 ms waits until 33 ms. A number or Unlimited: a frame is shown as soon as it is ready, at most "
+                   "that many a second (the game's clock is real time: the world does not run faster). Works with "
+                   "Vertical sync on or off; with it on, the display's refresh rate limits too. The game's own 30 fps "
+                   "lock (Options - Game) still applies. Applies at once.",
         .help_ru = "60 (кадр по vblank PS4) — как на консоли: кадр показывается только на vblank 60 Гц, поэтому кадр "
-                   "за 17 мс ждёт до 33 мс. Число или «Без ограничения» — кадр показывается сразу, как готов (часы "
-                   "игры — реальное время: мир не ускоряется). Выше частоты монитора — только с вертикальной "
-                   "синхронизацией Mailbox или «Выкл.». Ограничение 30 к/с самой игры (Параметры → Игра) действует.",
+                   "за 17 мс ждёт до 33 мс. Число или «Без ограничения» — кадр показывается сразу, как готов, не чаще "
+                   "заданного числа в секунду (часы игры — реальное время: мир не ускоряется). Работает при любой "
+                   "вертикальной синхронизации; при включённой частота монитора ограничивает дополнительно. "
+                   "Ограничение 30 к/с самой игры (Параметры → Игра) действует. Применяется сразу.",
         .why_en = "Needs SecondSonPC's own GPU backend (--gpu-backend sspc).",
         .why_ru = "Нужен собственный графический бэкенд SecondSonPC (--gpu-backend sspc).",
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.frame_rate_limit; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.frame_rate_limit = std::get<std::string>(x); },
+        .accepts = &AcceptsFrameRate, // (a number from SecondSonPC.toml / the user file: "75")
     });
 
     v.push_back(Desc{
@@ -371,6 +400,7 @@ void Build(Registry& r) {
         .why_ru = "Нужен собственный графический бэкенд SecondSonPC (--gpu-backend sspc); мост рендерит 1920×1080.",
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.resolution; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.resolution = std::get<std::string>(x); },
+        .accepts = &AcceptsResolution, // (the display's own size; any "WxH" from the files)
     });
     v.push_back(Desc{
         .id = "display.aspectRatio", .table = "Display", .key = "aspectRatio", .category = Category::Display,
@@ -1095,12 +1125,16 @@ bool Validate(const Desc& desc, const Value& value, std::string& error) {
             return false;
         }
         const auto& s = std::get<std::string>(value);
-        if (std::ranges::none_of(desc.choices, [&](const Choice& c) { return c.value == s; })) {
+        if (std::ranges::none_of(desc.choices, [&](const Choice& c) { return c.value == s; }) &&
+            (desc.accepts == nullptr || !desc.accepts(s))) {
             std::string list;
             for (const auto& c : desc.choices) {
                 list += fmt::format("{}\"{}\"", list.empty() ? "" : ", ", c.value);
             }
-            error = fmt::format("one of {} expected", list);
+            error = fmt::format("one of {} expected{}", list,
+                                desc.id == "display.frameRateLimit" ? " (or a number 20..1000)"
+                                : desc.id == "display.resolution"   ? " (or \"WxH\")"
+                                                                    : "");
             return false;
         }
         return true;

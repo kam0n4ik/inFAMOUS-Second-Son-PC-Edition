@@ -51,8 +51,15 @@ struct MenuEnv {
     std::string device_label;               // the active input device
     std::string backend_label;              // the GPU backend of this run
     std::vector<std::string> displays;      // display names
+    std::vector<std::string> display_labels; // R11: the same displays as the list shows them (size, refresh rate)
+    std::string primary_label;               // R11: the primary display's label ("" unknown)
+    std::pair<u32, u32> display_size{};      // R11: the desktop size of the window's display ({0, 0} unknown)
     std::vector<std::string> audio_devices; // playback device names
     std::vector<std::pair<u32, u32>> window_sizes;
+    // R11: the native presenter's present modes (the vertical sync row): known once its swapchain exists
+    bool present_known = false;
+    bool present_immediate = true, present_mailbox = true; // the surface offers IMMEDIATE / MAILBOX
+    std::string present_supported, present_now;              // "FIFO, IMMEDIATE, ...", the swapchain's mode
     std::string save_note; // changes are not saved / the last save failed
     std::string settings_file; // where changes are saved ("" : not saved in this run)
     // P4.14: the shader cache's statistics (empty: no native backend's cache in this run)
@@ -102,7 +109,7 @@ public:
     void SelectCategory(Settings::Category category) {
         SelectPage(PageOf(category));
     }
-    /// The focused row: a setting id, or "window.size", "reset.page", "info.*", "cmd.*".
+    /// The focused row: a setting id, or "window.mode", "window.size", "reset.page", "info.*", "cmd.*".
     std::string FocusedId() const;
     int FocusedSlot() const {
         return slot_;
@@ -133,10 +140,13 @@ public:
         std::string why;
     };
     std::vector<Option> Options(const Settings::Desc& desc) const;
+    /// R11: the "Window mode" row's choices ("window", "borderless"; "exclusive" only while the file sets it).
+    std::vector<Option> WindowModeOptions() const;
 
 private:
     struct Row {
-        enum class Kind : u8 { Header, Setting, WindowSize, Info, ResetPage, Command };
+        // WindowMode (R11): [Display] fullscreen + fullscreenMode as one choice
+        enum class Kind : u8 { Header, Setting, WindowSize, WindowMode, Info, ResetPage, Command };
         Kind kind = Kind::Setting;
         const Settings::Desc* desc = nullptr;
         std::string_view en, ru; // Header/Info/Command label
@@ -172,6 +182,9 @@ private:
     void SetValue(const Settings::Desc& desc, const Settings::Value& value);
     void SetWindowSize(u32 w, u32 h);
     void StepWindowSize(int dir);
+    std::string WindowModeNow() const;
+    void SetWindowMode(std::string_view mode);
+    void StepWindowMode(int dir);
     std::vector<std::pair<u32, u32>> WindowSizes() const;
     std::vector<std::string> TextOptions(const Settings::Desc& desc) const;
     std::vector<Option> RowOptions(size_t row) const;

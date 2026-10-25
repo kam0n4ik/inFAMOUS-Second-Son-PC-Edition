@@ -94,6 +94,17 @@ void SetFrameGen(bool on);
 void SetFpsCounter(bool on);
 /// FrameBreak FB-2: [Display] frameRateLimit while the game runs (VideoOut::ParsePacing; the spin kept). false: unknown.
 bool SetFrameLimit(const std::string& limit);
+/// R11 display: [Display] presentMode while the game runs ("Fifo" | "Immediate" | "Mailbox"); the presenter recreates
+/// its swapchain before its next present. false: no presenter.
+bool SetPresentMode(const std::string& present_mode);
+/// R11 display: the presenter's surface modes and the swapchain's (the settings menu; any thread).
+struct PresentModes {
+    bool known = false;    ///< a swapchain was made
+    std::string supported; ///< "FIFO, IMMEDIATE, MAILBOX, FIFO_RELAXED"
+    std::string current, wanted;
+    bool immediate = false, mailbox = false;
+};
+PresentModes GetPresentModes();
 /// A summary of what the backend did (also written to <logs>\gpu_native.txt at Stop).
 std::string Report();
 

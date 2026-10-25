@@ -28,6 +28,18 @@ class Timeline;
 /// thread, read by the present thread at its next present). SSPC_FPS_OVERLAY=0 still hides it.
 void SetFpsCounterShown(bool shown);
 
+/// R11 display: the present modes of the presenter's surface and the one its swapchain uses (any thread; the settings
+/// menu). Bits: 1 << VkPresentModeKHR for IMMEDIATE (0) .. FIFO_RELAXED (3); `known` once a swapchain was made.
+struct PresentModeInfo {
+    bool known = false;
+    u32 supported = 0;
+    VkPresentModeKHR current = VK_PRESENT_MODE_FIFO_KHR; ///< the swapchain's
+    VkPresentModeKHR wanted = VK_PRESENT_MODE_FIFO_KHR;  ///< [Display] presentMode as asked
+};
+PresentModeInfo GetPresentModeInfo();
+/// "IMMEDIATE", "MAILBOX", "FIFO", "FIFO_RELAXED"
+const char* PresentModeName(VkPresentModeKHR mode);
+
 class Presenter {
 public:
     /// `sdl_window`: the game's SDL_Window; `present_mode` the wanted one ("Mailbox" | "Fifo" | "Immediate", [Display]
@@ -69,6 +81,10 @@ public:
     /// FSR frame generation on or off while the game runs (the settings menu): the present thread replaces the
     /// swapchain before its next present.
     void SetFrameGen(bool on);
+    /// R11 display: [Display] presentMode while the game runs ("Fifo" | "Immediate" | "Mailbox"; the vertical sync of
+    /// the settings menu). The present thread recreates the swapchain before its next present (the same retirement
+    /// path as a resize; frame generation's swapchain is replaced by its own). Any thread.
+    void SetPresentMode(const std::string& present_mode);
 
     /// Present thread: shows `frame` (or black for -1). The frame is free again once the presentation's commands
     /// completed.

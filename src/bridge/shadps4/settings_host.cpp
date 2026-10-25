@@ -19,6 +19,7 @@
 #include "engine/render/render_resolution.h"
 #include "runtime/gpu/native_backend.h"
 #include "runtime/gpu/upscale/upscale_settings.h"
+#include "settings/registry.h"
 #include "settings/settings_service.h"
 #include "ui/menu_controller.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -141,6 +142,10 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
                 Gpu::Native::SetFpsCounter(c.show_fps); // the native presenter's counter, at its next present
             } else if (d->id == "display.frameRateLimit" && !bridge_presenter) {
                 Gpu::Native::SetFrameLimit(c.pc.frame_rate_limit); // the present thread's pacing, at once
+            } else if (d->id == "display.presentMode" && !bridge_presenter) {
+                // R11: the vertical sync - the presenter recreates its swapchain before its next present (the
+                // bridge's presenter has no such switch: Restart there, Desc::live_needs)
+                Gpu::Native::SetPresentMode(c.present_mode);
             } else if (d->id == "graphics.smokeQuality") {
                 Engine::Particles::SetSmokeQuality(c.pc.smoke_quality); // the game's emitters, either backend
             } else if (d->id == "graphics.particleResolution") {
@@ -185,6 +190,43 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
             }
         }
     });
+    // R11 display (diagnostic): SSPC_DIAG_DISPLAY_SWITCH=seconds:vsync=fifo|immediate|mailbox[;seconds:limit=60;...] -
+    // what the settings menu does with the vertical sync / the frame rate limit, at those seconds after the start (the
+    // precompiler's wait added), through the settings service and its appliers (automated runs, type B measurements)
+    char ds[512] = {};
+    if (native_gpu && GetEnvironmentVariableA("SSPC_DIAG_DISPLAY_SWITCH", ds, sizeof(ds)) > 0) {
+        SSPC_LOG(Loader, Warning, "DIAGNOSTIC: SSPC_DIAG_DISPLAY_SWITCH='{}'", ds);
+        std::thread([plan = std::string(ds)] {
+            const auto t0 = std::chrono::steady_clock::now();
+            size_t at = 0;
+            while (at < plan.size()) {
+                const size_t end = std::min(plan.find(';', at), plan.size());
+                const std::string step = plan.substr(at, end - at);
+                at = end + 1;
+                unsigned sec = 0;
+                char key[16] = {}, value[32] = {};
+                if (std::sscanf(step.c_str(), "%u:%15[^=]=%31s", &sec, key, value) != 3) {
+                    continue;
+                }
+                const std::string_view k(key);
+                const Settings::Desc* d = Settings::Find(k == "vsync" ? "display.presentMode"
+                                                         : k == "limit" ? "display.frameRateLimit"
+                                                                        : "");
+                if (d == nullptr) {
+                    continue;
+                }
+                std::this_thread::sleep_until(t0 + std::chrono::seconds(sec) +
+                                              std::chrono::nanoseconds(Gpu::Native::StartupPauseNs()));
+                std::string error;
+                const auto r = Settings::Instance().Set(*d, Settings::Value{std::string(value)}, &error);
+                SSPC_LOG(Loader, Warning, "DIAGNOSTIC: display switch at {} s: {} = {}: {}{}", sec, d->id, value,
+                         r == Settings::SetResult::Ok          ? "applied"
+                         : r == Settings::SetResult::Unchanged ? "unchanged"
+                                                               : "refused",
+                         error.empty() ? "" : " (" + error + ")");
+            }
+        }).detach();
+    }
     Ui::Menu().Install({.window = window,
                         .test_mode = test_mode,
                         .capabilities = caps,
