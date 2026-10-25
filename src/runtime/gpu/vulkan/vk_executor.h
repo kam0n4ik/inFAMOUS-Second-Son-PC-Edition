@@ -506,6 +506,12 @@ private:
         bool done = false;                          ///< completed on the GPU (AQ: possibly before earlier batches)
         std::bitset<Cp::kNumQueues> aq_unreported;  ///< done, CompleteWork not called yet (an earlier batch of that
                                                     ///< queue not complete)
+        // R11 neon (SSPC_R11_DIAG_AQ=1): the GDS users recorded in it (R11AqDiag keys), why aq_overflow (1 too many
+        // ranges, 2 an access of unknown extent), each guest queue's epoch at its last command
+        std::vector<u64> r11_gds;
+        u8 r11_ovf = 0;
+        std::vector<std::pair<u32, u32>> r11_epoch;
+        u32 r11_nondisp = 0; ///< (SSPC_R11_AQ_ORDER_EPOCH) guest queues with a command other than a dispatch in it
     };
     struct RenderKey {
         std::array<VkImageView, 8> color{};
@@ -1302,6 +1308,70 @@ private:
     void AqNote(u64 addr, u64 size);
     /// A lane batch `lane` must wait for the main batch `main`.
     static bool AqConflict(const Batch& main, const Batch& lane);
+    // ---- R11 neon (docs/R11_NEON.md; vk_executor_r11.cpp) ----
+    /// SSPC_R11_DIAG_AQ=1 (diagnostic): per compute program where its dispatches were recorded (lane / main and why),
+    /// what they bind (GDS, LDS, images), the splits they caused; why lane batches waited for main batches (with the
+    /// GDS users of both) and main batches for lane ones (a queue's order with or without a guest sync between).
+    /// GDS keys: a dispatch's cs address, a draw's vs | 1 << 63, a GDS DMA 1 << 62 | queue << 48 | kind << 32 | offset.
+    struct R11AqDiag {
+        struct Prog {
+            u64 n = 0, gds = 0, lds = 0, unknown = 0, images = 0, storage = 0, indirect = 0;
+            std::array<u64, 7> place{}; ///< 0 lane; main: 1 images, 2 graphics batch + waiting, 3 graphics batch,
+                                        ///< 4 compute-only, 5 compute-only + waiting, 6 kept (aq_main)
+            u64 split_lane = 0, split_main = 0; ///< splits its dispatches caused (to the lane / to the main queue)
+            u32 queue_mask = 0;                 ///< guest queues 0..31 it ran on
+        };
+        std::unordered_map<u64, Prog> progs;
+        std::unordered_map<u64, u64> gds_dma; ///< GDS DMA key -> count
+        u64 draw_splits = 0;
+        /// lane batches waiting for main: 0 a held fence's wait, 1 own wait-all, 2 own images, 3 own overflow, 4 a main
+        /// batch's overflow (ranges), 5 (unknown access), 6 GDS both, 7 a range conflict only, 8 free
+        std::array<u64, 9> lane_why{};
+        std::unordered_map<u64, u64> gds_pairs; ///< (lane user * 31 ^ main user) -> count, users kept in gds_pair_users
+        std::unordered_map<u64, std::pair<u64, u64>> gds_pair_users;
+        /// main batches (MAIN_FREE) waiting for lane: per queue-order wait, the lane batch's epoch of the queue equal to
+        /// the main batch's first (no guest sync between: [0]) or not ([1]); sync waits met by an unknown fence [2]
+        std::array<u64, 3> order{};
+        u64 unknown_fence_waits = 0;
+        u64 overflow_batches[2] = {}; ///< main batches with aq_overflow: ranges, unknown access
+    };
+    std::unique_ptr<R11AqDiag> r11_diag_;
+    /// SSPC_R11_AQ_IMAGES=1 (AQ on the compute family): a compute queue's dispatch whose images are all textures it only
+    /// samples - clean uploaded ones or ones the GPU wrote with nothing newer in memory, already in the layout its
+    /// transition takes them to with no write since their barrier, so that binding them records nothing - may run on the
+    /// lane (it stayed on the main queue for them before). The lane batch waits for the main batch of their last barrier
+    /// (the writes before it); a main batch recording a barrier over an image a lane batch in flight sampled waits for
+    /// that lane batch (ImageCache::TakeLaneWait). A barrier recorded on the lane while binding them (an invalidation
+    /// applied meanwhile, a new image) falls back to the lane's images rule.
+    bool r11_aq_images_ = false;
+    /// SSPC_R11_AQ_ORDER_EPOCH=1 (with SSPC_R10_AQ_MAIN_FREE): a main batch skips the order wait for a guest queue's
+    /// latest lane batch when only dispatches of that queue are in it and no guest synchronization point of the queue
+    /// (guest_epoch_: a met wait, a fence, an event / ACQUIRE_MEM) lies between that lane batch's last command of the
+    /// queue and its own last one - unordered on the PS4 too (P4.6); their memory is the conflict check's. It still
+    /// waits for the queue's newest lane batch of an earlier epoch (r11_q_prev_).
+    bool r11_order_epoch_ = false;
+    bool r11_note_dispatch_ = false; ///< the Note being made is a dispatch's
+    std::array<u32, Cp::kNumQueues> r11_q_epoch_{}; ///< the guest epoch at r10_q_lane_'s last command of the queue
+    std::array<u64, Cp::kNumQueues> r11_q_prev_{};  ///< the queue's newest lane batch of an epoch before r11_q_epoch_
+    u64 r11_order_skipped_ = 0, r11_order_kept_ = 0;
+    /// pre-check passed, refused; main batches that waited for such a lane batch; lane dispatches with images; fallbacks
+    std::array<u64, 5> r11_img_stats_{};
+    std::array<u64, 6> r11_img_why_{}; ///< refusals: binding kind, no memo, memo stale, image state, layout/access, barrier
+    u32 r11_img_logged_ = 0;
+    /// The pre-check (before the boundary): true when every image of `cs` qualifies; `wait_main`: the main batch the
+    /// lane batch must wait for (their last barriers').
+    bool R11LaneImagesOk(const GS::StageView& cs, u64& wait_main);
+    void R11DiagInit();
+    void R11DiagDispatch(const GS::StageView& cs, u32 queue, bool indirect, bool main_only, u64 splits_before);
+    void R11DiagGds(u64 key);
+    void R11DiagLane(u64 main_done);
+    void R11DiagMain(u64 lane_done);
+
+public:
+    /// SSPC_R11_DIAG_AQ=1: the report for gpu_native.txt (empty when off).
+    std::string R11DiagReport() const;
+
+private:
     /// A batch's completion bookkeeping (timestamps, clock fences, profiles): once, when it is seen complete.
     void Retire(Batch& b);
     /// Poll's end: the resources of completed batches released (every batch up to `completed` done).
