@@ -13,6 +13,13 @@ namespace {
 constexpr std::string_view kWhyEn = "Not available in this run (see the start options).";
 constexpr std::string_view kWhyRu = "Недоступно в этом режиме запуска.";
 
+Apply Effective(const Desc& d, u32 capabilities) {
+    if (d.apply == Apply::Live && d.live_needs != 0 && (capabilities & d.live_needs) != d.live_needs) {
+        return Apply::Restart;
+    }
+    return d.apply;
+}
+
 } // namespace
 
 void Service::Init(const App::Config& defaults, Overrides overrides, const App::Config& started,
@@ -70,8 +77,13 @@ bool Service::IsOverridden(const Desc& desc) const {
 
 bool Service::NeedsRestart(const Desc& desc) const {
     std::scoped_lock lock{mutex_};
-    return desc.apply == Apply::Restart && desc.get != nullptr &&
+    return Effective(desc, capabilities_) == Apply::Restart && desc.get != nullptr &&
            !Equal(desc.get(current_, desc), desc.get(started_, desc));
+}
+
+Apply Service::EffectiveApply(const Desc& desc) const {
+    std::scoped_lock lock{mutex_};
+    return Effective(desc, capabilities_);
 }
 
 bool Service::AnyNeedsRestart() const {
@@ -132,7 +144,7 @@ SetResult Service::Commit(std::span<const std::pair<const Desc*, Value>> changes
             }
             changed.push_back(d);
             SSPC_LOG(App, Info, "setting {} = {}{}", d->id, Describe(v),
-                     d->apply == Apply::Restart ? " (from the next start)" : "");
+                     Effective(*d, capabilities_) == Apply::Restart ? " (from the next start)" : "");
         }
         if (changed.empty()) {
             return SetResult::Unchanged;
@@ -140,8 +152,8 @@ SetResult Service::Commit(std::span<const std::pair<const Desc*, Value>> changes
         SaveLocked();
         snapshot = current_;
         appliers = appliers_;
+        std::erase_if(changed, [this](const Desc* d) { return Effective(*d, capabilities_) != Apply::Live; });
     }
-    std::erase_if(changed, [](const Desc* d) { return d->apply != Apply::Live; });
     if (!changed.empty()) {
         for (const auto& apply : appliers) {
             apply(snapshot, changed);

@@ -45,20 +45,15 @@ VkFormat Unorm(VkFormat f) {
     }
 }
 
-const char* PresentModeName(VkPresentModeKHR m) {
-    switch (m) {
-    case VK_PRESENT_MODE_IMMEDIATE_KHR:
-        return "IMMEDIATE";
-    case VK_PRESENT_MODE_MAILBOX_KHR:
-        return "MAILBOX";
-    case VK_PRESENT_MODE_FIFO_KHR:
-        return "FIFO";
-    case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
-        return "FIFO_RELAXED";
-    default:
-        return "other";
-    }
+VkPresentModeKHR ParsePresentMode(const std::string& present_mode) {
+    return present_mode == "Fifo"        ? VK_PRESENT_MODE_FIFO_KHR
+           : present_mode == "Immediate" ? VK_PRESENT_MODE_IMMEDIATE_KHR
+                                         : VK_PRESENT_MODE_MAILBOX_KHR;
 }
+
+// R11 display: what the menu shows (GetPresentModeInfo): bit 31 known, bits 0..3 the surface's modes, 8..15 the
+// swapchain's mode, 16..23 the wanted one
+std::atomic<u32> g_present_info{0};
 
 float HalfToFloat(u16 h) {
     const u32 s = (h >> 15) & 1, e = (h >> 10) & 0x1F, m = h & 0x3FF;
@@ -155,6 +150,31 @@ void SetFpsCounterShown(bool shown) {
     g_fps_counter_shown.store(shown, std::memory_order_relaxed);
 }
 
+const char* PresentModeName(VkPresentModeKHR m) {
+    switch (m) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR:
+        return "IMMEDIATE";
+    case VK_PRESENT_MODE_MAILBOX_KHR:
+        return "MAILBOX";
+    case VK_PRESENT_MODE_FIFO_KHR:
+        return "FIFO";
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+        return "FIFO_RELAXED";
+    default:
+        return "other";
+    }
+}
+
+PresentModeInfo GetPresentModeInfo() {
+    const u32 v = g_present_info.load(std::memory_order_acquire);
+    PresentModeInfo info;
+    info.known = (v >> 31) != 0;
+    info.supported = v & 0xF;
+    info.current = static_cast<VkPresentModeKHR>((v >> 8) & 0xFF);
+    info.wanted = static_cast<VkPresentModeKHR>((v >> 16) & 0xFF);
+    return info;
+}
+
 /// An image of the presenter's own (frame generation inputs), recreated for a size or format.
 struct OwnImage {
     VkImage image = VK_NULL_HANDLE;
@@ -243,6 +263,8 @@ struct Presenter::Impl {
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     VkPresentModeKHR wanted_mode = VK_PRESENT_MODE_MAILBOX_KHR; ///< [Display] presentMode
     bool modes_logged = false;
+    VkPresentModeKHR logged_mode = VK_PRESENT_MODE_FIFO_KHR, logged_wanted = VK_PRESENT_MODE_FIFO_KHR;
+    std::atomic<int> mode_request{-1}; ///< SetPresentMode: the wanted VkPresentModeKHR, -1 nothing asked
     std::vector<VkImage> images;
     std::vector<VkSemaphore> done; ///< per swapchain image: its commands finished (the present waits on it)
 
@@ -394,14 +416,28 @@ struct Presenter::Impl {
         } else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
             mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
         }
-        if (!modes_logged) {
-            modes_logged = true;
+        {
+            u32 supported = 0;
+            for (const VkPresentModeKHR m : modes) {
+                supported |= static_cast<u32>(m) < 4 ? 1u << static_cast<u32>(m) : 0u;
+            }
+            g_present_info.store(1u << 31 | supported | (static_cast<u32>(mode) & 0xFF) << 8 |
+                                     (static_cast<u32>(wanted_mode) & 0xFF) << 16,
+                                 std::memory_order_release);
+        }
+        if (!modes_logged || mode != logged_mode || wanted_mode != logged_wanted) {
+            // (at the first swapchain, and whenever the vertical sync setting changes it - not at every resize)
             std::string list;
             for (const VkPresentModeKHR m : modes) {
                 list += fmt::format("{}{}", list.empty() ? "" : ", ", PresentModeName(m));
             }
-            SSPC_LOG(GPU, Info, "native presenter: present modes {}; wanted {}, using {}; {} images min, {} max", list,
-                     PresentModeName(wanted_mode), PresentModeName(mode), caps.minImageCount, caps.maxImageCount);
+            SSPC_LOG(GPU, Info, "native presenter: present modes {}; wanted {}, using {}{}; {} images min, {} max{}",
+                     list, PresentModeName(wanted_mode), PresentModeName(mode),
+                     mode == wanted_mode ? "" : " (the surface lacks the wanted one)", caps.minImageCount,
+                     caps.maxImageCount, modes_logged ? " (changed while running)" : "");
+            modes_logged = true;
+            logged_mode = mode;
+            logged_wanted = wanted_mode;
         }
         u32 count = std::max(caps.minImageCount + 1, 3u);
         if (caps.maxImageCount != 0) {
@@ -763,9 +799,7 @@ Presenter::Presenter(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 std::unique_ptr<Presenter> Presenter::Create(DeviceContext& ctx, Timeline& timeline, void* sdl_window,
                                              const std::string& present_mode, std::string& error) {
     auto impl = std::make_unique<Impl>(ctx, timeline);
-    impl->wanted_mode = present_mode == "Fifo"        ? VK_PRESENT_MODE_FIFO_KHR
-                        : present_mode == "Immediate" ? VK_PRESENT_MODE_IMMEDIATE_KHR
-                                                      : VK_PRESENT_MODE_MAILBOX_KHR;
+    impl->wanted_mode = ParsePresentMode(present_mode);
     if (!ctx.Caps().swapchain_maintenance1) {
         error = "present fences are required (swapchainMaintenance1)";
         return nullptr;
@@ -1050,6 +1084,19 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     }
     if (const int want = m.fg_wanted.exchange(-1, std::memory_order_acq_rel); want >= 0) {
         m.SwitchFrameGen(want == 1);
+    }
+    if (const int want = m.mode_request.exchange(-1, std::memory_order_acq_rel);
+        want >= 0 && static_cast<VkPresentModeKHR>(want) != m.wanted_mode) {
+        // R11 display: the vertical sync changed in the settings menu - a swapchain of the new mode, between two
+        // presents, through Recreate (every present slot retired first; oldSwapchain chained, or frame generation's
+        // replaced). Minimized (no swapchain): the next one is made with it.
+        const VkPresentModeKHR before = m.mode;
+        m.wanted_mode = static_cast<VkPresentModeKHR>(want);
+        const bool ok = m.swapchain == VK_NULL_HANDLE || m.Recreate();
+        SSPC_LOG(GPU, Info, "native presenter: vertical sync setting -> {}: swapchain {} ({} -> {}){}",
+                 PresentModeName(m.wanted_mode), m.swapchain == VK_NULL_HANDLE ? "made at the next present"
+                                                                               : (ok ? "recreated" : "NOT recreated"),
+                 PresentModeName(before), PresentModeName(m.mode), m.fg ? ", frame generation's swapchain" : "");
     }
     if (m.fg) {
         // FrameBreak: FFX's present waits for room in its queue - inside the queue's lock below, where the backend's
@@ -1496,6 +1543,10 @@ bool Presenter::FrameGenActive() const {
 
 void Presenter::SetFrameGen(bool on) {
     impl_->fg_wanted.store(on ? 1 : 0, std::memory_order_release);
+}
+
+void Presenter::SetPresentMode(const std::string& present_mode) {
+    impl_->mode_request.store(static_cast<int>(ParsePresentMode(present_mode)), std::memory_order_release);
 }
 
 bool Presenter::RecordFrameGenInputs(VkCommandBuffer cb, s32 frame, const FrameGenSource& src) {

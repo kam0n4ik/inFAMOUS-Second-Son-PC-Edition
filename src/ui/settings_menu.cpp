@@ -485,17 +485,26 @@ void SettingsMenu::RebuildRows() {
         }
         break;
     }
-    case Page::Display:
+    case Page::Display: {
+        // R11: the window, the frames, the game's picture; then any other Display setting in the registry's order
+        AddHeader("Window", "Окно");
+        rows_.push_back({.kind = Row::Kind::WindowMode, .en = "Window mode", .ru = "Режим окна", .tag = "window.mode"});
+        rows_.push_back({.kind = Row::Kind::WindowSize, .en = "Window size", .ru = "Размер окна", .tag = "window.size"});
+        setting("display.monitor");
+        AddHeader("Frames", "Кадры");
+        setting("display.presentMode");
+        setting("display.frameRateLimit");
+        AddHeader("The game's picture", "Картинка игры");
+        constexpr std::string_view kPlaced[] = {"display.monitor", "display.presentMode", "display.frameRateLimit",
+                                                "display.showFps"};
         for (const auto& d : Settings::All()) {
-            if (d.category == Category::Display && d.own_row && d.id != "display.showFps" && Shown(d)) {
+            if (d.category == Category::Display && d.own_row && std::ranges::find(kPlaced, d.id) == std::end(kPlaced) &&
+                Shown(d)) {
                 rows_.push_back({.kind = Row::Kind::Setting, .desc = &d});
-                if (d.id == "display.fullscreenMode") {
-                    rows_.push_back({.kind = Row::Kind::WindowSize, .en = "Window size", .ru = "Размер окна",
-                                     .tag = "window.size"});
-                }
             }
         }
         break;
+    }
     case Page::Controls:
         AddHeader("Mouse", "Мышь");
         setting("input.mouseSensitivity");
@@ -691,7 +700,7 @@ void SettingsMenu::SetValue(const Desc& desc, const Value& value) {
     if (result == Settings::SetResult::Invalid || result == Settings::SetResult::Unavailable) {
         status_ = error;
         status_warn_ = true;
-    } else if (result == Settings::SetResult::Ok && desc.apply == Settings::Apply::Restart) {
+    } else if (result == Settings::SetResult::Ok && service_.EffectiveApply(desc) == Settings::Apply::Restart) {
         status_ = service_.NeedsRestart(desc)
                       ? std::string(T("Saved. Takes effect after a restart.",
                                       "Сохранено. Вступит в силу после перезапуска игры."))
@@ -744,6 +753,69 @@ void SettingsMenu::StepWindowSize(int dir) {
     SetWindowSize(sizes[static_cast<size_t>(idx)].first, sizes[static_cast<size_t>(idx)].second);
 }
 
+std::string SettingsMenu::WindowModeNow() const {
+    const auto cfg = service_.Current();
+    return !cfg.fullscreen ? "window" : cfg.exclusive_fullscreen ? "exclusive" : "borderless";
+}
+
+std::vector<SettingsMenu::Option> SettingsMenu::WindowModeOptions() const {
+    std::vector<Option> out{
+        {.value = "window", .label = std::string(T("Windowed", "Оконный"))},
+        {.value = "borderless", .label = std::string(T("Borderless (full screen)", "Без рамки (на весь экран)"))},
+    };
+    if (WindowModeNow() == "exclusive") {
+        // [Display] fullscreenMode = "exclusive" from a file: kept while chosen, not offered (no Vulkan exclusive mode:
+        // SDL's full screen at the desktop's display mode, as borderless, minimized on Alt+Tab)
+        out.push_back({.value = "exclusive",
+                       .label = std::string(T("Exclusive (SecondSonPC.toml)", "Эксклюзивный (SecondSonPC.toml)")),
+                       .ok = false,
+                       .why = std::string(T("no exclusive mode in the renderer: the display's mode is not changed, "
+                                            "the window covers it as borderless and minimizes on Alt+Tab",
+                                            "эксклюзивного режима в рендерере нет: режим монитора не меняется, окно "
+                                            "занимает его как «без рамки» и сворачивается при Alt+Tab"))});
+    }
+    return out;
+}
+
+void SettingsMenu::SetWindowMode(std::string_view mode) {
+    const Desc* fs = Settings::Find("display.fullscreen");
+    const Desc* fm = Settings::Find("display.fullscreenMode");
+    if (fs == nullptr || fm == nullptr) {
+        return;
+    }
+    if (const auto a = service_.Available(*fs); !a.available) {
+        status_ = std::string(T(a.why_en, a.why_ru));
+        status_warn_ = true;
+        return;
+    }
+    // (a mode chosen here is borderless or windowed: an "exclusive" of the file is not kept)
+    const std::pair<const Desc*, Value> changes[] = {{fs, Value{mode != "window"}},
+                                                     {fm, Value{std::string("borderless")}}};
+    BeginDisplayChange();
+    std::string error;
+    const auto result = service_.SetMany(changes, &error);
+    EndDisplayChange(result == Settings::SetResult::Ok);
+    if (result == Settings::SetResult::Invalid || result == Settings::SetResult::Unavailable) {
+        status_ = error;
+        status_warn_ = true;
+    }
+}
+
+void SettingsMenu::StepWindowMode(int dir) {
+    const auto options = WindowModeOptions();
+    const std::string now = WindowModeNow();
+    int idx = 0;
+    for (size_t i = 0; i < options.size(); ++i) {
+        idx = options[i].value == now ? static_cast<int>(i) : idx;
+    }
+    for (int next = idx + dir; next >= 0 && next < static_cast<int>(options.size()); next += dir) {
+        if (options[static_cast<size_t>(next)].ok) {
+            SetWindowMode(options[static_cast<size_t>(next)].value);
+            return;
+        }
+    }
+}
+
 std::vector<std::string> SettingsMenu::TextOptions(const Desc& desc) const {
     std::vector<std::string> options{""};
     const auto& extra = desc.id == "display.monitor" ? env_.displays : env_.audio_devices;
@@ -760,7 +832,23 @@ std::vector<SettingsMenu::Option> SettingsMenu::Options(const Desc& desc) const 
     const u32 caps = service_.Capabilities();
     if (desc.type == Type::Text) {
         for (const auto& v : TextOptions(desc)) {
-            out.push_back({.value = v, .label = ValueText(desc, Value{v})});
+            std::string label = ValueText(desc, Value{v});
+            if (desc.id == "display.monitor") {
+                // R11: the displays with their desktop size and refresh rate ("" = the primary one)
+                if (v.empty() && !env_.primary_label.empty()) {
+                    label = fmt::format("{} — {}", label, env_.primary_label);
+                }
+                const auto it = std::ranges::find(env_.displays, v);
+                if (!v.empty() && it != env_.displays.end()) {
+                    const size_t i = static_cast<size_t>(it - env_.displays.begin());
+                    if (i < env_.display_labels.size() && !env_.display_labels[i].empty()) {
+                        label = env_.display_labels[i];
+                    }
+                } else if (!v.empty()) {
+                    label = fmt::format("{} ({})", v, T("not connected", "не подключён"));
+                }
+            }
+            out.push_back({.value = v, .label = std::move(label)});
         }
         return out;
     }
@@ -796,8 +884,40 @@ std::vector<SettingsMenu::Option> SettingsMenu::Options(const Desc& desc) const 
             }
         } else if (desc.id == "upscaling.frameGenMultiplier" && c.value != "2" && (caps & Cap::DlssFrameGen) == 0) {
             continue;
+        } else if (desc.id == "display.presentMode" && env_.present_known) {
+            // R11: what the presenter's surface does with it (Off without IMMEDIATE: MAILBOX, as the presenter picks)
+            if (c.value == "immediate" && !env_.present_immediate) {
+                o.label += env_.present_mailbox ? std::string(T(" (here: Mailbox)", " (здесь: Mailbox)"))
+                                                : std::string(T(" (here: FIFO)", " (здесь: FIFO)"));
+            } else if (c.value == "mailbox" && !env_.present_mailbox) {
+                o.label += env_.present_immediate ? std::string(T(" (here: Immediate)", " (здесь: Immediate)"))
+                                                  : std::string(T(" (here: FIFO)", " (здесь: FIFO)"));
+            }
+        } else if (desc.id == "display.resolution" && env_.display_size.first != 0 &&
+                   c.value == fmt::format("{}x{}", env_.display_size.first, env_.display_size.second)) {
+            o.label += std::string(T(" — the display's", " — как у монитора"));
         }
         out.push_back(std::move(o));
+    }
+    if (desc.id == "display.resolution" && env_.display_size.first != 0) {
+        // R11: the window's display's own size, when no preset has it (1366x768, 2560x1080 of a laptop...)
+        const std::string own = fmt::format("{}x{}", env_.display_size.first, env_.display_size.second);
+        std::string error;
+        if (std::ranges::none_of(out, [&](const Option& o) { return o.value == own; }) &&
+            Settings::Validate(desc, Value{own}, error)) {
+            out.push_back({.value = own,
+                           .label = fmt::format("{} × {}{}", env_.display_size.first, env_.display_size.second,
+                                                T(" — the display's", " — как у монитора"))});
+        }
+    }
+    if (desc.accepts != nullptr) {
+        // a value outside the list from SecondSonPC.toml / the user file ("75", "1366x768"): selectable while chosen
+        const Value v = service_.Get(desc);
+        const auto* now = std::get_if<std::string>(&v);
+        if (now != nullptr && std::ranges::none_of(out, [&](const Option& o) { return o.value == *now; })) {
+            out.push_back({.value = *now, .label = fmt::format("{} ({})", *now, T("from the settings file",
+                                                                                   "из файла настроек"))});
+        }
     }
     return out;
 }
@@ -814,6 +934,9 @@ std::vector<SettingsMenu::Option> SettingsMenu::RowOptions(size_t row) const {
         }
         return out;
     }
+    if (r.kind == Row::Kind::WindowMode) {
+        return WindowModeOptions();
+    }
     if (r.kind == Row::Kind::Setting && r.desc != nullptr) {
         return Options(*r.desc);
     }
@@ -826,6 +949,8 @@ int SettingsMenu::CurrentOption(size_t row, const std::vector<Option>& options) 
     if (r.kind == Row::Kind::WindowSize) {
         const auto cfg = service_.Current();
         now = fmt::format("{}x{}", cfg.window_width, cfg.window_height);
+    } else if (r.kind == Row::Kind::WindowMode) {
+        now = WindowModeNow();
     } else if (r.desc != nullptr) {
         const Value v = service_.Get(*r.desc);
         if (const auto* s = std::get_if<std::string>(&v)) {
@@ -852,7 +977,7 @@ void SettingsMenu::OpenList() {
             status_warn_ = true;
             return;
         }
-    } else if (rows_[focus_].kind == Row::Kind::WindowSize) {
+    } else if (rows_[focus_].kind == Row::Kind::WindowSize || rows_[focus_].kind == Row::Kind::WindowMode) {
         if (const Desc* dw = Settings::Find("display.width"); dw != nullptr && !service_.Available(*dw).available) {
             const auto a = service_.Available(*dw);
             status_ = std::string(T(a.why_en, a.why_ru));
@@ -889,6 +1014,8 @@ void SettingsMenu::ChooseListItem(int index) {
             std::from_chars(rw.ptr + 1, end, h).ec == std::errc{} && w != 0 && h != 0) {
             SetWindowSize(w, h);
         }
+    } else if (r.kind == Row::Kind::WindowMode) {
+        SetWindowMode(o.value);
     } else if (r.desc != nullptr) {
         SetValue(*r.desc, Value{o.value});
     }
@@ -901,6 +1028,10 @@ void SettingsMenu::Adjust(int dir) {
     const auto& row = rows_[focus_];
     if (row.kind == Row::Kind::WindowSize) {
         StepWindowSize(dir);
+        return;
+    }
+    if (row.kind == Row::Kind::WindowMode) {
+        StepWindowMode(dir);
         return;
     }
     if (row.kind != Row::Kind::Setting || row.desc == nullptr) {
@@ -976,6 +1107,7 @@ void SettingsMenu::Activate() {
     const auto& row = rows_[focus_];
     switch (row.kind) {
     case Row::Kind::WindowSize:
+    case Row::Kind::WindowMode:
         OpenList();
         return;
     case Row::Kind::ResetPage:
@@ -1038,6 +1170,17 @@ void SettingsMenu::ResetFocused() {
         }
         return;
     }
+    if (row.kind == Row::Kind::WindowMode) {
+        // both settings back to SecondSonPC.toml's (a file's "exclusive" included), confirmed as any display change
+        const Desc* fs = Settings::Find("display.fullscreen");
+        const Desc* fm = Settings::Find("display.fullscreenMode");
+        if (fs != nullptr && fm != nullptr && service_.Available(*fs).available) {
+            const std::pair<const Desc*, Value> changes[] = {{fs, service_.Default(*fs)}, {fm, service_.Default(*fm)}};
+            BeginDisplayChange();
+            EndDisplayChange(service_.SetMany(changes) == Settings::SetResult::Ok);
+        }
+        return;
+    }
     if (row.kind == Row::Kind::Setting && row.desc != nullptr && !row.desc->table.empty()) {
         SetValue(*row.desc, service_.Default(*row.desc));
     }
@@ -1056,6 +1199,9 @@ void SettingsMenu::ResetPageSettings() {
         } else if (r.kind == Row::Kind::WindowSize) {
             add(Settings::Find("display.width"));
             add(Settings::Find("display.height"));
+        } else if (r.kind == Row::Kind::WindowMode) {
+            add(Settings::Find("display.fullscreen"));
+            add(Settings::Find("display.fullscreenMode"));
         }
     }
     if (changes.empty()) {
@@ -1470,6 +1616,9 @@ std::string SettingsMenu::ValueText(const Desc& desc, const Value& value) const 
     }
     case Type::Choice: {
         const auto label = Settings::ChoiceLabel(desc, std::get<std::string>(value), env_.ru);
+        if (label.empty() && desc.id == "display.resolution") {
+            return Replace(std::get<std::string>(value), "x", " × "); // (a size outside the list: "1366 × 768")
+        }
         return label.empty() ? std::get<std::string>(value) : std::string(label);
     }
     case Type::Text: {
@@ -1572,8 +1721,12 @@ std::string SettingsMenu::HelpText(size_t row, Color& color) const {
             add(fmt::format("{} {}. {}", T("Now in use:", "Сейчас действует:"), ValueText(d, service_.Started(d)),
                             T("The new value takes effect after a restart.",
                               "Новое значение вступит в силу после перезапуска.")));
-        } else if (d.apply == Settings::Apply::Restart) {
+        } else if (service_.EffectiveApply(d) == Settings::Apply::Restart) {
             add(T("(Applied at the next start.)", "(Применяется при следующем запуске.)"));
+        }
+        if (d.id == "display.presentMode" && env_.present_known) {
+            add(fmt::format("{} {} ({} {}).", T("Now:", "Сейчас:"), env_.present_now,
+                            T("the display offers", "монитор поддерживает"), env_.present_supported));
         }
         if (d.id == "upscaling.upscaler" && !env_.upscale_reason.empty()) {
             color = kRestart;
@@ -1583,6 +1736,20 @@ std::string SettingsMenu::HelpText(size_t row, Color& color) const {
             color = kWarn;
             add(fmt::format("{} {}.", T("The chosen value cannot run here:", "Выбранное значение здесь не работает:"),
                             why));
+        }
+    } else if (r.kind == Row::Kind::WindowMode) {
+        add(T("Windowed: a window with a frame, its size below. Borderless: the window covers the whole display "
+              "(Monitor), quick Alt+Tab. F11 switches between them while playing. A change is undone after 15 s "
+              "unless kept.",
+              "«Оконный» — окно с рамкой, его размер ниже. «Без рамки» — окно на весь монитор (строка «Монитор»), "
+              "быстрый Alt+Tab. F11 переключает их во время игры. Изменение отменяется через 15 с, если его не "
+              "подтвердить."));
+        for (const auto& o : WindowModeOptions()) {
+            if (o.value == WindowModeNow() && !o.ok) {
+                color = kWarn;
+                add(fmt::format("{} {}.", T("The chosen value cannot run here:", "Выбранное значение здесь не работает:"),
+                                o.why));
+            }
         }
     } else if (r.kind == Row::Kind::WindowSize) {
         add(T("The window's size when not in full screen. The game draws at its Resolution (automatic: this size, at "
@@ -1902,6 +2069,21 @@ void SettingsMenu::Build(TextMeasure& measure, DrawList& out) {
         case Row::Kind::WindowSize: {
             const bool ok = service_.Available(*Settings::Find("display.width")).available;
             dropdown(fmt::format("{} × {}", cfg.window_width, cfg.window_height), ok && !inactive ? kText : kText3);
+            break;
+        }
+        case Row::Kind::WindowMode: {
+            const bool ok = service_.Available(*Settings::Find("display.fullscreen")).available;
+            const auto options = WindowModeOptions();
+            const std::string now = WindowModeNow();
+            std::string text = now;
+            bool runs = true;
+            for (const auto& o : options) {
+                if (o.value == now) {
+                    text = o.label;
+                    runs = o.ok;
+                }
+            }
+            dropdown(text, !ok ? kText3 : runs ? kText : kWarn);
             break;
         }
         case Row::Kind::Setting: {

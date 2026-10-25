@@ -43,6 +43,9 @@ public:
     Value Started(const Desc& desc) const;  // this run's value at start
     bool IsOverridden(const Desc& desc) const;
     bool NeedsRestart(const Desc& desc) const; // Restart setting changed since the start
+    /// How a change of `desc` takes effect in this run: its `apply`, but Restart for a Live setting whose
+    /// `live_needs` this run lacks (the vertical sync with the bridge's presenter).
+    Apply EffectiveApply(const Desc& desc) const;
     bool AnyNeedsRestart() const;
     Availability Available(const Desc& desc) const;
 

@@ -77,6 +77,9 @@ struct State {
     bool busy = false;             // inside an event/open/close: SDL calls may pump messages (the timer must wait)
     bool exclusive_lifted = false; // exclusive full screen turned borderless while the menu is shown
     std::vector<std::string> displays, audio_devices;
+    std::vector<std::string> display_labels; // R11: the displays as the Monitor list shows them
+    std::string primary_label;
+    std::string present_now; // R11: the presenter's mode the menu last saw (redrawn when it changes)
     std::vector<std::pair<u32, u32>> window_sizes;
     std::string fsr_why; // FSR 3.1 cannot run: its DLL is not next to the exe (looked at when the menu opens)
     // PC Edition: the PC settings are an entry of the game's own Settings screen (Esc / Options during play)
@@ -214,31 +217,50 @@ u32 PromptTimer(void*, SDL_TimerID, u32 interval) {
     return interval;
 }
 
-SDL_DisplayID FindDisplay(const std::string& name) {
-    int n = 0;
-    SDL_DisplayID* ids = SDL_GetDisplays(&n);
-    SDL_DisplayID found = 0;
-    for (int i = 0; ids != nullptr && i < n && !name.empty(); ++i) {
-        const char* dn = SDL_GetDisplayName(ids[i]);
-        if (dn != nullptr && name == dn) {
-            found = ids[i];
-            break;
-        }
-    }
-    SDL_free(ids);
-    return found != 0 ? found : SDL_GetPrimaryDisplay();
-}
-
-std::vector<std::string> DisplayNames() {
-    std::vector<std::string> out;
+/// The system's displays with the names [Display] monitor stores: SDL's name, and for a second display of the same name
+/// (two monitors of one model) "<name> (2)", "<name> (3)"... in SDL's order.
+std::vector<std::pair<SDL_DisplayID, std::string>> Displays() {
+    std::vector<std::pair<SDL_DisplayID, std::string>> out;
     int n = 0;
     SDL_DisplayID* ids = SDL_GetDisplays(&n);
     for (int i = 0; ids != nullptr && i < n; ++i) {
         const char* dn = SDL_GetDisplayName(ids[i]);
-        out.emplace_back(dn != nullptr ? dn : "?");
+        std::string name = dn != nullptr ? dn : "?";
+        const auto same = std::ranges::count_if(out, [&](const auto& d) {
+            return d.second == name || d.second.starts_with(name + " (");
+        });
+        out.emplace_back(ids[i], same == 0 ? name : fmt::format("{} ({})", name, same + 1));
     }
     SDL_free(ids);
     return out;
+}
+
+SDL_DisplayID FindDisplay(const std::string& name) {
+    if (!name.empty()) {
+        for (const auto& [id, n] : Displays()) {
+            if (n == name) {
+                return id;
+            }
+        }
+    }
+    return SDL_GetPrimaryDisplay();
+}
+
+/// R11: a display as the Monitor list shows it: "<name> — 1920 × 1080, 165 Hz (primary)".
+std::string DisplayLabel(SDL_DisplayID id, const std::string& name, bool ru, bool mark_primary = true) {
+    const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(id);
+    std::string label = name;
+    if (m != nullptr && m->w > 0 && m->h > 0) {
+        // (the desktop mode in pixels: SDL's w/h are in points with a display scale)
+        const int w = static_cast<int>(std::lround(m->w * (m->pixel_density > 0 ? m->pixel_density : 1.0f)));
+        const int h = static_cast<int>(std::lround(m->h * (m->pixel_density > 0 ? m->pixel_density : 1.0f)));
+        label += m->refresh_rate > 0 ? fmt::format(" — {} × {}, {:.0f} {}", w, h, m->refresh_rate, ru ? "Гц" : "Hz")
+                                     : fmt::format(" — {} × {}", w, h);
+    }
+    if (mark_primary && id == SDL_GetPrimaryDisplay()) {
+        label += ru ? " (основной)" : " (primary)";
+    }
+    return label;
 }
 
 std::vector<std::string> AudioDeviceNames() {
@@ -314,6 +336,25 @@ MenuEnv BuildEnv() {
                                                     : "shadPS4 bridge (--gpu-backend bridge)")
                                : std::string(env.ru ? "собственный Vulkan SecondSonPC" : "SecondSonPC's own Vulkan");
     env.displays = st.displays;
+    env.display_labels = st.display_labels;
+    env.primary_label = st.primary_label;
+    if (st.opt.window != nullptr) {
+        if (const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(st.opt.window));
+            m != nullptr && m->w > 0 && m->h > 0) {
+            const float density = m->pixel_density > 0 ? m->pixel_density : 1.0f;
+            env.display_size = {static_cast<u32>(std::lround(m->w * density)),
+                                static_cast<u32>(std::lround(m->h * density))};
+        }
+    }
+    if (!bridge) {
+        // R11: the vertical sync row - the present modes of the presenter's surface and the swapchain's
+        const auto pm = Gpu::Native::GetPresentModes();
+        env.present_known = pm.known;
+        env.present_immediate = pm.immediate;
+        env.present_mailbox = pm.mailbox;
+        env.present_supported = pm.supported;
+        env.present_now = pm.current;
+    }
     env.audio_devices = st.audio_devices;
     env.window_sizes = st.window_sizes;
     auto& service = Settings::Instance();
@@ -477,6 +518,13 @@ void OnTimer(void*) {
         SendNav(*st.held_nav);
         st.next_repeat_ns = now + kRepeatPeriodNs;
         st.dirty = true;
+    }
+    if ((Settings::Instance().Capabilities() & Settings::Capability::PresentModeSwitch) != 0) {
+        // R11: the vertical sync row's "Now:" - the presenter switches at its next present, after the render of the
+        // change: drawn again once its swapchain's mode is another
+        const std::string now_mode = Gpu::Native::GetPresentModes().current;
+        st.dirty = st.dirty || now_mode != st.present_now;
+        st.present_now = now_mode;
     }
     if (st.menu->TakeCloseRequest()) {
         Menu().Close();
@@ -919,7 +967,16 @@ void MenuController::Open() {
     st.entry_shown = false;
     st.hover_pending = false;
     st.nav_active = false;
-    st.displays = DisplayNames();
+    st.displays.clear();
+    st.display_labels.clear();
+    st.primary_label.clear();
+    for (const auto& [id, name] : Displays()) {
+        st.displays.push_back(name);
+        st.display_labels.push_back(DisplayLabel(id, name, Ru(Settings::Instance().Current())));
+        if (id == SDL_GetPrimaryDisplay()) {
+            st.primary_label = DisplayLabel(id, name, Ru(Settings::Instance().Current()), false); // ("Primary - <it>")
+        }
+    }
     st.audio_devices = AudioDeviceNames();
     st.window_sizes = WindowSizes(st.opt.window);
     {

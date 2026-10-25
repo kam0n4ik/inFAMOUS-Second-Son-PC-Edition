@@ -121,6 +121,23 @@ void Registry(const CheckFn& check) {
     check(g, "range: sensitivity 0.5 accepted", sens != nullptr && Validate(*sens, Value{0.5}, e), e);
     const Desc* pm = Find("display.presentMode");
     check(g, "choice: unknown value refused", pm != nullptr && !Validate(*pm, Value{std::string("vsync")}, e), e);
+    // R11 display: the stored values of the older files stay valid, the new list values and a file's own numbers too
+    {
+        const auto valid = [&e](const Desc* d, std::string_view v) { return d != nullptr && Validate(*d, Value{std::string(v)}, e); };
+        const Desc* fl = Find("display.frameRateLimit");
+        const Desc* res = Find("display.resolution");
+        check(g, "vertical sync: fifo / immediate / mailbox (the files' values) valid",
+              valid(pm, "fifo") && valid(pm, "immediate") && valid(pm, "mailbox") && pm->choices.size() == 3, "");
+        check(g, "frame rate limit: 30 40 50 60 90 120 144 165 240 console unlimited, and a file's 75 / 1000; 19, 1001, "
+                 "\"60fps\" refused",
+              valid(fl, "30") && valid(fl, "40") && valid(fl, "50") && valid(fl, "60") && valid(fl, "90") &&
+                  valid(fl, "120") && valid(fl, "144") && valid(fl, "165") && valid(fl, "240") && valid(fl, "console") &&
+                  valid(fl, "unlimited") && valid(fl, "75") && valid(fl, "1000") && !valid(fl, "19") &&
+                  !valid(fl, "1001") && !valid(fl, "60fps") && !valid(fl, ""),
+              e);
+        check(g, "resolution: a display's own size (1366x768) accepted, 100x100 and \"wide\" refused",
+              valid(res, "1366x768") && valid(res, "auto") && !valid(res, "100x100") && !valid(res, "wide"), e);
+    }
     const Desc* cross = Find("keyboard.cross");
     check(g, "binding: F10 (hotkey) refused",
           cross != nullptr && !Validate(*cross, Value{Bindings{Key(SDL_SCANCODE_F10)}}, e), e);
@@ -168,6 +185,8 @@ void UserFile(const CheckFn& check, const fs::path& dir) {
     o["input.mouseSensitivity"] = 1.0;
     o["gamepad.cameraSensitivity"] = 1.25;
     o["display.presentMode"] = std::string("fifo");
+    o["display.frameRateLimit"] = std::string("75"); // (R11: a number outside the list, as a hand-edited file has it)
+    o["display.resolution"] = std::string("1366x768");
     o["display.monitor"] = std::string("Монитор \"DELL\" \\ 27");
     o["keyboard.cross"] = Bindings{Key(SDL_SCANCODE_SPACE), {InputCode::Kind::MouseButton, SDL_BUTTON_X1}};
     o["keyboard.dpadUp"] = Bindings{{InputCode::Kind::MouseWheel, 0}};
@@ -306,6 +325,22 @@ void ServiceChecks(const CheckFn& check, const fs::path& dir) {
           s.Set(pm, Value{std::string("fifo")}) == SetResult::Ok && s.NeedsRestart(pm) && applied.empty(), "");
     s.Set(pm, Value{std::string("mailbox")});
     check(g, "restart setting back to the started value: not marked", !s.NeedsRestart(pm), "");
+    // R11: the vertical sync is Live where the presenter switches its swapchain (the native backend), Restart else
+    {
+        const u32 caps = s.Capabilities();
+        const bool restart_here = s.EffectiveApply(pm) == Apply::Restart;
+        s.SetCapabilities(caps | Capability::PresentModeSwitch);
+        applied.clear();
+        const bool live = s.EffectiveApply(pm) == Apply::Live && s.Set(pm, Value{std::string("immediate")}) == SetResult::Ok &&
+                          applied == std::vector<std::string>{"display.presentMode"} && !s.NeedsRestart(pm) &&
+                          s.Current().present_mode == "Immediate";
+        s.Set(pm, Value{std::string("mailbox")});
+        s.SetCapabilities(caps);
+        applied.clear();
+        check(g, "vertical sync: live with the native presenter (applier called, no restart mark), restart with the "
+                 "bridge's",
+              restart_here && live, "");
+    }
 
     s.Set(inv, Value{true});
     s.Set(sens, Value{2.5});
@@ -377,6 +412,19 @@ void ConfigChecks(const CheckFn& check, const fs::path& dir) {
     auto [c4, e4] = toml("");
     check(g, "SecondSonPC.toml without the new sections: defaults", c4 && c4->pc.vibration == 100 && !c4->pc.fsr,
           e4.empty() ? "" : e4.front());
+    // R11 display: what the files had before stays as it was (the first start after the update behaves the same)
+    check(g, "SecondSonPC.toml without [Display] keys: vertical sync Mailbox, 60 FPS limit, windowed (as before)",
+          c4 && c4->present_mode == "Mailbox" && c4->pc.frame_rate_limit == "60" && !c4->fullscreen &&
+              !c4->exclusive_fullscreen,
+          "");
+    auto [c5, e5] = toml("[Display]\npresentMode = \"immediate\"\nframeRateLimit = \"75\"\nresolution = \"1366x768\"\n"
+                         "fullscreen = true\nfullscreenMode = \"exclusive\"\n");
+    check(g, "SecondSonPC.toml: immediate, a 75 FPS limit, 1366x768, exclusive full screen kept",
+          c5 && c5->present_mode == "Immediate" && c5->pc.frame_rate_limit == "75" && c5->pc.resolution == "1366x768" &&
+              c5->fullscreen && c5->exclusive_fullscreen,
+          e5.empty() ? "" : e5.front());
+    auto [c6, e6] = toml("[Display]\nframeRateLimit = \"7\"\n");
+    check(g, "SecondSonPC.toml: a frame rate limit of 7 is an error", !c6 && !e6.empty(), e6.empty() ? "" : e6.front());
 }
 
 void BindingChecks(const CheckFn& check) {
@@ -935,28 +983,115 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
 
     // display changes are confirmed or reverted
     menu.SelectPage(Ui::Page::Display);
-    menu.Focus("display.fullscreen");
-    menu.OnNav(Ui::Nav::Accept);
+    {
+        // R11: the page - one "Window mode" row for fullscreen + fullscreenMode, then size, monitor, the frames
+        const auto ids = menu.ListedIds();
+        const auto at = [&ids](std::string_view id) { return std::ranges::find(ids, id) - ids.begin(); };
+        check(g, "Display: window mode, window size, monitor, vertical sync, FPS limit, resolution (no separate full "
+                 "screen rows)",
+              contains(ids, "window.mode") && !contains(ids, "display.fullscreen") &&
+                  !contains(ids, "display.fullscreenMode") && at("window.mode") < at("window.size") &&
+                  at("window.size") < at("display.monitor") && at("display.monitor") < at("display.presentMode") &&
+                  at("display.presentMode") < at("display.frameRateLimit") &&
+                  at("display.frameRateLimit") < at("display.resolution") && contains(ids, "display.hudArea"),
+              fmt::format("{} rows", ids.size()));
+        const auto modes = menu.WindowModeOptions();
+        check(g, "window mode: windowed and borderless offered, exclusive not (no Vulkan exclusive mode)",
+              modes.size() == 2 && modes[0].value == "window" && modes[1].value == "borderless", "");
+    }
+    menu.Focus("window.mode");
+    menu.OnNav(Ui::Nav::Right); // windowed -> borderless
     const bool asked = menu.ConfirmPending() && std::get<bool>(s.Get(*Find("display.fullscreen")));
     menu.Tick(env.now_ns + Ui::SettingsMenu::kConfirmNs + 1);
     check(g, "display change: confirmation asked, reverted after 15 s without an answer",
           asked && !menu.ConfirmPending() && !std::get<bool>(s.Get(*Find("display.fullscreen"))), menu.Status());
-    menu.OnNav(Ui::Nav::Accept);
+    menu.OnNav(Ui::Nav::Right);
     menu.OnNav(Ui::Nav::Accept); // "Keep" is focused first
     check(g, "display change: kept when confirmed",
-          !menu.ConfirmPending() && std::get<bool>(s.Get(*Find("display.fullscreen"))), menu.Status());
+          !menu.ConfirmPending() && std::get<bool>(s.Get(*Find("display.fullscreen"))) &&
+              std::get<std::string>(s.Get(*Find("display.fullscreenMode"))) == "borderless",
+          menu.Status());
     menu.Focus("window.size");
     menu.OnNav(Ui::Nav::Right);
     const auto cfg = s.Current();
     menu.OnNav(Ui::Nav::Accept);
     check(g, "window size: next preset sets width and height together",
           cfg.window_width == 1600 && cfg.window_height == 900, fmt::format("{}x{}", cfg.window_width, cfg.window_height));
-    menu.Focus("display.fullscreen");
-    menu.OnNav(Ui::Nav::Accept);
+    menu.Focus("window.mode");
+    menu.OnNav(Ui::Nav::Left); // borderless -> windowed
     menu.Close(); // closed while asking: the safe side
     menu.Open();
     check(g, "closed during the confirmation: the display change is reverted",
           std::get<bool>(s.Get(*Find("display.fullscreen"))) && !menu.ConfirmPending(), "");
+    // the monitor: a list of the system's displays (with their size and refresh rate), confirmed as the others
+    {
+        auto e = env;
+        e.displays = {"DELL U2414H", "DELL U2414H (2)"};
+        e.display_labels = {"DELL U2414H — 1920 × 1080, 60 Гц (основной)", "DELL U2414H (2) — 2560 × 1440, 144 Гц"};
+        e.primary_label = e.display_labels[0];
+        menu.SetEnv(e);
+        const auto mons = menu.Options(*Find("display.monitor"));
+        menu.Focus("display.monitor");
+        menu.OnNav(Ui::Nav::Right);
+        const bool moved = menu.ConfirmPending() && s.Current().pc.monitor == "DELL U2414H";
+        menu.OnNav(Ui::Nav::Back); // Esc in the dialog: revert
+        check(g, "monitor: the displays listed with size and refresh rate (two of one model told apart), a change "
+                 "confirmed or reverted",
+              mons.size() == 3 && mons[2].label.find("144") != std::string::npos && moved &&
+                  s.Current().pc.monitor.empty() && !menu.ConfirmPending(),
+              mons.size() == 3 ? mons[0].label : "");
+        menu.SetEnv(env);
+    }
+    // the frames: vertical sync and the frame rate limit (no confirmation: nothing of the window changes)
+    {
+        auto e = env;
+        e.present_known = true;
+        e.present_immediate = false; // a surface without IMMEDIATE
+        e.present_mailbox = true;
+        e.present_supported = "FIFO, MAILBOX";
+        e.present_now = "MAILBOX";
+        menu.SetEnv(e);
+        const auto vs = menu.Options(*Find("display.presentMode"));
+        const bool fallback_said = vs.size() == 3 && vs[1].value == "immediate" &&
+                                   vs[1].label.find("Mailbox") != std::string::npos && vs[1].ok;
+        menu.Focus("display.presentMode");
+        menu.OnNav(Ui::Nav::Left); // (wraps) -> the previous choice
+        const bool changed = !menu.ConfirmPending() && s.Current().present_mode != "Mailbox";
+        menu.OnNav(Ui::Nav::Reset);
+        check(g, "vertical sync: on / off / off without tearing; Off says what this surface does instead; no "
+                 "confirmation; Del back to the default",
+              fallback_said && changed && s.Current().present_mode == "Mailbox", s.Current().present_mode);
+        menu.SetEnv(env);
+        const Desc& fl = *Find("display.frameRateLimit");
+        const auto lims = menu.Options(fl);
+        s.Set(fl, Value{std::string("75")});
+        const auto lims75 = menu.Options(fl);
+        menu.Focus("display.frameRateLimit");
+        menu.OnNav(Ui::Nav::Right); // from the file's 75 to the list's first
+        const bool stepped = s.Current().pc.frame_rate_limit != "75";
+        s.Reset(fl);
+        check(g, "frame rate limit: 40 and 50 offered, a file's 75 listed while chosen and left with the arrows",
+              std::ranges::any_of(lims, [](const auto& o) { return o.value == "40"; }) &&
+                  std::ranges::any_of(lims, [](const auto& o) { return o.value == "50"; }) &&
+                  std::ranges::none_of(lims, [](const auto& o) { return o.value == "75"; }) &&
+                  std::ranges::any_of(lims75, [](const auto& o) { return o.value == "75"; }) && stepped &&
+                  s.Current().pc.frame_rate_limit == "60",
+              s.Current().pc.frame_rate_limit);
+    }
+    // a file's exclusive full screen: shown as chosen, with why it is not offered; the arrows leave it
+    {
+        const Desc& fm = *Find("display.fullscreenMode");
+        const Desc& fs = *Find("display.fullscreen");
+        s.Set(fm, Value{std::string("exclusive")});
+        s.Set(fs, Value{true});
+        const auto modes = menu.WindowModeOptions();
+        const bool listed = modes.size() == 3 && modes[2].value == "exclusive" && !modes[2].ok && !modes[2].why.empty();
+        menu.Focus("window.mode");
+        menu.OnNav(Ui::Nav::Left); // exclusive -> borderless
+        menu.OnNav(Ui::Nav::Accept); // keep
+        check(g, "exclusive from the file: listed greyed with why; Left goes to borderless",
+              listed && s.Current().fullscreen && !s.Current().exclusive_fullscreen && !menu.ConfirmPending(), "");
+    }
 
     menu.Focus("reset.page");
     menu.OnNav(Ui::Nav::Accept);

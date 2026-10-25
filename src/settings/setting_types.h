@@ -55,6 +55,8 @@ constexpr u32 Dlss = 1u << 11;         // DLSS Super Resolution (GeForce RTX, NG
 constexpr u32 FsrFrameGen = 1u << 12;  // FSR 3.1 frame generation (amd_fidelityfx_vk.dll)
 constexpr u32 DlssFrameGen = 1u << 13; // DLSS Frame Generation (Streamline, GeForce RTX 40/50)
 constexpr u32 Reflex = 1u << 14;       // NVIDIA Reflex (VK_NV_low_latency2: GeForce, a recent driver)
+// R11 display: the native presenter replaces its swapchain for a new present mode while the game runs
+constexpr u32 PresentModeSwitch = 1u << 15;
 } // namespace Capability
 
 struct Choice {
@@ -92,6 +94,12 @@ struct Desc {
     bool legacy_parse = false;  // SecondSonPC.toml: parsed by LoadConfig's own code (keys older than this file)
     std::string_view requires_on; // another Bool setting's id that must be true for this one to matter
     bool own_row = true;          // false: the menu edits it through a combined row (window width + height)
+    // Apply::Live only in a run with all these Capability bits; in another run the setting applies from the next
+    // start (Service::EffectiveApply). 0: `apply` as it is.
+    u32 live_needs = 0;
+    // Choice: a value outside `choices` this accepts is valid too (SecondSonPC.toml / the user file: a frame rate
+    // limit of 75, a resolution of 1366x768); the menu lists it while it is the current value. nullptr: choices only.
+    bool (*accepts)(std::string_view value) = nullptr;
 };
 
 } // namespace SecondSon::Settings
