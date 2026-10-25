@@ -82,6 +82,11 @@ struct ExecutorStats {
     u64 meta_writes = 0, meta_writes_xor = 0, meta_writes_reading = 0; ///< compute writes of known targets' metadata
     u64 gpu_busy_ns = 0, gpu_batches_timed = 0; ///< the GPU's time executing batches (timestamps)
     u64 submit_ns = 0;                          ///< CPU time in vkQueueSubmit2
+    /// R11 t2 (docs/R11_T2.md): the time in Flush (every cause), the early submissions (SSPC_R11_EARLY_SUBMIT: batches
+    /// ended before they were full, their commands, the GPU's value read for it and the time that took) and the
+    /// batches handed to the submitter thread (SSPC_R11_ASYNC_SUBMIT)
+    u64 r11_flush_ns = 0, r11_early = 0, r11_early_checks = 0, r11_early_check_ns = 0, r11_early_commands = 0;
+    u64 r11_async = 0;
     u64 lds_dispatches = 0, lds_max_bytes = 0;  ///< dispatches with the emulated LDS buffer
     u64 diag_skipped_draws = 0, diag_skipped_dispatches = 0; ///< SSPC_DIAG_SKIP_DRAWS / _DISPATCHES (diagnostic)
     u64 merge_split_dispatches = 0; ///< the particle sort's dispatches recorded one width each (SplitMergeLevels)
@@ -418,6 +423,17 @@ public:
         Flush();
     }
     bool HasOpenWork() const { return open_ && commands_ > 0; }
+    /// R11 t2 (SSPC_R11_EARLY_SUBMIT=<min commands>[:<backlog>], off by default; docs/R11_T2.md): between two records -
+    /// the open main batch submitted now, before it is full, when it holds at least `min` commands and the GPU has at
+    /// most `backlog` main batches not completed (0: idle) - the GPU starts on what is recorded instead of waiting for
+    /// the rest of the batch. Where a full batch ends (the same state reset), never inside a draw or a run.
+    void R11EarlySubmitPoint() {
+        if (r11_early_min_ != 0 && open_ && commands_ >= r11_early_next_) {
+            R11EarlySubmitCheck();
+        }
+    }
+    /// R11: what the submitter thread reports for the async submissions (any thread; ms)
+    double R11AsyncSubmitMs() const { return static_cast<double>(r11_async_submit_ns_.load()) / 1e6; }
     bool Busy() const { return !in_flight_.empty(); }
     /// Waits up to `timeout_ns` for the oldest batch in flight; true when one completed.
     bool WaitOldest(u64 timeout_ns);
@@ -1308,6 +1324,31 @@ private:
     std::atomic<bool> eviction_due_{false}; ///< (FlipQueued / EvictionDue)
     bool flip_queued_ = false;              ///< FlipQueued is running Flip
     u64 batch_first_cmd_ = 0, batch_last_cmd_ = 0;
+
+    // R11 t2 (docs/R11_T2.md)
+    u32 r11_early_min_ = 0;     ///< SSPC_R11_EARLY_SUBMIT: the open batch's commands before the GPU is asked (0: off)
+    u32 r11_early_backlog_ = 0; ///< ... the main batches not completed it may still have
+    u64 r11_early_next_ = 0;    ///< commands_ at which the GPU's value is read next
+    void R11EarlySubmitCheck();
+    /// SSPC_R11_ASYNC_SUBMIT=1 (Emit::AsyncSubmit): a batch's vkQueueSubmit2 made by the submitter thread
+    bool r11_async_ = false;
+    struct R11SubmitJob {
+        Executor* self = nullptr;
+        VkQueue queue = VK_NULL_HANDLE;
+        u64 value = 0, flip_id = 0, open_t = 0;
+        u32 lane = 0, n_wait = 0, n_cb = 0, commands = 0, aq_wait = 0;
+        u16 aq_flags = 0;
+        VkSemaphoreSubmitInfo waits[3]{};
+        VkCommandBufferSubmitInfo cbis[2]{};
+        VkSemaphoreSubmitInfo signal{};
+    };
+    static void R11RunSubmit(void* ctx, const void* job);
+    std::atomic<u64> r11_async_submit_ns_{0}; ///< the submitter's time in vkQueueSubmit2
+    std::atomic<s32> r11_async_fail_{0};      ///< the first failed async submission's VkResult (0 none)
+    std::atomic<u64> r11_async_fail_value_{0};
+    bool r11_async_fail_reported_ = false;
+    /// a submitted value's submission (TSC: before the queue's lock, after the call) for the stall trace's GPU batches
+    std::array<std::array<std::atomic<u64>, 2>, 1024> r11_submit_t_{};
 
     // P4.8 Performance Inspector (SetInspector)
     const Inspector::Catalog* insp_catalog_ = nullptr;

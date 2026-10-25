@@ -5,6 +5,7 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <thread>
 #include <tuple>
@@ -63,6 +64,82 @@ std::atomic<u64> g_publishes{0}; ///< SSPC_VK_EMIT_BATCH: Publish's stores (unde
 
 void Bump(std::atomic<u64>& a, u64 v = 1) {
     a.fetch_add(v, std::memory_order_relaxed);
+}
+
+// ---- R11 t2: the submitter thread (SSPC_R11_ASYNC_SUBMIT=1, vk_emit.h)
+bool g_async = false;
+/// a job: called once the emitter passed `pos` (every entry put in the ring before the job was handed on)
+struct Job {
+    void (*fn)(void* ctx, const void* data) = nullptr;
+    void* ctx = nullptr;
+    u64 pos = 0;
+    alignas(16) u8 data[1024];
+};
+constexpr u64 kJobs = 64;
+Job* g_jobs = nullptr;               ///< kJobs of them, a ring
+std::mutex g_job_mu;                 ///< the producers' pushes (two producers may submit, never at once in practice)
+alignas(64) std::atomic<u64> g_job_w{0}; ///< pushed
+alignas(64) std::atomic<u64> g_job_r{0}; ///< run
+alignas(64) std::atomic<u32> g_sub_sleeping{0};
+std::atomic<u64> g_jobs_run{0}, g_job_lag_ticks{0}, g_job_lag_waits{0}, g_job_run_ticks{0}, g_job_full{0};
+std::atomic<u64> g_drain_timeouts{0};
+/// a deferred vkBeginCommandBuffer / vkEndCommandBuffer the driver refused (the first VkResult; the batch's submission
+/// is then refused too - Executor::R11RunSubmit)
+std::atomic<s32> g_cb_error{0};
+std::atomic<u64> g_cb_errors{0};
+
+void NoteCbError(const char* what, VkResult r) {
+    Bump(g_cb_errors);
+    s32 expected = 0;
+    if (g_cb_error.compare_exchange_strong(expected, static_cast<s32>(r))) {
+        SSPC_LOG(GPU, Error, "emitter thread (SSPC_R11_ASYNC_SUBMIT): {} failed (VkResult {}) - the batch is not submitted",
+                 what, static_cast<int>(r));
+    }
+}
+
+void SubmitterLoop() {
+    SetThreadDescription(GetCurrentThread(), L"SecondSonPC:GpuSubmit");
+    for (;;) {
+        const u64 r = g_job_r.load(std::memory_order_relaxed);
+        u64 w = g_job_w.load(std::memory_order_acquire);
+        if (w == r) {
+            const u64 t0 = __rdtsc();
+            // (~30 us hot, then asleep: a frame's batches come every ~1 ms - no core spent spinning between them)
+            while (w == r && __rdtsc() - t0 < 100'000) {
+                _mm_pause();
+                w = g_job_w.load(std::memory_order_acquire);
+            }
+            while (w == r) {
+                g_sub_sleeping.store(1, std::memory_order_seq_cst);
+                w = g_job_w.load(std::memory_order_seq_cst);
+                if (w == r) {
+                    g_job_w.wait(r, std::memory_order_seq_cst);
+                }
+                g_sub_sleeping.store(0, std::memory_order_relaxed);
+                w = g_job_w.load(std::memory_order_acquire);
+            }
+        }
+        Job& j = g_jobs[r % kJobs];
+        if (g_r.load(std::memory_order_acquire) < j.pos) { // (the emitter has not passed the batch's commands yet)
+            const u64 t0 = __rdtsc();
+            u32 spins = 0;
+            while (g_r.load(std::memory_order_acquire) < j.pos) {
+                if (++spins < 4096) {
+                    _mm_pause();
+                } else {
+                    SwitchToThread();
+                }
+            }
+            Bump(g_job_lag_waits);
+            Bump(g_job_lag_ticks, __rdtsc() - t0);
+        }
+        const u64 t1 = __rdtsc();
+        j.fn(j.ctx, j.data);
+        Bump(g_job_run_ticks, __rdtsc() - t1);
+        Bump(g_jobs_run);
+        g_job_r.store(r + 1, std::memory_order_seq_cst);
+        g_job_r.notify_all(); // (DrainSubmits, a producer waiting for a free job)
+    }
 }
 
 /// Waits until the emitter passed position `w` to the driver.
@@ -791,6 +868,57 @@ void VKAPI_CALL BeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri) {
     Commit();
 }
 
+// ---- R11 t2 (SSPC_R11_ASYNC_SUBMIT=1): a producer's command buffer begin / end through the ring (no Sync: the
+// submitter waits for the emitter instead); a non-producer's, or one with extension data, as before (Synced)
+void ReplayBeginCb(const u8* p) {
+    In in{p};
+    const auto cb = in.Get<VkCommandBuffer>();
+    const auto flags = in.Get<VkCommandBufferUsageFlags>();
+    const VkCommandBufferBeginInfo bi{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = flags};
+    if (const VkResult r = g_real.vkBeginCommandBuffer(cb, &bi); r != VK_SUCCESS) {
+        NoteCbError("vkBeginCommandBuffer", r);
+    }
+}
+VkResult VKAPI_CALL BeginCb(VkCommandBuffer cb, const VkCommandBufferBeginInfo* bi) {
+    if (!t_producer || bi == nullptr || bi->pNext != nullptr || bi->pInheritanceInfo != nullptr) {
+        Sync();
+        return g_real.vkBeginCommandBuffer(cb, bi);
+    }
+    Out o{Begin(&ReplayBeginCb, Sz<VkCommandBuffer>() + Sz<VkCommandBufferUsageFlags>())};
+    o.Put(cb), o.Put(bi->flags);
+    Commit();
+    return VK_SUCCESS;
+}
+void ReplayEndCb(const u8* p) {
+    In in{p};
+    const auto cb = in.Get<VkCommandBuffer>();
+    if (const VkResult r = g_real.vkEndCommandBuffer(cb); r != VK_SUCCESS) {
+        NoteCbError("vkEndCommandBuffer", r);
+    }
+}
+VkResult VKAPI_CALL EndCb(VkCommandBuffer cb) {
+    if (!t_producer) {
+        Sync();
+        return g_real.vkEndCommandBuffer(cb);
+    }
+    Out o{Begin(&ReplayEndCb, Sz<VkCommandBuffer>())};
+    o.Put(cb);
+    Commit();
+    return VK_SUCCESS;
+}
+/// The waits for the whole device / queue: the ring passed on, then the batches handed to the submitter submitted
+/// (a caller holding the queue's mutex must have drained them first - Backend's shutdown)
+VkResult VKAPI_CALL DeviceWaitIdleAsync(VkDevice device) {
+    Sync();
+    DrainSubmits();
+    return g_real.vkDeviceWaitIdle(device);
+}
+VkResult VKAPI_CALL QueueWaitIdleAsync(VkQueue queue) {
+    Sync();
+    DrainSubmits();
+    return g_real.vkQueueWaitIdle(queue);
+}
+
 } // namespace
 
 void Publish() {
@@ -818,6 +946,84 @@ void Sync() {
     // (and to the submissions) - what the other one put in the ring goes before this call
     Bump(g_syncs);
     WaitEmitted(g_w.load(std::memory_order_acquire));
+}
+
+bool AsyncSubmit() {
+    return g_async;
+}
+
+const Api& Real() {
+    return g_on ? g_real : Fn();
+}
+
+bool CanSubmitLater() {
+    return g_async && t_producer;
+}
+
+bool SubmitLater(void (*fn)(void* ctx, const void* data), void* ctx, const void* data, u32 bytes) {
+    if (!g_async || !t_producer || bytes > sizeof(Job::data)) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{g_job_mu};
+        const u64 w = g_job_w.load(std::memory_order_relaxed);
+        if (w - g_job_r.load(std::memory_order_acquire) >= kJobs) {
+            Bump(g_job_full);
+            Publish(); // (what the waiting jobs wait for)
+            for (u64 r = g_job_r.load(std::memory_order_acquire); w - r >= kJobs; r = g_job_r.load(std::memory_order_acquire)) {
+                g_job_r.wait(r, std::memory_order_acquire);
+            }
+        }
+        Job& j = g_jobs[w % kJobs];
+        j.fn = fn;
+        j.ctx = ctx;
+        std::memcpy(j.data, data, bytes);
+        // the ring's end now: every entry before the job (each complete under the lock - another producer's not yet
+        // published ones too), handed to the emitter here so the job never waits for that producer's next publish
+        while (g_lock.test_and_set(std::memory_order_acquire)) {
+            _mm_pause();
+        }
+        j.pos = g_wlocal;
+        g_w.store(g_wlocal, std::memory_order_seq_cst);
+        g_lock.clear(std::memory_order_release);
+        t_pending = false;
+        g_job_w.store(w + 1, std::memory_order_seq_cst);
+    }
+    if (g_sleeping.load(std::memory_order_seq_cst) != 0) {
+        g_w.notify_one();
+    }
+    if (g_sub_sleeping.load(std::memory_order_seq_cst) != 0) {
+        g_job_w.notify_one();
+    }
+    return true;
+}
+
+bool DrainSubmits(u64 timeout_ns) {
+    if (!g_async) {
+        return true;
+    }
+    const u64 target = g_job_w.load(std::memory_order_acquire);
+    const u64 t0 = __rdtsc();
+    const u64 limit = timeout_ns * 3; // (TSC ~3 GHz: a bound, not a measurement)
+    u32 spins = 0;
+    while (g_job_r.load(std::memory_order_acquire) < target) {
+        if (__rdtsc() - t0 > limit) {
+            Bump(g_drain_timeouts);
+            SSPC_LOG(GPU, Warning, "emitter thread (SSPC_R11_ASYNC_SUBMIT): the submitter did not reach job {} in {} ms "
+                                   "(the caller may hold the queue's mutex)", target, timeout_ns / 1'000'000);
+            return false;
+        }
+        if (++spins < 4096) {
+            _mm_pause();
+        } else {
+            SwitchToThread();
+        }
+    }
+    return true;
+}
+
+int RecordingError() {
+    return g_cb_error.load(std::memory_order_acquire);
 }
 
 void SetProducerThread() {
@@ -995,6 +1201,22 @@ bool Install(Api& f) {
     SSPC_EMIT_ORDERED(vkDestroyPipelineLayout)
     SSPC_EMIT_ORDERED(vkDestroyPipeline)
 #undef SSPC_EMIT_ORDERED
+    // R11 t2 (SSPC_R11_ASYNC_SUBMIT=1, off by default): a producer's begin / end through the ring, its batches
+    // submitted by the submitter thread (Executor::Flush); the waits for the whole device / queue drain it first
+    if (char a[4] = {}; GetEnvironmentVariableA("SSPC_R11_ASYNC_SUBMIT", a, sizeof(a)) == 1 && a[0] == '1') {
+        g_jobs = new (std::nothrow) Job[kJobs];
+        if (g_jobs != nullptr) {
+            g_async = true;
+            f.vkBeginCommandBuffer = &BeginCb;
+            f.vkEndCommandBuffer = &EndCb;
+            f.vkDeviceWaitIdle = &DeviceWaitIdleAsync;
+            f.vkQueueWaitIdle = &QueueWaitIdleAsync;
+            std::thread(SubmitterLoop).detach();
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R11_ASYNC_SUBMIT=1 - the recording thread's command buffer begin/end "
+                                   "go through the emitter's ring and its batches are submitted by the submitter thread "
+                                   "(in order, once the emitter passed their commands)");
+        }
+    }
     g_on = true;
     char b[4] = {};
     g_batch = GetEnvironmentVariableA("SSPC_VK_EMIT_BATCH", b, sizeof(b)) == 1 && b[0] == '1';
@@ -1018,7 +1240,14 @@ std::string Report() {
                        static_cast<double>(g_sync_ticks.load()) / 3.0e6, g_full_waits.load(), g_fallbacks.load(),
                        g_batch ? fmt::format("; SSPC_VK_EMIT_BATCH: the recording thread's published {} times",
                                              g_publishes.load())
-                               : std::string{});
+                               : std::string{}) +
+           (g_async ? fmt::format("; R11 SSPC_R11_ASYNC_SUBMIT: {} batches submitted by the submitter thread ({:.0f} ms "
+                                  "of its time), {} of them waited for the emitter ({:.0f} ms), jobs full {} times, "
+                                  "drains timed out {}, begin/end refused {}",
+                                  g_jobs_run.load(), static_cast<double>(g_job_run_ticks.load()) / 3.0e6,
+                                  g_job_lag_waits.load(), static_cast<double>(g_job_lag_ticks.load()) / 3.0e6,
+                                  g_job_full.load(), g_drain_timeouts.load(), g_cb_errors.load())
+                    : std::string{});
 }
 
 } // namespace SecondSon::Gpu::Vk::Emit

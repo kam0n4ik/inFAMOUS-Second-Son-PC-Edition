@@ -35,6 +35,7 @@
 #include "runtime/gpu/vulkan/vk_capture.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
+#include "runtime/gpu/vulkan/vk_emit.h"
 #include "runtime/gpu/vulkan/vk_formats.h"
 #include "runtime/gpu/vulkan/vk_image_cache.h"
 #include "runtime/gpu/vulkan/vk_presenter.h"
@@ -361,6 +362,21 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
         }
     }
     CmdTraceInit();
+    // R11 t2 (docs/R11_T2.md, off by default): SSPC_R11_EARLY_SUBMIT=<min commands>[:<backlog>] - the open main batch
+    // submitted between two records once it holds `min` commands and the GPU has at most `backlog` main batches not
+    // completed; SSPC_R11_ASYNC_SUBMIT=1 (vk_emit.h) - the batches' vkQueueSubmit2 made by the emitter's submitter
+    if (char v[32] = {}; GetEnvironmentVariableA("SSPC_R11_EARLY_SUBMIT", v, sizeof(v)) > 0) {
+        char* end = nullptr;
+        const unsigned long m = std::strtoul(v, &end, 10);
+        if (m >= 8) {
+            r11_early_min_ = static_cast<u32>(std::min<unsigned long>(m, options_.max_draws_per_batch));
+            r11_early_backlog_ = end != nullptr && *end == ':' ? static_cast<u32>(std::strtoul(end + 1, nullptr, 10)) : 0;
+            SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R11_EARLY_SUBMIT={} - a main batch is submitted before it is full "
+                                   "once it holds {} commands and the GPU has at most {} main batches not completed",
+                     v, r11_early_min_, r11_early_backlog_);
+        }
+    }
+    r11_async_ = Emit::AsyncSubmit();
     // FrameBreak AQ: the async compute lane (off by default)
     if (char v[8] = {}; GetEnvironmentVariableA("SSPC_FB_ASYNC_COMPUTE", v, sizeof(v)) == 1 && v[0] == '1') {
         if (ctx_.LaneQueue() == VK_NULL_HANDLE || !timeline_.EnableLane()) {
@@ -531,9 +547,12 @@ bool Executor::Begin() {
     if (reuse != free_.end()) {
         cur_ = std::move(*reuse);
         free_.erase(reuse);
-        f.vkResetCommandPool(ctx_.Device(), cur_.pool, 0);
+        // (R11 SSPC_R11_ASYNC_SUBMIT: a completed batch was submitted, so the emitter passed all of its commands long
+        // ago - its pools reset at once, not after the ring's newer entries as the Ordered thunks would)
+        const auto& reset = r11_async_ ? Emit::Real() : f;
+        reset.vkResetCommandPool(ctx_.Device(), cur_.pool, 0);
         if (cur_.descriptors != VK_NULL_HANDLE) {
-            f.vkResetDescriptorPool(ctx_.Device(), cur_.descriptors, 0);
+            reset.vkResetDescriptorPool(ctx_.Device(), cur_.descriptors, 0);
         }
     } else {
         cur_ = Batch{};
@@ -623,6 +642,7 @@ bool Executor::Begin() {
     }
     open_ = true;
     commands_ = 0;
+    r11_early_next_ = r11_early_min_; // (R11 SSPC_R11_EARLY_SUBMIT)
     rendering_ = false;
     label_open_ = false; // labels never span command buffers (Flush ends the open one)
     // a new command buffer: no dynamic state set yet - also what a draw sets only conditionally (the depth bias values
@@ -908,6 +928,12 @@ void Executor::Flush() {
     if (!open_) {
         return;
     }
+    // (R11: the recording thread's time in a flush, every cause - the batch end, the emitter's catch-up, the submission)
+    struct FlushTime {
+        u64& acc;
+        u64 t0;
+        ~FlushTime() { acc += GS::TicksToNs(GS::Ticks() - t0); }
+    } const flush_time{stats_.r11_flush_ns, GS::Ticks()};
     const auto& f = Fn();
     if (Failed()) { // never publish completion or recycle an unsubmitted batch
         f.vkEndCommandBuffer(cur_.cb);
@@ -1096,6 +1122,91 @@ void Executor::Flush() {
                                        .value = cur_.value,
                                        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     g_diag_submission.store(cur_.value, std::memory_order_relaxed);
+    // the batch in flight from here (both ways of submitting it)
+    const auto submitted = [this] {
+        if (diag_ != nullptr) {
+            diag_->Submitted(cur_.value, batch_first_cmd_, batch_last_cmd_, cur_.lane);
+        }
+        submitted_value_.store(cur_.value, std::memory_order_release);
+        if (aq_) {
+            (cur_.lane != 0 ? aq_last_lane_ : aq_last_main_) = cur_.value;
+            if (cur_.lane != 0) {
+                for (const u32 q : cur_.queues) {
+                    r10_q_lane_[q] = cur_.value; // (R10 SSPC_R10_AQ_MAIN_FREE)
+                }
+            }
+            ++(cur_.lane != 0 ? stats_.aq_lane_batches : stats_.aq_main_batches);
+        }
+        in_flight_.push_back(std::move(cur_));
+        cur_ = Batch{};
+        open_ = false;
+        commands_ = 0;
+    };
+    if (r11_async_ && Emit::CanSubmitLater()) {
+        // R11 SSPC_R11_ASYNC_SUBMIT: the submission handed to the submitter thread - made once the emitter passed this
+        // batch's commands (its End included), in the order of the jobs; its result checked there (R11RunSubmit). The
+        // batch is in flight now: nothing completes it but its semaphore value, which a refused submission never signals.
+        static_assert(sizeof(R11SubmitJob) <= 1024 && std::is_trivially_copyable_v<R11SubmitJob>);
+        R11SubmitJob job;
+        job.self = this;
+        job.queue = cur_.lane != 0 ? ctx_.LaneQueue() : ctx_.Queue();
+        job.value = cur_.value;
+        job.lane = cur_.lane;
+        job.flip_id = cur_.lane != 0 ? 0 : VideoOut::NextFlipId(); // (Reflex: the frame being recorded)
+        job.open_t = cur_.open_t;
+        job.commands = static_cast<u32>(commands_);
+        // the video memory the batch's commands need bound first (their own timeline): bound now, before the job
+        VkSemaphore bind_sem = VK_NULL_HANDLE;
+        u64 bind_value = 0;
+        if (buffers_.HasPendingBinds()) {
+            std::scoped_lock lock{ctx_.QueueMutex()};
+            buffers_.SubmitBinds(bind_sem, bind_value);
+        }
+        const bool bind_waited = bind_sem != VK_NULL_HANDLE;
+        if (aq_ && bind_sem == VK_NULL_HANDLE && buffers_.LastBindValue() != 0) {
+            bind_sem = buffers_.BindTimeline(); // (as below: the lane is not ordered behind them by the queue)
+            bind_value = buffers_.LastBindValue();
+        }
+        const auto wait_on = [&](VkSemaphore s, u64 v) {
+            job.waits[job.n_wait++] = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                                       .semaphore = s,
+                                       .value = v,
+                                       .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+        };
+        if (bind_sem != VK_NULL_HANDLE) {
+            wait_on(bind_sem, bind_value);
+        }
+        if (aq_wait_main != 0) {
+            wait_on(timeline_.Handle(), aq_wait_main);
+        }
+        if (aq_wait_lane != 0) {
+            wait_on(timeline_.LaneHandle(), aq_wait_lane);
+        }
+        job.n_cb = n_cb;
+        for (u32 i = 0; i < n_cb; ++i) {
+            job.cbis[i] = cbis[i];
+        }
+        job.signal = signal;
+        u16 qmask = 0;
+        for (const u32 q : cur_.queues) {
+            qmask |= q < 8 ? static_cast<u16>(1u << q) : u16{0x80};
+        }
+        job.aq_wait = static_cast<u32>(aq_wait_main != 0 ? aq_wait_main : aq_wait_lane);
+        job.aq_flags = static_cast<u16>(aq_why | (bind_waited ? StallTrace::kAqBinds : 0) | (qmask << 8));
+        if (cur_.lane != 0) {
+            timeline_.SubmittedOnLane(cur_.value); // (before its submission: a waiter finds it on the lane)
+        }
+        auto& st = r11_submit_t_[cur_.value & (r11_submit_t_.size() - 1)];
+        st[0].store(0, std::memory_order_relaxed);
+        st[1].store(0, std::memory_order_relaxed);
+        Emit::SubmitLater(&Executor::R11RunSubmit, nullptr, &job, sizeof(job));
+        ++stats_.r11_async;
+        submitted();
+        return;
+    }
+    if (r11_async_) {
+        Emit::DrainSubmits(); // (this thread submits itself: after every batch handed on - the timeline's order)
+    }
     VkResult r;
     const u64 submit_t0 = GS::Ticks();
     u64 locked_t = 0;
@@ -1187,26 +1298,91 @@ void Executor::Flush() {
         }
         return;
     }
-    if (diag_ != nullptr) {
-        diag_->Submitted(cur_.value, batch_first_cmd_, batch_last_cmd_, cur_.lane);
-    }
-    submitted_value_.store(cur_.value, std::memory_order_release);
-    if (aq_) {
-        (cur_.lane != 0 ? aq_last_lane_ : aq_last_main_) = cur_.value;
-        if (cur_.lane != 0) {
-            for (const u32 q : cur_.queues) {
-                r10_q_lane_[q] = cur_.value; // (R10 SSPC_R10_AQ_MAIN_FREE)
-            }
+    submitted();
+}
+
+void Executor::R11RunSubmit(void*, const void* data) {
+    // (the submitter thread: Emit's SubmitterLoop, once the emitter passed the batch's commands)
+    const R11SubmitJob& j = *static_cast<const R11SubmitJob*>(data);
+    Executor& e = *j.self;
+    VkResult r = static_cast<VkResult>(Emit::RecordingError()); // (a begin/end the driver refused: not submitted)
+    const u64 t0 = GS::Ticks();
+    u64 locked_t = t0;
+    bool contended = false;
+    if (r == VK_SUCCESS) {
+        std::unique_lock lock{e.ctx_.QueueMutex(), std::try_to_lock};
+        if (!lock.owns_lock()) {
+            contended = true; // (the present thread holds the queue)
+            lock.lock();
         }
-        ++(cur_.lane != 0 ? stats_.aq_lane_batches : stats_.aq_main_batches);
+        locked_t = GS::Ticks();
+        VkLatencySubmissionPresentIdNV latency{}; // (NVIDIA Reflex: the frame recorded when it was handed on)
+        const VkSubmitInfo2 si{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                               .pNext = j.lane != 0 ? nullptr : Reflex::SubmitChain(j.flip_id, latency),
+                               .waitSemaphoreInfoCount = j.n_wait,
+                               .pWaitSemaphoreInfos = j.waits,
+                               .commandBufferInfoCount = j.n_cb,
+                               .pCommandBufferInfos = j.cbis,
+                               .signalSemaphoreInfoCount = 1,
+                               .pSignalSemaphoreInfos = &j.signal};
+        r = e.ctx_.Failed() ? e.ctx_.Failure() : Emit::Real().vkQueueSubmit2(j.queue, 1, &si, VK_NULL_HANDLE);
     }
-    in_flight_.push_back(std::move(cur_));
-    cur_ = Batch{};
-    open_ = false;
-    commands_ = 0;
+    const u64 t1 = GS::Ticks();
+    e.r11_async_submit_ns_.fetch_add(GS::TicksToNs(t1 - t0), std::memory_order_relaxed);
+    auto& st = e.r11_submit_t_[j.value & (e.r11_submit_t_.size() - 1)];
+    st[0].store(t0, std::memory_order_relaxed);
+    st[1].store(t1, std::memory_order_release);
+    if (StallTrace::On()) {
+        if (contended) {
+            StallTrace::Span(StallTrace::Ev::QueueLock, t0, locked_t, j.value);
+        }
+        StallTrace::Span(StallTrace::Ev::Submit, locked_t, t1, j.value, j.commands);
+        StallTrace::Span(StallTrace::Ev::AqSubmit, j.open_t != 0 ? j.open_t : locked_t, t1, j.value, j.aq_wait,
+                         j.aq_flags);
+    }
+    if (r != VK_SUCCESS) {
+        s32 expected = 0;
+        if (e.r11_async_fail_.compare_exchange_strong(expected, static_cast<s32>(r))) {
+            e.r11_async_fail_value_.store(j.value, std::memory_order_release);
+            SSPC_LOG(GPU, Error, "native backend: vkQueueSubmit2 failed on the submitter thread (VkResult {}, value {}); "
+                                 "no completion will be published (SSPC_R11_ASYNC_SUBMIT)",
+                     static_cast<int>(r), j.value);
+        }
+        e.ctx_.Fail("vkQueueSubmit2 (R11 submitter)", r);
+    }
+}
+
+void Executor::R11EarlySubmitCheck() {
+    r11_early_next_ = commands_ + 16; // (the GPU's value read every 16 commands at most)
+    // the main queue's batches only: a batch with graphics work (a compute-only one may go to the lane at its end)
+    if (cur_.lane != 0 || cur_.work[Cp::kGraphicsQueue] == 0) {
+        return;
+    }
+    const u64 t0 = GS::Ticks();
+    ++stats_.r11_early_checks;
+    const u64 done = aq_ ? timeline_.QueryMain() : timeline_.QueryCompleted();
+    u32 backlog = 0;
+    for (const Batch& b : in_flight_) {
+        backlog += b.lane == 0 && !b.done && b.value > done ? 1 : 0;
+    }
+    stats_.r11_early_check_ns += GS::TicksToNs(GS::Ticks() - t0);
+    if (backlog > r11_early_backlog_) {
+        return;
+    }
+    ++stats_.r11_early;
+    stats_.r11_early_commands += commands_;
+    run_ok_ = false; // (as at a full batch's end)
+    Flush();
 }
 
 void Executor::Poll() {
+    if (r11_async_ && !r11_async_fail_reported_ && r11_async_fail_.load(std::memory_order_acquire) != 0) {
+        // R11 SSPC_R11_ASYNC_SUBMIT: the submitter thread's refused submission reported here (the executor's thread)
+        r11_async_fail_reported_ = true;
+        if (r11_async_fail_.load(std::memory_order_relaxed) == VK_ERROR_DEVICE_LOST) {
+            OnDeviceLost("vkQueueSubmit2 (R11 submitter)", r11_async_fail_value_.load(std::memory_order_acquire));
+        }
+    }
     if (Failed()) {
         return;
     }
@@ -1315,6 +1491,11 @@ void Executor::Retire(Batch& b) {
                     if (mine.size() > 32) {
                         mine.pop_front();
                     }
+                }
+                if (r11_async_ && b.submit_t1 == 0) { // (R11: submitted by the submitter thread)
+                    const auto& st = r11_submit_t_[b.value & (r11_submit_t_.size() - 1)];
+                    b.submit_t1 = st[1].load(std::memory_order_acquire);
+                    b.submit_t0 = st[0].load(std::memory_order_relaxed);
                 }
                 StallTrace::GpuBatch(b.value, b.submit_t0, b.submit_t1, ts[0], ts[1], b.trace_frame,
                                      b.lane != 0 ? 1u : 0u); // (P4.12; R10: the lane)
