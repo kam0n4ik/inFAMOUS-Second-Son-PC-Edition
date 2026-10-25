@@ -487,6 +487,8 @@ private:
     bool nodrain_wait_ = false; ///< SSPC_CP_ROUND_NODRAIN=2
     u64 nodrain_rounds_ = 0;
     std::vector<std::pair<u32, u64>> completions_;
+    bool r11_fast_label_ = false;     ///< R11 SSPC_R11_FAST_LABEL=1 (needs CP-9)
+    u64 r11_mid_slice_applies_ = 0;   ///< ... completions applied between packets (the GPU thread)
     /// Thread 1: the queues' completions the executor kept (CP-9) handed to the processor (labels written).
     void ApplyCompletions() {
         if (nodrain_ && executor_->TakeCompletions(completions_)) {
@@ -857,6 +859,20 @@ bool Backend::Start(const Options& o, std::string& error) {
             executor_->SetDeferCompletions(true);
             SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_CP_ROUND_NODRAIN=1 - the processor's round ends without draining "
                                    "the recording thread (it polls the GPU in stream order)");
+            // R11 (docs/R11_MAIN_THREAD.md): SSPC_R11_FAST_LABEL=1 - a completed batch's labels sooner: the recording
+            // thread polls between its records (every SSPC_R11_FAST_LABEL_US, 100), this thread hands the kept
+            // completions to the processor between packets (not only between the queues' slices)
+            if (char f[4] = {}; GetEnvironmentVariableA("SSPC_R11_FAST_LABEL", f, sizeof(f)) == 1 && f[0] == '1') {
+                char u[16] = {};
+                const u64 us = GetEnvironmentVariableA("SSPC_R11_FAST_LABEL_US", u, sizeof(u)) > 0
+                                   ? std::clamp<u64>(std::strtoull(u, nullptr, 10), 10, 10'000)
+                                   : 100;
+                parallel_->SetR11FastPoll(us * std::max<u64>(Kernel::Clock::TscFrequency() / 1'000'000, 1));
+                r11_fast_label_ = true;
+                SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R11_FAST_LABEL=1 - the recording thread polls the GPU between "
+                                       "its records (every {} us), the processor writes the completed labels between "
+                                       "packets", us);
+            }
         }
         if (po.async_writes) {
             SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_CP_ASYNC_WRITES=1 - WRITE_DATA / fills and GDS DMA on the timeline "
@@ -1474,6 +1490,10 @@ void Backend::Loop() {
                 const Cp::StepStatus st = cp_->Step(q);
                 if (st == Cp::StepStatus::Packet) {
                     progress = true;
+                    if (r11_fast_label_ && executor_->CompletionsReady()) {
+                        ++r11_mid_slice_applies_;
+                        ApplyCompletions(); // (R11: between packets - the labels thread 2 just polled)
+                    }
                     continue;
                 }
                 if (st == Cp::StepStatus::Blocked) {
@@ -2597,6 +2617,11 @@ std::string Backend::Report() {
             }
             if (nodrain_) {
                 out += fmt::format("round ends without a drain (CP-9, SSPC_CP_ROUND_NODRAIN): {}\n", nodrain_rounds_);
+            }
+            if (r11_fast_label_) {
+                out += fmt::format("R11 fast labels (SSPC_R11_FAST_LABEL): recording thread polls that collected {}, "
+                                   "completions applied between packets {}\n", parallel_->R11Polls(),
+                                   r11_mid_slice_applies_);
             }
             if (executor_ && executor_->AsyncLane()) {
                 const auto& es = executor_->Stats();

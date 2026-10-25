@@ -54,4 +54,9 @@ bool InstallEarlySubmitFromEnvironment(u64 eboot_base);
 /// (docs/R9_REA3_FIX.md). After InstallCriticalComputeFromEnvironment and InstallEarlySubmitFromEnvironment.
 bool InstallDeferComputeWaitFromEnvironment(u64 eboot_base);
 
+/// R11 (SSPC_R11_LABEL_WAIT=1, off by default; docs/R11_MAIN_THREAD.md): the async compute wait 0x1695e0 (the replacement
+/// above, installed here when nothing else did) sleeps on its label (Gpu::LabelWait) instead of the game's rdtsc spin
+/// delay(50): Game:Main leaves the CPU while it waits. After InstallDeferComputeWaitFromEnvironment.
+bool InstallLabelWaitFromEnvironment(u64 eboot_base);
+
 } // namespace SecondSon::Engine::Render::Trace

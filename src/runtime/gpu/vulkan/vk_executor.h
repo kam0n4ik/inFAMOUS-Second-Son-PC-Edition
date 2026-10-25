@@ -391,6 +391,9 @@ public:
     /// Completed batches -> CommandProcessor::CompleteWork (in order), resources released. The GPU thread, outside
     /// CommandProcessor::Run.
     void Poll();
+    /// R11 (SSPC_R11_FAST_LABEL): Poll when the oldest batch in flight completed (one timeline query otherwise); true
+    /// when it polled. The executor's thread, between records.
+    bool PollIfCompleted();
     /// FrameBreak CP-9 (SSPC_CP_ASYNC_WRITES): what WriteOnTimeline / GdsOnTimeline refuse by their shape alone (any
     /// thread: nothing but the GDS buffer's size, fixed); the rest of their refusals (an import) only when they run.
     static bool TimelineWriteShapeOk(u64 dst, u64 bytes) {
