@@ -79,6 +79,7 @@ struct State {
     std::vector<std::string> displays, audio_devices;
     std::vector<std::string> display_labels; // R11: the displays as the Monitor list shows them
     std::string primary_label;
+    std::string present_now; // R11: the presenter's mode the menu last saw (redrawn when it changes)
     std::vector<std::pair<u32, u32>> window_sizes;
     std::string fsr_why; // FSR 3.1 cannot run: its DLL is not next to the exe (looked at when the menu opens)
     // PC Edition: the PC settings are an entry of the game's own Settings screen (Esc / Options during play)
@@ -246,7 +247,7 @@ SDL_DisplayID FindDisplay(const std::string& name) {
 }
 
 /// R11: a display as the Monitor list shows it: "<name> — 1920 × 1080, 165 Hz (primary)".
-std::string DisplayLabel(SDL_DisplayID id, const std::string& name, bool ru) {
+std::string DisplayLabel(SDL_DisplayID id, const std::string& name, bool ru, bool mark_primary = true) {
     const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(id);
     std::string label = name;
     if (m != nullptr && m->w > 0 && m->h > 0) {
@@ -256,7 +257,7 @@ std::string DisplayLabel(SDL_DisplayID id, const std::string& name, bool ru) {
         label += m->refresh_rate > 0 ? fmt::format(" — {} × {}, {:.0f} {}", w, h, m->refresh_rate, ru ? "Гц" : "Hz")
                                      : fmt::format(" — {} × {}", w, h);
     }
-    if (id == SDL_GetPrimaryDisplay()) {
+    if (mark_primary && id == SDL_GetPrimaryDisplay()) {
         label += ru ? " (основной)" : " (primary)";
     }
     return label;
@@ -517,6 +518,13 @@ void OnTimer(void*) {
         SendNav(*st.held_nav);
         st.next_repeat_ns = now + kRepeatPeriodNs;
         st.dirty = true;
+    }
+    if ((Settings::Instance().Capabilities() & Settings::Capability::PresentModeSwitch) != 0) {
+        // R11: the vertical sync row's "Now:" - the presenter switches at its next present, after the render of the
+        // change: drawn again once its swapchain's mode is another
+        const std::string now_mode = Gpu::Native::GetPresentModes().current;
+        st.dirty = st.dirty || now_mode != st.present_now;
+        st.present_now = now_mode;
     }
     if (st.menu->TakeCloseRequest()) {
         Menu().Close();
@@ -966,7 +974,7 @@ void MenuController::Open() {
         st.displays.push_back(name);
         st.display_labels.push_back(DisplayLabel(id, name, Ru(Settings::Instance().Current())));
         if (id == SDL_GetPrimaryDisplay()) {
-            st.primary_label = st.display_labels.back();
+            st.primary_label = DisplayLabel(id, name, Ru(Settings::Instance().Current()), false); // ("Primary - <it>")
         }
     }
     st.audio_devices = AudioDeviceNames();

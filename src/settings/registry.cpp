@@ -327,17 +327,13 @@ void Build(Registry& r) {
         .id = "display.presentMode", .table = "Display", .key = "presentMode", .category = Category::Display,
         .type = Type::Choice, .apply = Apply::Live, .needs = Capability::Window,
         .choices = kPresentModes, .en = "Vertical sync", .ru = "Вертикальная синхронизация",
-        .help_en = "On: a frame waits for the display's refresh (Vulkan FIFO) - no tearing, at most the refresh rate. "
-                   "Off: shown at once (IMMEDIATE) - tearing possible, no limit; where the display does not offer it, "
-                   "Mailbox is used. Off, without tearing: the newest frame at the next refresh (MAILBOX), the frame "
-                   "rate not limited by the display. The Frame rate limit applies in every mode. SecondSonPC's own "
-                   "backend applies it at once (the swapchain is recreated); the shadPS4 bridge after a restart.",
-        .help_ru = "«Вкл.» — кадр ждёт обновления монитора (Vulkan FIFO): без разрывов, не выше частоты монитора. "
-                   "«Выкл.» — кадр показывается сразу (IMMEDIATE): возможны разрывы, без ограничения; если монитор "
-                   "этого не поддерживает, используется Mailbox. «Выкл., без разрывов» — новейший кадр на ближайшем "
-                   "обновлении (MAILBOX), частота кадров монитором не ограничивается. «Ограничение FPS» действует в "
-                   "любом режиме. Собственный бэкенд SecondSonPC применяет сразу (swapchain пересоздаётся), мост "
-                   "shadPS4 — после перезапуска.",
+        .help_en = "On (FIFO): no tearing, at most the display's refresh rate. Off (IMMEDIATE): frames at once, tearing "
+                   "possible; Mailbox where the display lacks it. Off without tearing (MAILBOX): the newest frame at "
+                   "each refresh. The FPS limit works in every mode. Applies at once (shadPS4 bridge: after a restart).",
+        .help_ru = "«Вкл.» (FIFO) — без разрывов, не выше частоты монитора. «Выкл.» (IMMEDIATE) — кадр сразу, "
+                   "возможны разрывы; если монитор не поддерживает — Mailbox. «Выкл., без разрывов» (MAILBOX) — "
+                   "новейший кадр на каждом обновлении. Ограничение FPS работает в любом режиме. Применяется сразу "
+                   "(мост shadPS4 — после перезапуска).",
         .get = [](const Config& c, const Desc&) -> Value {
             return std::string(c.present_mode == "Fifo" ? "fifo" : c.present_mode == "Immediate" ? "immediate"
                                                                                                     : "mailbox");
