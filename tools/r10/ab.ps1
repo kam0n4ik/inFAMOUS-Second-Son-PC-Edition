@@ -65,6 +65,7 @@ foreach ($sc in $Scenes.Split(',', [StringSplitOptions]::RemoveEmptyEntries)) {
                 $envs = "$Base;$($c.Env)".Trim(';')
                 switch ($scene) {
                     "user"  { & "$Worktree\tools\r9\r9run.ps1" -Worktree $Worktree -Tag $tag -Route look -Scene user -Env $envs -Out $dir | Out-Null; $w = 40, 100 }
+                    "calm"  { & "$Worktree\tools\r9\r9run.ps1" -Worktree $Worktree -Tag $tag -Route calm -Scene user -Env $envs -Out $dir | Out-Null; $w = 45, 118 }
                     "fight" { & "$Worktree\tools\r9\r9run.ps1" -Worktree $Worktree -Tag $tag -Route fight -Scene city -Env $envs -Out $dir | Out-Null; $w = 45, 140 }
                     "city"  { & "$Worktree\tools\r9\r9run.ps1" -Worktree $Worktree -Tag $tag -Route traverse -Scene city -Env $envs -Out $dir | Out-Null; $w = 45, 140 }
                     "neon"  { & "$Worktree\tools\r9\r9run.ps1" -Worktree $Worktree -Tag $tag -Route neon -Scene neon -Env $envs -Out $dir | Out-Null; $w = 42, 133 }
