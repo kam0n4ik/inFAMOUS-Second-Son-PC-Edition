@@ -64,6 +64,10 @@ std::atomic<bool> g_dof_on{true};
 bool g_dof_written = false; // the flag is ours (the game never writes it): cleared again when DOF comes back on
 // SSPC_POSTFX_DIAG
 bool g_diag_bloom = false, g_diag_vignette = false, g_diag_depth_blur = false;
+bool g_diag_mb_flip = false, g_diag_dof_flip = false; // motion blur skipped on every other MotionBlurPass call (A/B of neighbouring frames)
+bool g_diag_mb_cycle = false; // MotionBlurPass calls cycle: skipped / the set strength / 100 % (neighbouring frames)
+float g_raw_exposure = 0.0f;  // the blended exposure before the strength (mbcycle)
+std::atomic<u64> g_mb_calls{0};
 // which settings an environment variable fixed (the menu does not change those)
 bool g_env_mb = false, g_env_strength = false, g_env_grain = false, g_env_dof = false;
 
@@ -129,6 +133,7 @@ SSPC_SYSV_ABI void BlendProbe(u64 overrides) {
     if (*exposure > 0.0f) {
         g_count.exposure_frames.fetch_add(1, std::memory_order_relaxed);
         Max(g_count.exposure_max, *exposure);
+        g_raw_exposure = *exposure;
         *exposure = ScaleExposure(*exposure, g_mb_strength.load(std::memory_order_relaxed));
     }
     float* grain = At<float>(kFilmGrain);
@@ -145,7 +150,10 @@ SSPC_SYSV_ABI void BlendProbe(u64 overrides) {
         g_count.dof_frames.fetch_add(1, std::memory_order_relaxed);
         Max(g_count.dof_max, dof);
     }
-    if (!g_dof_on.load(std::memory_order_relaxed)) {
+    if (g_diag_dof_flip) {
+        *At<u8>(kDofDisabled) = (g_count.frames.load(std::memory_order_relaxed) & 1) != 0 ? 1 : 0;
+        g_dof_written = true;
+    } else if (!g_dof_on.load(std::memory_order_relaxed)) {
         *At<u8>(kDofDisabled) = 1;
         g_dof_written = true;
     } else if (g_dof_written) {
@@ -175,9 +183,26 @@ SSPC_SYSV_ABI void BlendProbe(u64 overrides) {
 SSPC_SYSV_ABI void MotionBlurProbe(u64 targets, u64 context, u64 camera) {
     const bool would_run = camera != 0 && *reinterpret_cast<const s32*>(camera + kCameraSkip) == 0 &&
                            *At<u8>(kMotionBlurOff) == 0 && *At<float>(kExposure) > 0.0f;
+    if (would_run && g_diag_mb_cycle && g_mb_on.load(std::memory_order_relaxed)) {
+        const u64 k = g_mb_calls.fetch_add(1, std::memory_order_relaxed) % 3;
+        if (k == 0) {
+            g_count.mb_skipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        g_count.mb_run.fetch_add(1, std::memory_order_relaxed);
+        float* exposure = At<float>(kExposure);
+        const float set = *exposure;
+        if (k == 2) {
+            *exposure = g_raw_exposure; // the game's own length for this frame's blur only (pass 29 already ran)
+        }
+        g_motion_blur(targets, context, camera);
+        *exposure = set;
+        return;
+    }
     if (!would_run) {
         g_count.mb_idle.fetch_add(1, std::memory_order_relaxed);
-    } else if (!g_mb_on.load(std::memory_order_relaxed)) {
+    } else if (!g_mb_on.load(std::memory_order_relaxed) ||
+               (g_diag_mb_flip && (g_mb_calls.fetch_add(1, std::memory_order_relaxed) & 1) != 0)) {
         g_count.mb_skipped.fetch_add(1, std::memory_order_relaxed);
         return; // the game's own path at exposure 0: nothing recorded
     } else {
@@ -282,9 +307,15 @@ bool Install(u64 eboot_base, const Options& options) {
         g_diag_bloom = d.find("bloom") != std::string::npos;
         g_diag_vignette = d.find("vignette") != std::string::npos;
         g_diag_depth_blur = d.find("depthblur") != std::string::npos;
-        SSPC_LOG(Engine, Warning, "DIAGNOSTICS: SSPC_POSTFX_DIAG={} - zeroed after the blend:{}{}{}", d,
+        g_diag_mb_flip = d.find("mbflip") != std::string::npos;
+        g_diag_dof_flip = d.find("dofflip") != std::string::npos;
+        g_diag_mb_cycle = d.find("mbcycle") != std::string::npos;
+        SSPC_LOG(Engine, Warning, "DIAGNOSTICS: SSPC_POSTFX_DIAG={} - zeroed after the blend:{}{}{}{}{}{}", d,
                  g_diag_bloom ? " bloom scale" : "", g_diag_vignette ? " vignette scale" : "",
-                 g_diag_depth_blur ? " depth blur strength" : "");
+                 g_diag_depth_blur ? " depth blur strength" : "",
+                 g_diag_mb_flip ? "; motion blur on every other frame" : "",
+                 g_diag_dof_flip ? "; depth of field on every other frame" : "",
+                 g_diag_mb_cycle ? "; motion blur cycles off / the strength / 100 %" : "");
     }
 
     std::string error;
@@ -350,14 +381,6 @@ void SetMotionBlurStrength(u32 percent) {
     }
     g_mb_strength.store(std::clamp<u32>(percent, 10, 100), std::memory_order_relaxed);
     SSPC_LOG(Engine, Info, "Post effects: motion blur strength {}%", g_mb_strength.load());
-}
-
-void SetFilmGrain(bool on) {
-    if (g_env_grain) {
-        return;
-    }
-    g_grain_on.store(on, std::memory_order_relaxed);
-    SSPC_LOG(Engine, Info, "Post effects: film grain {}", on ? "on" : "off");
 }
 
 void SetDepthOfField(bool on) {

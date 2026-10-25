@@ -43,7 +43,6 @@ struct PcSettings {
     // the game's own
     bool motion_blur = true;
     u32 motion_blur_strength = 100; // 10..100 %: the game's blur length scaled
-    bool film_grain = true;
     bool depth_of_field = true;
     // [Graphics] upscaling and frame generation (native backend; docs/UPSCALING_FRAME_GENERATION.md)
     std::string upscaler = "off";            // "off" | "dlss" | "fsr"

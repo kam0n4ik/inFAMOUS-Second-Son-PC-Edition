@@ -536,15 +536,7 @@ void Build(Registry& r) {
         },
         .requires_on = "graphics.motionBlur",
     });
-    v.push_back(Desc{
-        .id = "graphics.filmGrain", .table = "Graphics", .key = "filmGrain", .category = Category::Graphics,
-        .type = Type::Bool, .apply = Apply::Live, .en = "Film grain", .ru = "Зернистость",
-        .help_en = "The game's own film grain, which some places and scenes add. Off: none. Applies at once.",
-        .help_ru = "Собственная зернистость игры («плёнка»), которую добавляют некоторые места и сцены. «Выкл.» — без "
-                   "неё. Применяется сразу.",
-        .get = [](const Config& c, const Desc&) -> Value { return c.pc.film_grain; },
-        .set = [](Config& c, const Desc&, const Value& x) { c.pc.film_grain = std::get<bool>(x); },
-    });
+    // (film grain: the pass and its parameter exist, but no place played so far sets it - not offered; R11_POSTFX.md)
     v.push_back(Desc{
         .id = "graphics.depthOfField", .table = "Graphics", .key = "depthOfField", .category = Category::Graphics,
         .type = Type::Bool, .apply = Apply::Live, .en = "Depth of field", .ru = "Глубина резкости",

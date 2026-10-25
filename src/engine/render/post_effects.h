@@ -19,14 +19,17 @@
 //   [Graphics] motionBlur = true|false   off: MotionBlurPass is not run (entry probe returns before it - the game's
 //                                        own path at exposure 0); the exposure itself stays, so the velocity pass,
 //                                        SMAA T2x and the upscalers see what they always saw.
-//   [Graphics] motionBlurStrength = 25..100 (%)  the blended exposure scaled after the blend (blur length).
-//   [Graphics] filmGrain = true|false    off: the blended film_grain set to 0 after the blend.
+//   [Graphics] motionBlurStrength = 10..100 (%)  the blended exposure scaled after the blend (blur length; never to 0).
+//   film grain (SSPC_POSTFX_FILM_GRAIN=0 only, not a setting: no place played so far sets film_grain > 0)
+//                                        off: the blended film_grain set to 0 after the blend.
 //   [Graphics] depthOfField = true|false off: the engine's DOF-disable flag 0x7dfc300 set.
 //
 //   SSPC_POSTFX_MOTION_BLUR=0|1, SSPC_POSTFX_MB_STRENGTH=<%>, SSPC_POSTFX_FILM_GRAIN=0|1, SSPC_POSTFX_DOF=0|1
 //                                        override the settings (automated runs)
 //   SSPC_POSTFX_STATS=<seconds>          a log line with the blended values and the passes run every <seconds>
-//   SSPC_POSTFX_DIAG=bloom,vignette,depthblur  DIAGNOSTICS: those parameters zeroed after the blend (A/B only)
+//   SSPC_POSTFX_DIAG=bloom,vignette,depthblur,mbflip,dofflip,mbcycle  DIAGNOSTICS: those parameters zeroed after the
+//                                        blend; mbflip / dofflip: motion blur / depth of field off on every other
+//                                        frame; mbcycle: frames cycle off / the strength / 100 % (neighbouring A/B)
 //   SSPC_POSTFX_HOOK=0                   no probe at all (the game's own everything)
 #pragma once
 
@@ -48,7 +51,6 @@ bool Install(u64 eboot_base, const Options& options);
 /// Changes from the settings menu: take effect at the game's next frame.
 void SetMotionBlur(bool on);
 void SetMotionBlurStrength(u32 percent);
-void SetFilmGrain(bool on);
 void SetDepthOfField(bool on);
 
 /// The exposure after the strength (pure; the self-test checks it): `exposure` the blended one, `percent` 0..100.

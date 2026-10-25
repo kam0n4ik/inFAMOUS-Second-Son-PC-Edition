@@ -150,8 +150,6 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
                 Engine::Render::PostFx::SetMotionBlur(c.pc.motion_blur); // the game's post effects, either backend
             } else if (d->id == "graphics.motionBlurStrength") {
                 Engine::Render::PostFx::SetMotionBlurStrength(c.pc.motion_blur_strength);
-            } else if (d->id == "graphics.filmGrain") {
-                Engine::Render::PostFx::SetFilmGrain(c.pc.film_grain);
             } else if (d->id == "graphics.depthOfField") {
                 Engine::Render::PostFx::SetDepthOfField(c.pc.depth_of_field);
             } else if (d->id == "graphics.renderScale" && !bridge_presenter) {
