@@ -121,6 +121,7 @@ add_library(sspc_runtime STATIC
     src/runtime/gpu/upscale/upscalers.cpp
     src/runtime/gpu/upscale/fsr_framegen.cpp
     src/runtime/gpu/vulkan/vk_executor_upscale.cpp
+    src/runtime/gpu/vulkan/vk_executor_r11.cpp
     src/runtime/gpu/host_shaders.cpp
     src/runtime/gpu/image_layout.cpp
     src/runtime/gpu/native_backend.cpp

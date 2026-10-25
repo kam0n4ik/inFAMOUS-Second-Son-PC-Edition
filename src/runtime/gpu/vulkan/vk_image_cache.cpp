@@ -986,6 +986,11 @@ bool ImageCache::Transition(VkCommandBuffer cb, CachedImage& img, VkImageLayout 
     const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
                                .pImageMemoryBarriers = &b};
     Fn().vkCmdPipelineBarrier2(cb, &dep);
+    if (rec_value_ != 0) { // (R11 SSPC_R11_AQ_IMAGES: the lane batches that sampled it run before this barrier)
+        img.barrier_value = rec_value_;
+        img.barrier_lane = rec_lane_;
+        lane_wait_ = !rec_lane_ ? std::max(lane_wait_, img.lane_use) : lane_wait_;
+    }
     img.current = layout;
     img.stage = stage;
     img.access = access;

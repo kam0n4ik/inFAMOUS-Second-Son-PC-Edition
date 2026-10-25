@@ -2611,6 +2611,7 @@ std::string Backend::Report() {
                                        "{}, of them behind an earlier batch than the queue's last {}, already complete {}\n",
                                        es.r10_held_exact, es.r10_held_earlier, es.r10_held_complete);
                 }
+                out += executor_->R11DiagReport(); // (R11 neon: SSPC_R11_DIAG_AQ=1)
             }
         }
         out += fmt::format("barriers kept by ranges: off {}, unknown write pending {}, own unknown access {}, too many "

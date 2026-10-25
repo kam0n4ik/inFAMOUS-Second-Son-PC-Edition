@@ -413,6 +413,15 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
                 SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R10_AQ_MAIN_FREE=1 - a main batch waits only for the lane batches "
                                        "it conflicts with or a guest wait was met by, not for every lane batch before it");
             }
+            if (char ai[4] = {}; GetEnvironmentVariableA("SSPC_R11_AQ_IMAGES", ai, sizeof(ai)) == 1 && ai[0] == '1') {
+                if (aq_family_) {
+                    r11_aq_images_ = true; // (R11 neon, vk_executor.h)
+                    SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R11_AQ_IMAGES=1 - compute dispatches that only sample clean "
+                                           "uploaded textures already in their layout may run on the async compute lane");
+                } else {
+                    SSPC_LOG(GPU, Warning, "SSPC_R11_AQ_IMAGES=1 needs the lane on the compute family: off");
+                }
+            }
             buffers_.DisableLazy(); // (FB-7's kept-back write-backs stay on the main queue: not with the lane)
             char sp[16] = {};
             if (GetEnvironmentVariableA("SSPC_FB_ASYNC_SPLIT", sp, sizeof(sp)) > 0) {
@@ -425,6 +434,7 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
                      "compute: {}; the lane on the {} family",
                      aq_split_ == 0 ? "never" : aq_split_ == 1 ? "while the game waits" : "always",
                      aq_family_ ? "compute" : "main");
+            R11DiagInit(); // (R11 neon: SSPC_R11_DIAG_AQ, vk_executor_r11.cpp)
         }
     }
 }
@@ -570,9 +580,15 @@ bool Executor::Begin() {
     cur_.aq_main = cur_.aq_wait_all = cur_.aq_images = cur_.aq_gds = cur_.aq_overflow = false;
     cur_.aq_lds = 0;
     cur_.aq_ranges.clear();
+    cur_.r11_gds.clear(); // (R11 diagnostics)
+    cur_.r11_ovf = 0;
+    cur_.r11_epoch.clear();
     cur_.done = false;
     cur_.aq_unreported.reset();
     cur_.value = timeline_.Next();
+    if (r11_aq_images_) {
+        images_.SetRecording(cur_.value, cur_.pool_lane != 0); // (R11: the images' barriers' batch)
+    }
     cur_.trace_frame = StallTrace::CurrentFrame(); // (P4.12)
     cur_.open_t = StallTrace::On() ? StallTrace::Now() : 0; // (R10: AqSubmit's start)
     cur_.submit_t0 = cur_.submit_t1 = 0;
@@ -645,6 +661,15 @@ void Executor::Note(u32 queue, u64 seq) {
     if (queue >= Cp::kNumQueues) {
         return;
     }
+    if (r11_diag_ != nullptr) {
+        // (R11 diagnostics: the queue's guest epoch at the batch's last command of it)
+        auto it = std::find_if(cur_.r11_epoch.begin(), cur_.r11_epoch.end(), [&](const auto& e) { return e.first == queue; });
+        if (it == cur_.r11_epoch.end()) {
+            cur_.r11_epoch.emplace_back(queue, guest_epoch_[queue]);
+        } else {
+            it->second = guest_epoch_[queue];
+        }
+    }
     if (cur_.work[queue] == 0) {
         cur_.queues.push_back(queue);
     }
@@ -689,6 +714,7 @@ void Executor::AqNote(u64 addr, u64 size) {
     }
     if (v.size() >= 4096) {
         cur_.aq_overflow = true;
+        cur_.r11_ovf |= 1; // (R11 diagnostics)
         return;
     }
     v.emplace_back(addr, end);
@@ -706,6 +732,63 @@ bool Executor::AqConflict(const Batch& main, const Batch& lane) {
         }
     }
     return false;
+}
+
+bool Executor::R11LaneImagesOk(const GS::StageView& cs, u64& wait_main) {
+    // R11 SSPC_R11_AQ_IMAGES (vk_executor.h): each image the texture memo resolves to the image BindStage takes without
+    // Find, sampled in the layout it is in, no write since its barrier - binding it records nothing
+    constexpr VkAccessFlags2 kWrites = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                       VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
+    images_.ApplyPendingInvalidations(); // (as BindStage before its memo's checks: nothing changes between)
+    wait_main = 0;
+    const auto refuse = [&](u32 why, const CachedImage* m) {
+        ++r11_img_why_[why];
+        if (r11_img_logged_ < 12) {
+            ++r11_img_logged_;
+            SSPC_LOG(GPU, Info, "R11 AQ images: cs {:#x} not on the lane ({}): img{} {:#x} fmt {} uploaded {} dirty {} "
+                                "gpu_written {} layout {} access {:#x} barrier v{} lane {}", cs.address, why,
+                     m != nullptr ? m->id : 0, m != nullptr ? m->layout.guest_address : 0,
+                     m != nullptr ? m->layout.pixel_format : 0, m != nullptr && m->uploaded, m != nullptr && m->dirty,
+                     m != nullptr && m->gpu_written, m != nullptr ? static_cast<int>(m->current) : -1,
+                     m != nullptr ? m->access : 0, m != nullptr ? m->barrier_value : 0, m != nullptr && m->barrier_lane);
+        }
+        return false;
+    };
+    for (const auto& im : cs.plan.images) {
+        if (im.status != GS::ResourceStatus::Ok || im.storage || im.fmask || im.atomic || std::max<u32>(im.count, 1) != 1) {
+            return refuse(0, nullptr);
+        }
+        const u32 flags = TexFlags(im);
+        const auto it = tex_memo_.find(TexMemoKey(im.desc.raw, flags));
+        if (it == tex_memo_.end()) {
+            return refuse(1, nullptr);
+        }
+        const TexMemo& memo = it->second;
+        const CachedImage* m = memo.img;
+        if (m == nullptr || memo.epoch != images_.Epoch() || memo.raw != im.desc.raw || memo.flags != flags) {
+            return refuse(2, m);
+        }
+        // (BindStage's memo hit; a GPU-written one - rendered by the main queue - too: its last barrier, before which
+        // the rendering is, is a main batch's the lane batch waits for)
+        if (!((m->gpu_written && !m->memory_newer) || (m->uploaded && !m->dirty && !m->gpu_written))) {
+            return refuse(3, m);
+        }
+        // the layout RecordDispatch's transition takes it to (TextureLayout's rule) - already there, read since
+        const bool storage = (m->usage & VK_IMAGE_USAGE_STORAGE_BIT) && m->gpu_written;
+        const VkImageLayout want = storage                    ? VK_IMAGE_LAYOUT_GENERAL
+                                   : m->layout.props.is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                              : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        if (m->current != want || (m->access & kWrites) != 0) {
+            return refuse(4, m);
+        }
+        if (m->barrier_lane || m->barrier_value == 0) {
+            return refuse(5, m);
+        }
+        wait_main = std::max(wait_main, m->barrier_value);
+    }
+    return !cs.plan.images.empty();
 }
 
 void Executor::EndRendering() {
@@ -1047,10 +1130,24 @@ void Executor::Flush() {
                 ++(aq_wait_main == 0 ? stats_.aq_free : shared ? stats_.aq_wait_shared : stats_.aq_wait_conflict);
                 aq_why = aq_wait_main == 0 ? 0 : shared ? StallTrace::kAqWhyShared : StallTrace::kAqWhyRange;
             }
+            if (r11_aq_images_ && cur_.aq_wait_main_min > main_done) {
+                // R11: a wait for one main batch (a held fence's, its textures' last barrier) covers the ones before it
+                // only - the later ones it conflicts with too
+                for (const Batch& b : in_flight_) {
+                    if (b.lane == 0 && !b.done && b.value > aq_wait_main && AqConflict(b, cur_)) {
+                        aq_wait_main = b.value;
+                    }
+                }
+            }
             aq_why |= StallTrace::kAqLane | (aq_wait_main != 0 ? StallTrace::kAqWaitMain : 0);
+            if (r11_diag_ != nullptr) {
+                R11DiagLane(main_done);
+            }
         } else {
             stats_.aq_kept_main += cur_.work[Cp::kGraphicsQueue] == 0 && !cur_.queues.empty() ? 1 : 0;
             const u64 lane_done = timeline_.QueryLane();
+            // (R11 SSPC_R11_AQ_IMAGES: a barrier in it over an image a lane batch in flight sampled)
+            const u64 r11_img_wait = r11_aq_images_ ? images_.TakeLaneWait() : 0;
             if (!r10_main_free_) {
                 aq_wait_lane = aq_last_lane_ > lane_done ? aq_last_lane_ : 0;
                 aq_why = aq_wait_lane != 0 ? StallTrace::kAqWaitLane : 0;
@@ -1069,6 +1166,10 @@ void Executor::Flush() {
                         conflict = b.value;
                     }
                 }
+                if (r11_img_wait > lane_done) {
+                    images = std::max(images, r11_img_wait);
+                    ++r11_img_stats_[2];
+                }
                 u64 sync = 0, order = 0;
                 for (const u32 q : cur_.queues) {
                     sync = std::max(sync, r10_q_sync_[q]);
@@ -1077,6 +1178,9 @@ void Executor::Flush() {
                 sync = sync > lane_done ? sync : 0;
                 order = order > lane_done ? order : 0;
                 aq_wait_lane = std::max({conflict, images, sync, order});
+                if (r11_diag_ != nullptr && order != 0) {
+                    R11DiagMain(lane_done);
+                }
                 if (aq_wait_lane == 0) {
                     ++stats_.r10_main_free;
                 } else {
@@ -1199,6 +1303,12 @@ void Executor::Flush() {
             }
         }
         ++(cur_.lane != 0 ? stats_.aq_lane_batches : stats_.aq_main_batches);
+        if (r11_diag_ != nullptr && cur_.lane == 0 && cur_.aq_overflow) {
+            ++r11_diag_->overflow_batches[(cur_.r11_ovf & 1) != 0 ? 0 : 1];
+        }
+        if (r11_aq_images_) {
+            images_.SetRecording(aq_last_main_, false); // (R11: barriers outside a batch taken as the main queue's)
+        }
     }
     in_flight_.push_back(std::move(cur_));
     cur_ = Batch{};
@@ -2577,6 +2687,9 @@ bool Executor::GdsOnTimeline(u32 queue, u64 seq, Cp::DmaKind kind, u64 memory, u
         return false;
     }
     cur_.aq_gds = true;
+    if (r11_diag_ != nullptr) {
+        R11DiagGds((1ull << 62) | (u64{queue & 0xFFFF} << 48) | (u64{static_cast<u32>(kind) & 0xFFFF} << 32) | gds_offset);
+    }
     write_run_ = false;
     aq_what_ = 3 | (u64{static_cast<u32>(kind)} << 8);
     if (LabelChanges(kLabelOther | 3)) {
@@ -2710,6 +2823,9 @@ void Executor::WaitMetByHeldFence(u32 queue_and_fence, u64 after_seq) {
         // AQ: the work after the wait goes after the batch the fence's queue recorded in last - nothing to wait for on
         // the same queue or in the open batch; a main batch when the work after it may go to the lane
         if (fence_q >= Cp::kNumQueues || !aq_family_) {
+            if (r11_diag_ != nullptr) {
+                ++r11_diag_->unknown_fence_waits;
+            }
             if (open_) {
                 cur_.aq_wait_all = true;
             } else {
@@ -3248,6 +3364,9 @@ bool Executor::BindStage(const void* stage_view, bool compute, PushData& push,
         }
         case GS::BufferKind::GdsBuffer:
             cur_.aq_gds = true;
+            if (r11_diag_ != nullptr) {
+                R11DiagGds(aq_what_);
+            }
             info = {gds_.buffer, 0, gds_.size};
             writes_memory |= b.written;
             break;
@@ -5121,7 +5240,11 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     const u32 mode = (regs.Get(kCbColorControl) >> 4) & 7;
     const bool filtered = DrawFiltered(regs, d);
     const GS::DrawPreparation* prepared = filtered ? nullptr : pc.prep;
+    const u64 splits_before = stats_.aq_splits; // (R11 diagnostics)
     AqBoundary(d.queue);
+    if (r11_diag_ != nullptr) {
+        r11_diag_->draw_splits += stats_.aq_splits - splits_before;
+    }
     if (!Begin()) {
         return;
     }
@@ -6924,11 +7047,28 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
     const auto& f = Fn();
     const GS::DrawPreparation* prepared = cs == nullptr ? nullptr : pc.prep;
     // (AQ: a dispatch binding images stays on the main queue - their layouts are one state, the transitions graphics')
-    AqBoundary(d.queue, pc.stage != nullptr && !pc.stage->plan.images.empty());
+    bool main_only = pc.stage != nullptr && !pc.stage->plan.images.empty();
+    // (R11 SSPC_R11_AQ_IMAGES: a compute queue's dispatch that only samples clean textures in their layout may not)
+    u64 r11_img_main = 0;
+    bool r11_img = false;
+    if (main_only && r11_aq_images_ && d.queue != Cp::kGraphicsQueue) {
+        r11_img = R11LaneImagesOk(*pc.stage, r11_img_main);
+        main_only = !r11_img;
+        ++r11_img_stats_[r11_img ? 0 : 1];
+    }
+    const u64 splits_before = stats_.aq_splits; // (R11 diagnostics)
+    AqBoundary(d.queue, main_only);
     if (!Begin()) {
         return;
     }
+    r11_img = r11_img && cur_.pool_lane != 0; // (on the main queue - not split - it is an ordinary one there)
+    if (r11_img && r11_img_main != 0) {
+        cur_.aq_wait_main_min = std::max(cur_.aq_wait_main_min, r11_img_main); // (their last barriers' main batch)
+    }
     Note(d.queue, d.seq);
+    if (r11_diag_ != nullptr && pc.stage != nullptr) {
+        R11DiagDispatch(*pc.stage, d.queue, d.indirect, main_only, splits_before);
+    }
     ++commands_;
     write_run_ = false;
     if (cs == nullptr) {
@@ -7037,10 +7177,13 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
     aq_watch_capture_ = aq_watch_cs_ != 0 && csv.address == aq_watch_cs_;
     aq_watch_b0_ = {};
     if (!BindStage(&csv, true, push, writes, buf_infos, img_infos, bound, writes_memory, none)) {
+        if (r11_img) {
+            cur_.aq_images = true; // (R11: whatever BindStage did to the images before it failed)
+        }
         return;
     }
     stats_.t_bind += GS::FineTicks() - tb0;
-    if (aq_ && !bound.empty()) {
+    if (aq_ && !bound.empty() && !r11_img) {
         cur_.aq_images = true;
     }
     VkBuffer argbuf = VK_NULL_HANDLE;
@@ -7070,6 +7213,7 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
             acc_unknown = true; // the emulated LDS (shared by every dispatch), BDA, ...
             if (b.kind != GS::BufferKind::SharedMemory && aq_) {
                 cur_.aq_overflow = true; // (AQ: an access of unknown extent)
+                cur_.r11_ovf |= 2;
             }
         }
     }
@@ -7119,6 +7263,27 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                            storage ? (VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT)
                                    : VK_ACCESS_2_SHADER_READ_BIT);
+    }
+    if (r11_img) {
+        // R11 SSPC_R11_AQ_IMAGES: binding them recorded no barrier on the lane (an invalidation applied meanwhile made
+        // one dirty - uploaded here -, a new image) - a later main barrier over them waits for this batch; otherwise the
+        // lane's images rule (conservative: after every main batch before it, the main batches after it after it)
+        bool clean = !bound.empty();
+        for (const CachedImage* img : bound) {
+            clean = clean && !img->barrier_lane;
+        }
+        if (clean) {
+            for (CachedImage* img : bound) {
+                img->lane_use = cur_.value;
+            }
+            ++r11_img_stats_[3];
+        } else {
+            cur_.aq_images = true;
+            if (r11_img_stats_[4]++ < 8) {
+                SSPC_LOG(GPU, Info, "R11 AQ images: cs {:#x} fell back - a barrier on the lane over its {} images",
+                         csv.address, bound.size());
+            }
+        }
     }
     for (auto& w : writes) {
         if (w.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {

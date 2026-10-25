@@ -17,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "base/abi.h"
@@ -68,6 +69,11 @@ struct CachedImage {
     bool write_tracked = false;
     u64 last_seq = 0;
     u64 last_frame = 0; ///< ImageCache::NewFrame count at its last use
+    // R11 neon (SSPC_R11_AQ_IMAGES, docs/R11_NEON.md): the last async compute lane batch that sampled it, and the batch
+    // its last barrier was recorded in (0: none since the switch is on) and whether that one was a lane batch
+    u64 lane_use = 0;
+    u64 barrier_value = 0;
+    bool barrier_lane = false;
     std::unordered_map<u64, VkImageView, U64Hash> views;
 };
 
@@ -287,8 +293,18 @@ public:
     /// A Transition of `img` to its current layout for (`stage`, `access`) would record nothing and change nothing: it
     /// is read there without a write since its barrier, by those stages already.
     static bool ReadSince(const CachedImage& img, VkPipelineStageFlags2 stage, VkAccessFlags2 access);
+    /// R11 (SSPC_R11_AQ_IMAGES): the batch commands are recorded into now (its value, on the lane or not) - kept in the
+    /// images' barrier_value; a barrier on a main batch over an image a lane batch sampled makes the main batch wait for
+    /// it (TakeLaneWait: the highest such lane value since the last call).
+    void SetRecording(u64 value, bool lane) {
+        rec_value_ = value;
+        rec_lane_ = lane;
+    }
+    u64 TakeLaneWait() { return std::exchange(lane_wait_, 0); }
 
 private:
+    u64 rec_value_ = 0, lane_wait_ = 0;
+    bool rec_lane_ = false;
     u32 next_id_ = 1;
     std::unordered_map<u64, VkSampler, U64Hash> samplers_;
     std::deque<Temp> temps_;
