@@ -89,6 +89,21 @@ constexpr Experiment kExperiments[] = {
      .requires_env = "SSPC_VK_EMIT_THREAD", .en = "Batched recording", .ru = "Пакетная запись",
      .help_en = "The recording thread publishes its commands once per record (city 39.1 -> 41.5 FPS). On in play.cmd.",
      .help_ru = "Поток записи публикует команды один раз на запись (город 39,1 → 41,5 FPS). Включено в play.cmd."},
+    {.env = "SSPC_R11_EARLY_SUBMIT", .group_en = kVkEn, .group_ru = kVkRu, .on = "256", .off = "0",
+     .en = "Early batch submission (R11)", .ru = "Ранняя отправка батчей (R11)",
+     .help_en = "A batch goes to the GPU once it holds 256 commands while the GPU has nothing queued, instead of at "
+                "500. Owner's save 31.3 -> 32.4 FPS, Neon Dash frames over 33 ms 590 -> 186 a minute; the fight within "
+                "noise (3 runs each). On in play.cmd.",
+     .help_ru = "Батч уходит на видеокарту, как только в нём 256 команд и видеокарта простаивает, а не по 500. "
+                "Сохранение 31,3 → 32,4 FPS, в Neon Dash кадров дольше 33 мс 590 → 186 в минуту; бой в пределах "
+                "шума (по 3 прогона). Включено в play.cmd."},
+    {.env = "SSPC_R11_ASYNC_SUBMIT", .group_en = kVkEn, .group_ru = kVkRu, .on = "1", .off = "0",
+     .requires_env = "SSPC_VK_EMIT_THREAD", .en = "Submissions on their own thread (R11)",
+     .ru = "Отправка батчей в отдельном потоке (R11)",
+     .help_en = "Experiment, off. vkQueueSubmit2 is made by a thread of its own, not the recording thread (its time "
+                "there per batch 47 -> 7 us). No FPS change measured: the recording thread is not the limit.",
+     .help_ru = "Эксперимент, выключено. vkQueueSubmit2 вызывается в отдельном потоке, а не в потоке записи (время "
+                "в нём на батч 47 → 7 мкс). Изменения FPS не замерено: поток записи не ограничивает кадр."},
 
     // ---- pipelines and memory
     {.env = "SSPC_ASYNC_PIPELINES", .group_en = kPipeEn, .group_ru = kPipeRu, .on = "1", .off = "0",
@@ -138,6 +153,22 @@ constexpr Experiment kExperiments[] = {
      .help_ru = "Эксперимент (play_experimental.cmd), вместе с REA-3 и AQ. Графика ждёт только тот compute, от "
                 "которого зависит. Сохранение 31,6 → 37,6 FPS, бой 46,6 → 53,0 FPS и меньше провалов; в Neon Dash "
                 "1 % low ниже (16,3 против 18,9). 20-минутный прогон не проверен."},
+    {.env = "SSPC_R11_FAST_LABEL", .group_en = kQueueEn, .group_ru = kQueueRu, .on = "1", .off = "0",
+     .requires_env = "SSPC_CP_ROUND_NODRAIN", .en = "Completed compute seen sooner (R11)",
+     .ru = "Готовый compute виден раньше (R11)",
+     .help_en = "Experiment, off. The GPU's completion labels reach the game every 100 us instead of at the round's "
+                "end (0.9 -> 0.09 ms of the game's compute wait). Alone: fight +1.6 %, save +1.0 %; with early "
+                "submission only the fight gains (47.8 against 46.4 FPS), the save and Neon Dash do not.",
+     .help_ru = "Эксперимент, выключено. Метки завершения работы видеокарты доходят до игры каждые 100 мкс, а не в "
+                "конце раунда (ожидание compute в игре 0,9 → 0,09 мс). Отдельно: бой +1,6 %, сохранение +1,0 %; "
+                "вместе с ранней отправкой батчей выигрыш только в бою (47,8 против 46,4 FPS), в сохранении и Neon "
+                "Dash — нет."},
+    {.env = "SSPC_R11_LABEL_WAIT", .group_en = kQueueEn, .group_ru = kQueueRu, .on = "1", .off = "0",
+     .en = "Game's compute wait asleep (R11)", .ru = "Ожидание compute в игре без спина (R11)",
+     .help_en = "Experiment, off. The game's wait for its compute (0x1695e0) spins 20 us, then sleeps until the label "
+                "is written. Fight +3.3 % with the option above, but Neon Dash -3.4 %.",
+     .help_ru = "Эксперимент, выключено. Ожидание compute в игре (0x1695e0) крутится 20 мкс, затем спит до записи "
+                "метки. Бой +3,3 % вместе с пунктом выше, но Neon Dash −3,4 %."},
 
     // ---- processor threads (R10 sched)
     {.env = "SSPC_R10_SCHED", .group_en = kCpuEn, .group_ru = kCpuRu, .on = "1", .off = "0",
