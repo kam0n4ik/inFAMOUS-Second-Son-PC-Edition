@@ -492,6 +492,7 @@ private:
         std::vector<u64> r11_gds;
         u8 r11_ovf = 0;
         std::vector<std::pair<u32, u32>> r11_epoch;
+        u32 r11_nondisp = 0; ///< (SSPC_R11_AQ_ORDER_EPOCH) guest queues with a command other than a dispatch in it
     };
     struct RenderKey {
         std::array<VkImageView, 8> color{};
@@ -1324,6 +1325,16 @@ private:
     /// that lane batch (ImageCache::TakeLaneWait). A barrier recorded on the lane while binding them (an invalidation
     /// applied meanwhile, a new image) falls back to the lane's images rule.
     bool r11_aq_images_ = false;
+    /// SSPC_R11_AQ_ORDER_EPOCH=1 (with SSPC_R10_AQ_MAIN_FREE): a main batch skips the order wait for a guest queue's
+    /// latest lane batch when only dispatches of that queue are in it and no guest synchronization point of the queue
+    /// (guest_epoch_: a met wait, a fence, an event / ACQUIRE_MEM) lies between that lane batch's last command of the
+    /// queue and its own last one - unordered on the PS4 too (P4.6); their memory is the conflict check's. It still
+    /// waits for the queue's newest lane batch of an earlier epoch (r11_q_prev_).
+    bool r11_order_epoch_ = false;
+    bool r11_note_dispatch_ = false; ///< the Note being made is a dispatch's
+    std::array<u32, Cp::kNumQueues> r11_q_epoch_{}; ///< the guest epoch at r10_q_lane_'s last command of the queue
+    std::array<u64, Cp::kNumQueues> r11_q_prev_{};  ///< the queue's newest lane batch of an epoch before r11_q_epoch_
+    u64 r11_order_skipped_ = 0, r11_order_kept_ = 0;
     /// pre-check passed, refused; main batches that waited for such a lane batch; lane dispatches with images; fallbacks
     std::array<u64, 5> r11_img_stats_{};
     std::array<u64, 6> r11_img_why_{}; ///< refusals: binding kind, no memo, memo stale, image state, layout/access, barrier

@@ -172,6 +172,11 @@ std::string Executor::R11DiagReport() const {
                            r11_img_why_[0], r11_img_why_[1], r11_img_why_[2], r11_img_why_[3], r11_img_why_[4],
                            r11_img_why_[5]);
     }
+    if (r11_order_epoch_) {
+        out += fmt::format("R11 order waits by the guest epoch (SSPC_R11_AQ_ORDER_EPOCH): skipped {}, kept (another epoch) "
+                           "{}\n",
+                           r11_order_skipped_, r11_order_kept_);
+    }
     if (r11_diag_ == nullptr) {
         return out;
     }

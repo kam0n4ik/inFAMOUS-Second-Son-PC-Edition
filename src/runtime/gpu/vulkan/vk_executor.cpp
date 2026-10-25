@@ -422,6 +422,15 @@ Executor::Executor(DeviceContext& ctx, Timeline& timeline, StreamRing& ring, Gue
                     SSPC_LOG(GPU, Warning, "SSPC_R11_AQ_IMAGES=1 needs the lane on the compute family: off");
                 }
             }
+            if (char oe[4] = {}; GetEnvironmentVariableA("SSPC_R11_AQ_ORDER_EPOCH", oe, sizeof(oe)) == 1 && oe[0] == '1') {
+                if (r10_main_free_) {
+                    r11_order_epoch_ = true; // (R11 neon, vk_executor.h)
+                    SSPC_LOG(GPU, Warning, "EXPERIMENT: SSPC_R11_AQ_ORDER_EPOCH=1 - a main batch does not wait for a lane "
+                                           "batch of its guest queue in the same guest epoch (dispatches only)");
+                } else {
+                    SSPC_LOG(GPU, Warning, "SSPC_R11_AQ_ORDER_EPOCH=1 needs SSPC_R10_AQ_MAIN_FREE=1: off");
+                }
+            }
             buffers_.DisableLazy(); // (FB-7's kept-back write-backs stay on the main queue: not with the lane)
             char sp[16] = {};
             if (GetEnvironmentVariableA("SSPC_FB_ASYNC_SPLIT", sp, sizeof(sp)) > 0) {
@@ -583,6 +592,7 @@ bool Executor::Begin() {
     cur_.r11_gds.clear(); // (R11 diagnostics)
     cur_.r11_ovf = 0;
     cur_.r11_epoch.clear();
+    cur_.r11_nondisp = 0;
     cur_.done = false;
     cur_.aq_unreported.reset();
     cur_.value = timeline_.Next();
@@ -661,8 +671,12 @@ void Executor::Note(u32 queue, u64 seq) {
     if (queue >= Cp::kNumQueues) {
         return;
     }
-    if (r11_diag_ != nullptr) {
-        // (R11 diagnostics: the queue's guest epoch at the batch's last command of it)
+    if (!r11_note_dispatch_) {
+        cur_.r11_nondisp |= 1u << queue;
+    }
+    r11_note_dispatch_ = false;
+    if (r11_diag_ != nullptr || r11_order_epoch_) {
+        // (R11 diagnostics / SSPC_R11_AQ_ORDER_EPOCH: the queue's guest epoch at the batch's last command of it)
         auto it = std::find_if(cur_.r11_epoch.begin(), cur_.r11_epoch.end(), [&](const auto& e) { return e.first == queue; });
         if (it == cur_.r11_epoch.end()) {
             cur_.r11_epoch.emplace_back(queue, guest_epoch_[queue]);
@@ -1173,6 +1187,16 @@ void Executor::Flush() {
                 u64 sync = 0, order = 0;
                 for (const u32 q : cur_.queues) {
                     sync = std::max(sync, r10_q_sync_[q]);
+                    if (r11_order_epoch_ && r10_q_lane_[q] > lane_done && (cur_.r11_nondisp & (1u << q)) == 0) {
+                        const auto e = std::find_if(cur_.r11_epoch.begin(), cur_.r11_epoch.end(),
+                                                    [&](const auto& x) { return x.first == q; });
+                        if (e != cur_.r11_epoch.end() && e->second == r11_q_epoch_[q]) {
+                            order = std::max(order, r11_q_prev_[q]); // (R11: the same guest epoch - unordered)
+                            ++r11_order_skipped_;
+                            continue;
+                        }
+                        ++r11_order_kept_;
+                    }
                     order = std::max(order, r10_q_lane_[q]);
                 }
                 sync = sync > lane_done ? sync : 0;
@@ -1299,6 +1323,16 @@ void Executor::Flush() {
         (cur_.lane != 0 ? aq_last_lane_ : aq_last_main_) = cur_.value;
         if (cur_.lane != 0) {
             for (const u32 q : cur_.queues) {
+                if (r11_order_epoch_) {
+                    // (R11: the guest epoch at its last command of the queue; the newest lane batch of an earlier one)
+                    const auto e = std::find_if(cur_.r11_epoch.begin(), cur_.r11_epoch.end(),
+                                                [&](const auto& x) { return x.first == q; });
+                    const u32 ep = e != cur_.r11_epoch.end() ? e->second : guest_epoch_[q];
+                    if ((cur_.r11_nondisp & (1u << q)) != 0 || r10_q_lane_[q] == 0 || ep != r11_q_epoch_[q]) {
+                        r11_q_prev_[q] = (cur_.r11_nondisp & (1u << q)) != 0 ? cur_.value : r10_q_lane_[q];
+                    }
+                    r11_q_epoch_[q] = ep;
+                }
                 r10_q_lane_[q] = cur_.value; // (R10 SSPC_R10_AQ_MAIN_FREE)
             }
         }
@@ -7065,6 +7099,7 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
     if (r11_img && r11_img_main != 0) {
         cur_.aq_wait_main_min = std::max(cur_.aq_wait_main_min, r11_img_main); // (their last barriers' main batch)
     }
+    r11_note_dispatch_ = true;
     Note(d.queue, d.seq);
     if (r11_diag_ != nullptr && pc.stage != nullptr) {
         R11DiagDispatch(*pc.stage, d.queue, d.indirect, main_only, splits_before);
