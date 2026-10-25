@@ -39,6 +39,10 @@ struct PcSettings {
     // game started with): "auto" (at most 1080 lines, as the PS4) | "50" | "60" | "67" | "75" | "85" | "100"
     std::string render_scale = "auto";
     u32 fov = 100; // 80..130 %: the player camera's vertical field of view (cut-scenes keep theirs)
+    // [Graphics] the game's own post-processing effects (src/engine/render/post_effects.h); both backends. Defaults:
+    // the game's own
+    bool motion_blur = true;
+    u32 motion_blur_strength = 100; // 10..100 %: the game's blur length scaled
     // [Graphics] upscaling and frame generation (native backend; docs/UPSCALING_FRAME_GENERATION.md)
     std::string upscaler = "off";            // "off" | "dlss" | "fsr"
     std::string upscale_quality = "quality"; // "native" | "quality" | "balanced" | "performance" | "ultra"

@@ -539,6 +539,31 @@ void Build(Registry& r) {
         .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.pc.fov); },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.fov = static_cast<u32>(std::get<s64>(x)); },
     });
+    // ------------------------------------------------------------------ Graphics: post effects (R11 postfx)
+    v.push_back(Desc{
+        .id = "graphics.motionBlur", .table = "Graphics", .key = "motionBlur", .category = Category::Graphics,
+        .type = Type::Bool, .apply = Apply::Live, .en = "Motion blur", .ru = "Размытие в движении",
+        .help_en = "The game's own blur of fast movement (the camera and objects). Off: a sharp picture; the motion "
+                   "data of the game's anti-aliasing and of DLSS / FSR does not change. Applies at once.",
+        .help_ru = "Собственное размытие игры при быстром движении (камеры и объектов). «Выкл.» — чёткая картинка; "
+                   "данные движения для сглаживания игры и для DLSS / FSR не меняются. Применяется сразу.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.motion_blur; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.motion_blur = std::get<bool>(x); },
+    });
+    v.push_back(Desc{
+        .id = "graphics.motionBlurStrength", .table = "Graphics", .key = "motionBlurStrength",
+        .category = Category::Graphics, .type = Type::Int, .apply = Apply::Live, .min = 10, .max = 100, .ui_min = 10,
+        .ui_max = 100, .step = 10, .unit = "%", .en = "Motion blur strength", .ru = "Сила размытия",
+        .help_en = "The length of the game's motion blur: 100 % is the game's own. Applies at once.",
+        .help_ru = "Длина размытия в движении: 100 % — как в игре. Применяется сразу.",
+        .get = [](const Config& c, const Desc&) -> Value { return static_cast<s64>(c.pc.motion_blur_strength); },
+        .set = [](Config& c, const Desc&, const Value& x) {
+            c.pc.motion_blur_strength = static_cast<u32>(std::get<s64>(x));
+        },
+        .requires_on = "graphics.motionBlur",
+    });
+    // (film grain: the pass and its parameter exist, but no place played so far sets it - not offered; depth of
+    // field: see kMissing; R11_POSTFX.md)
     // ------------------------------------------------------------------ Upscaling & frame generation
     v.push_back(Desc{
         .id = "upscaling.upscaler", .table = "Graphics", .key = "upscaler", .category = Category::Upscaling,
@@ -670,12 +695,12 @@ void Build(Registry& r) {
         {"graphics.antiAliasing", "Anti-aliasing", "Сглаживание",
          "The game does its own anti-aliasing; a separate option needs backend work (P4.6+).",
          "Сглаживание выполняет сама игра; отдельная настройка требует работы в бэкенде (P4.6+).", 0},
-        {"graphics.motionBlur", "Motion blur", "Размытие в движении",
-         "The game has no such option; turning it off means changing the game's shaders (not researched).",
-         "В игре нет такого параметра; отключение — правка шейдеров игры (не исследовано).", 0},
         {"graphics.depthOfField", "Depth of field", "Глубина резкости",
-         "The game has no such option; turning it off means changing the game's shaders (not researched).",
-         "В игре нет такого параметра; отключение — правка шейдеров игры (не исследовано).", 0},
+         "The game's bokeh depth of field has its own off switch, but switching it (even with a forced radius) "
+         "changed nothing seen in play; not offered until a scene shows it (R11_POSTFX.md).",
+         "У боке-глубины резкости игры есть свой выключатель, но его переключение (даже с принудительным радиусом) "
+         "в игре ничего видимого не меняло; не предлагается, пока не найдена сцена с ней (R11_POSTFX.md).",
+         0},
     };
     for (const auto& m : kMissing) {
         v.push_back(Desc{.id = m.id, .category = Category::Graphics, .type = Type::Bool, .apply = Apply::Unavailable,
