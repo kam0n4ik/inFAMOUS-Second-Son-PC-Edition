@@ -196,6 +196,13 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
     char ds[512] = {};
     if (native_gpu && GetEnvironmentVariableA("SSPC_DIAG_DISPLAY_SWITCH", ds, sizeof(ds)) > 0) {
         SSPC_LOG(Loader, Warning, "DIAGNOSTIC: SSPC_DIAG_DISPLAY_SWITCH='{}'", ds);
+        if (test_mode) {
+            // (an automated run installs no menu, which gives the service this host's capabilities: the window one
+            // is what the vertical sync needs - given here, for this diagnostic only)
+            Settings::Instance().SetCapabilities(Settings::Instance().Capabilities() | caps);
+            SSPC_LOG(Loader, Warning, "DIAGNOSTIC: automated run: settings capabilities 0x{:x} for the display switch",
+                     Settings::Instance().Capabilities());
+        }
         std::thread([plan = std::string(ds)] {
             const auto t0 = std::chrono::steady_clock::now();
             size_t at = 0;
