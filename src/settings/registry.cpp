@@ -536,17 +536,8 @@ void Build(Registry& r) {
         },
         .requires_on = "graphics.motionBlur",
     });
-    // (film grain: the pass and its parameter exist, but no place played so far sets it - not offered; R11_POSTFX.md)
-    v.push_back(Desc{
-        .id = "graphics.depthOfField", .table = "Graphics", .key = "depthOfField", .category = Category::Graphics,
-        .type = Type::Bool, .apply = Apply::Live, .en = "Depth of field", .ru = "Глубина резкости",
-        .help_en = "The game's own out-of-focus blur (bokeh) of near or far objects, mostly in cut-scenes. Off: "
-                   "everything in focus. Applies at once.",
-        .help_ru = "Собственное размытие игры вне фокуса (боке) у близких или дальних объектов, в основном в "
-                   "кат-сценах. «Выкл.» — всё в фокусе. Применяется сразу.",
-        .get = [](const Config& c, const Desc&) -> Value { return c.pc.depth_of_field; },
-        .set = [](Config& c, const Desc&, const Value& x) { c.pc.depth_of_field = std::get<bool>(x); },
-    });
+    // (film grain: the pass and its parameter exist, but no place played so far sets it - not offered; depth of
+    // field: see kMissing; R11_POSTFX.md)
     // ------------------------------------------------------------------ Upscaling & frame generation
     v.push_back(Desc{
         .id = "upscaling.upscaler", .table = "Graphics", .key = "upscaler", .category = Category::Upscaling,
@@ -678,6 +669,12 @@ void Build(Registry& r) {
         {"graphics.antiAliasing", "Anti-aliasing", "Сглаживание",
          "The game does its own anti-aliasing; a separate option needs backend work (P4.6+).",
          "Сглаживание выполняет сама игра; отдельная настройка требует работы в бэкенде (P4.6+).", 0},
+        {"graphics.depthOfField", "Depth of field", "Глубина резкости",
+         "The game's bokeh depth of field has its own off switch, but switching it (even with a forced radius) "
+         "changed nothing seen in play; not offered until a scene shows it (R11_POSTFX.md).",
+         "У боке-глубины резкости игры есть свой выключатель, но его переключение (даже с принудительным радиусом) "
+         "в игре ничего видимого не меняло; не предлагается, пока не найдена сцена с ней (R11_POSTFX.md).",
+         0},
     };
     for (const auto& m : kMissing) {
         v.push_back(Desc{.id = m.id, .category = Category::Graphics, .type = Type::Bool, .apply = Apply::Unavailable,

@@ -65,7 +65,8 @@ bool g_dof_written = false; // the flag is ours (the game never writes it): clea
 // SSPC_POSTFX_DIAG
 bool g_diag_bloom = false, g_diag_vignette = false, g_diag_depth_blur = false;
 bool g_diag_mb_flip = false, g_diag_dof_flip = false; // motion blur skipped on every other MotionBlurPass call (A/B of neighbouring frames)
-bool g_diag_mb_cycle = false; // MotionBlurPass calls cycle: skipped / the set strength / 100 % (neighbouring frames)
+bool g_diag_mb_cycle = false;  // MotionBlurPass calls cycle: skipped / the set strength / 100 % (neighbouring frames)
+bool g_diag_dof_force = false; // the DOF radius set to 1.0 every frame
 float g_raw_exposure = 0.0f;  // the blended exposure before the strength (mbcycle)
 std::atomic<u64> g_mb_calls{0};
 // which settings an environment variable fixed (the menu does not change those)
@@ -149,6 +150,9 @@ SSPC_SYSV_ABI void BlendProbe(u64 overrides) {
     if (dof > 0.0f) {
         g_count.dof_frames.fetch_add(1, std::memory_order_relaxed);
         Max(g_count.dof_max, dof);
+    }
+    if (g_diag_dof_force) {
+        *At<float>(kDofRadius) = 1.0f; // (a strong, visible bokeh: does the engine's flag turn it off)
     }
     if (g_diag_dof_flip) {
         *At<u8>(kDofDisabled) = (g_count.frames.load(std::memory_order_relaxed) & 1) != 0 ? 1 : 0;
@@ -310,12 +314,14 @@ bool Install(u64 eboot_base, const Options& options) {
         g_diag_mb_flip = d.find("mbflip") != std::string::npos;
         g_diag_dof_flip = d.find("dofflip") != std::string::npos;
         g_diag_mb_cycle = d.find("mbcycle") != std::string::npos;
-        SSPC_LOG(Engine, Warning, "DIAGNOSTICS: SSPC_POSTFX_DIAG={} - zeroed after the blend:{}{}{}{}{}{}", d,
+        g_diag_dof_force = d.find("dofforce") != std::string::npos;
+        SSPC_LOG(Engine, Warning, "DIAGNOSTICS: SSPC_POSTFX_DIAG={} - zeroed after the blend:{}{}{}{}{}{}{}", d,
                  g_diag_bloom ? " bloom scale" : "", g_diag_vignette ? " vignette scale" : "",
                  g_diag_depth_blur ? " depth blur strength" : "",
                  g_diag_mb_flip ? "; motion blur on every other frame" : "",
                  g_diag_dof_flip ? "; depth of field on every other frame" : "",
-                 g_diag_mb_cycle ? "; motion blur cycles off / the strength / 100 %" : "");
+                 g_diag_mb_cycle ? "; motion blur cycles off / the strength / 100 %" : "",
+                 g_diag_dof_force ? "; DOF radius 1.0" : "");
     }
 
     std::string error;
@@ -381,14 +387,6 @@ void SetMotionBlurStrength(u32 percent) {
     }
     g_mb_strength.store(std::clamp<u32>(percent, 10, 100), std::memory_order_relaxed);
     SSPC_LOG(Engine, Info, "Post effects: motion blur strength {}%", g_mb_strength.load());
-}
-
-void SetDepthOfField(bool on) {
-    if (g_env_dof) {
-        return;
-    }
-    g_dof_on.store(on, std::memory_order_relaxed);
-    SSPC_LOG(Engine, Info, "Post effects: depth of field {}", on ? "on" : "off");
 }
 
 } // namespace SecondSon::Engine::Render::PostFx
