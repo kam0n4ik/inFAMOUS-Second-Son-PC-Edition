@@ -107,6 +107,7 @@ bool PageTracker::Hide(u64 block_addr) {
         }
     }
     hidden_[block / 64].fetch_or(1ull << (block % 64), std::memory_order_acq_rel);
+    ever_hidden_.store(true, std::memory_order_relaxed);
     memory_->ProtectTracking(block << kBlockBits, 1ull << kBlockBits, TrackingProtection::None);
     return true;
 }
@@ -275,6 +276,25 @@ bool PageTracker::OnFault(u64 address, bool is_write) {
     if (!is_write) {
         // SSPC_DIAG_READ_WATCH: a read of a watched armed page - counted, the page read-only again (still armed)
         if (watch_end_ == 0 || !Watched(page)) {
+            if (!ever_hidden_.load(std::memory_order_relaxed)) {
+                return false;
+            }
+            // FB-7 (R12): an access that faulted on a hidden block another thread showed meanwhile - its Unhide clears
+            // the bit before it gives the pages back, both under the lock: under it the block is hidden again (the
+            // access retries and faults into the path above) or readable now (it retries and reads). Without this
+            // the guest died here ("nobody resolved", neon: 2 of 11 runs with SSPC_FB_LAZY_WB=1).
+            Lock lock;
+            if (IsHidden(page >> (kBlockBits - kPageBits))) {
+                hidden_raced_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) != 0 && mbi.State == MEM_COMMIT &&
+                (mbi.Protect & PAGE_GUARD) == 0 &&
+                (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) {
+                hidden_raced_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
             return false;
         }
         Lock lock;

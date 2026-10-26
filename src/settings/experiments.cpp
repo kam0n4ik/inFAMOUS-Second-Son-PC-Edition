@@ -37,6 +37,15 @@ constexpr Choice kReflStats[] = {
     {"", "Off", "Выключено"},
     {"5", "Every 5 s", "Раз в 5 с"},
 };
+constexpr Choice kWriterDetails[] = {
+    {"", "Off", "Выключено"},
+    {"2edafa400", "Tiled lighting shader", "Шейдер тайлового освещения"},
+};
+constexpr Choice kReadersOf[] = {
+    {"", "Off", "Выключено"},
+    {"2edc12000", "Per-tile light list", "Список света по тайлам"},
+    {"26d558000", "Particle pool", "Пул частиц"},
+};
 
 constexpr std::string_view kCpEn = "Command processor", kCpRu = "Обработчик команд GPU";
 constexpr std::string_view kVkEn = "Vulkan recording", kVkRu = "Запись команд Vulkan";
@@ -148,6 +157,40 @@ constexpr Experiment kExperiments[] = {
      .help_ru = "Эксперимент, выключено. Новые compute-конвейеры начинают собираться, как только подготовлен их "
                 "dispatch. С пустым кэшем шейдеров (первое прохождение, новый драйвер) Neon Dash 12,9 → 26,1 FPS, "
                 "самый долгий фриз 5,5 → 2,5 с (один прогон); с прогретым кэшем ничего не меняет."},
+    {.env = "SSPC_R12_LIGHT_LIST_KEEP", .group_en = kPipeEn, .group_ru = kPipeRu, .on = "1", .off = "0",
+     .en = "Light index list stays in video memory (R12)", .ru = "Список источников света — только в видеопамяти (R12)",
+     .help_en = "Experiment, off. The per-tile light list the GPU builds every frame (6.25 MiB) is no longer copied "
+                "back to the CPU's memory: only the GPU reads it (0 CPU reads measured); a CPU access still gets it "
+                "written back first. The picture is the same. No FPS change (user 32.85 -> 32.79, fight 46.83 -> "
+                "46.94, n = 3): its write-back is cheap - the particle pools are what costs (see below). "
+                "Measurements: docs/R12_LIGHTS.md.",
+     .help_ru = "Эксперимент, выключено. Список источников света по тайлам, который видеокарта строит каждый кадр "
+                "(6,25 МиБ), больше не копируется обратно в память процессора: его читает только видеокарта "
+                "(чтений процессором — 0); при обращении процессора он сначала записывается обратно. Картинка та же. "
+                "FPS не меняется (user 32,85 → 32,79, бой 46,83 → 46,94, n = 3): его write-back дешёвый, дорого "
+                "стоят пулы частиц (см. ниже). Замеры — docs/R12_LIGHTS.md."},
+    {.env = "SSPC_FB_LAZY_WB", .group_en = kPipeEn, .group_ru = kPipeRu, .on = "1", .off = "0",
+     .en = "GPU writes stay in video memory until read (FB-7)",
+     .ru = "Данные видеокарты — в видеопамяти до чтения (FB-7)",
+     .help_en = "Experiment, off. Large ranges the GPU writes every frame (the particle pools, the light list) are "
+                "no longer copied back to the CPU's memory each frame; a CPU access waits for its 64 KiB block "
+                "(2-9 ms, ~60-170 a run). R12 (n = 3): user 33.14 -> 41.43 FPS (+25 %), 1 % low 27.9 -> 32.6; "
+                "city 47.83 -> 48.20, fight neutral; Neon Dash within its spread. The picture is the same "
+                "(poison test, Validation 0).",
+     .help_ru = "Эксперимент, выключено. Большие диапазоны, которые видеокарта пишет каждый кадр (пулы частиц, "
+                "список света), больше не копируются в память процессора каждый кадр; обращение процессора ждёт "
+                "свой блок 64 КиБ (2–9 мс, ~60–170 за прогон). R12 (n = 3): user 33,14 → 41,43 FPS (+25 %), "
+                "1 % low 27,9 → 32,6; город 47,83 → 48,20, бой без изменений; Neon Dash — в пределах разброса. "
+                "Картинка та же (тест отравления, Validation 0)."},
+    {.env = "SSPC_REA_HEAP_READS", .group_en = kPipeEn, .group_ru = kPipeRu, .on = "1", .off = "0",
+     .requires_env = "SSPC_FB_LAZY_WB", .en = "Vertex heap reads skip write-backs (REA-2)",
+     .ru = "Чтение кучи вершин без write-back (REA-2)",
+     .help_en = "Experiment, off. With the previous switch: the game's vertex-data heaps (read-only, >= 256 MiB) "
+                "no longer force the write-back of what the GPU wrote inside their range. R12 (n = 3, both): user "
+                "41.75 FPS (+26 %), city 50.13 (+4.8 %), 1 % low 20.5 -> 24.2; fight neutral.",
+     .help_ru = "Эксперимент, выключено. Вместе с предыдущим: кучи вершин игры (только чтение, ≥ 256 МиБ) больше "
+                "не заставляют записывать обратно то, что видеокарта записала в их диапазоне. R12 (n = 3, оба "
+                "флага): user 41,75 FPS (+26 %), город 50,13 (+4,8 %), 1 % low 20,5 → 24,2; бой без изменений."},
 
     // ---- GPU queues and frame pacing (play_experimental.cmd)
     {.env = "SSPC_REA_DEFER_WAIT_B", .group_en = kQueueEn, .group_ru = kQueueRu, .on = "1", .off = "0",
@@ -289,6 +332,36 @@ constexpr Experiment kExperiments[] = {
                 "quality» has no effect.",
      .help_ru = "Диагностика, выключено. Проба отражений не ставится: путь игры как есть, пункт «Качество "
                 "отражений» не действует."},
+    // R12 lights (docs/R12_LIGHTS.md)
+    {.env = "SSPC_R12_LIGHT_CENSUS", .group_en = kStandEn, .group_ru = kStandRu, .on = "1", .off = "",
+     .en = "Light census", .ru = "Перепись источников света",
+     .help_en = "Diagnostics, off. A log line every 10 s: the lights the engine puts into the frame by kind, with a "
+                "shadow, the shadow atlas's draws, the glows' occlusion queries and the largest GPU writers. The "
+                "picture is unchanged.",
+     .help_ru = "Диагностика, выключено. Строка журнала раз в 10 с: источники света в кадре по видам, с тенью, "
+                "draw атласа теней, occlusion queries свечений и самые большие записи видеокарты. Картинка не "
+                "меняется."},
+    {.env = "SSPC_R12_WRITER_DETAIL", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kWriterDetails, .unset_shows = "", .requires_env = "SSPC_R12_LIGHT_CENSUS",
+     .en = "Writes of one shader", .ru = "Записи одного шейдера",
+     .help_en = "Diagnostics, off. With the light census: each distinct buffer range the chosen shader writes is "
+                "logged once.",
+     .help_ru = "Диагностика, выключено. Вместе с переписью света: каждый диапазон буферов, который пишет "
+                "выбранный шейдер, пишется в журнал один раз."},
+    {.env = "SSPC_R12_READERS_OF", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kReadersOf, .unset_shows = "", .requires_env = "SSPC_R12_LIGHT_CENSUS",
+     .en = "Shaders reading a range", .ru = "Шейдеры, читающие диапазон",
+     .help_en = "Diagnostics, off. With the light census: the shaders that bind the chosen range are logged.",
+     .help_ru = "Диагностика, выключено. Вместе с переписью света: в журнал пишутся шейдеры, которые подключают "
+                "выбранный диапазон."},
+    {.env = "SSPC_R12_LAZY_TRACE", .group_en = kStandEn, .group_ru = kStandRu, .on = "1", .off = "",
+     .requires_env = "SSPC_FB_LAZY_WB", .en = "Log the waits for kept-back blocks",
+     .ru = "Журнал ожиданий отложенных блоков",
+     .help_en = "Diagnostics, off. With FB-7: each CPU wait for a block kept in video memory is logged with its "
+                "time (at most 4000), to match long frames with these waits.",
+     .help_ru = "Диагностика, выключено. Вместе с FB-7: каждое ожидание процессором блока, оставленного в "
+                "видеопамяти, пишется в журнал со временем (не больше 4000), чтобы сопоставить их с длинными "
+                "кадрами."},
 };
 
 std::string GetEnv(std::string_view name) {

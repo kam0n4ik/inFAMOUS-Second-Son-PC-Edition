@@ -34,6 +34,7 @@ add_library(sspc_runtime STATIC
     src/engine/render/dcb_scan.cpp
     src/engine/render/frame_trace.cpp
     src/engine/render/draw_census.cpp
+    src/engine/render/light_census.cpp
     src/engine/render/draw_runs.cpp
     src/engine/render/native_draw.cpp
     src/engine/render/native_render_ops.cpp

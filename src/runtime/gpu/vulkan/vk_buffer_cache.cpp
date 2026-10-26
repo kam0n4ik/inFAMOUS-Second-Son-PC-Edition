@@ -416,6 +416,13 @@ void BufferCache::InitDiff() {
                      v, lazy_ == 1 ? "kept back from the host" : "counted as if kept back (written back as before)");
         }
     }
+    // R12 lights: FB-7's kept-back write-back for the tiled lighting's light index list only (mode 3; FB-7 itself wins)
+    if (char v[4] = {}; lazy_ == 0 && diff_pipeline_ != VK_NULL_HANDLE && tracker_ != nullptr &&
+                        GetEnvironmentVariableA("SSPC_R12_LIGHT_LIST_KEEP", v, sizeof(v)) == 1 && v[0] == '1') {
+        lazy_ = 3;
+        SSPC_LOG(GPU, Warning, "R12: SSPC_R12_LIGHT_LIST_KEEP=1 - the tiled lighting's per-tile light index list stays "
+                               "in video memory (kept back from the host until a CPU access or a non-heap host reader)");
+    }
     if (diff_pipeline_ != VK_NULL_HANDLE) {
         SSPC_LOG(GPU, Info, "native backend: buffer cache: write-backs of ranges >= {} KiB write only the words the GPU "
                             "changed (a video memory shadow per range)",
@@ -681,7 +688,8 @@ bool BufferCache::Prepare(u64 addr, u64 size, bool write, VkCommandBuffer cb, u6
         if (heap_reads_ && !write && size >= kHeapMin) {
             ++heap_unflushed_; // REA-2: a vertex-data heap - GPU-written data in its range is not what it reads
         } else {
-            FlushWritten(addr, size, cb, seq);
+            // (R12 mode 3: a heap reading leaves the light index list kept back - REA-2's assumption for that range)
+            FlushWritten(addr, size, cb, seq, lazy_ == 3 && !write && size >= kHeapMin);
         }
         if (write) {
             Invalidate(addr, size);
@@ -885,14 +893,29 @@ std::string BufferCache::LargeBindReport() const {
     return out;
 }
 
-void BufferCache::FlushWritten(u64 addr, u64 size, VkCommandBuffer cb, u64 seq) {
+void BufferCache::AddGpuOnlyRange(u64 addr, u64 size) {
+    const std::pair<u64, u64> r{addr, addr + size};
+    if (lazy_ != 3 || std::ranges::find(gpu_only_, r) != gpu_only_.end() || gpu_only_.size() >= 4) {
+        return;
+    }
+    gpu_only_.push_back(r);
+    SSPC_LOG(GPU, Info, "R12: light index list [{:#x}, +{:#x}) registered as GPU-only (kept back from the host)", addr,
+             size);
+}
+
+bool BufferCache::InGpuOnlyRange(u64 block) const {
+    const u64 b = block << kBlockBits, e = b + (1ull << kBlockBits);
+    return std::ranges::any_of(gpu_only_, [&](const std::pair<u64, u64>& r) { return r.first <= b && e <= r.second; });
+}
+
+void BufferCache::FlushWritten(u64 addr, u64 size, VkCommandBuffer cb, u64 seq, bool skip_gpu_only) {
     // this batch's GPU writes overlapping [addr, addr + size): copied back to the host now (a host import of the range
     // is accessed next) and dropped from the batch end's write-back - the host import may be written next (a shader
     // through it, WRITE_DATA): the end's copy of the older video memory bytes would undo that (review HIGH 1)
     const u64 end = addr + size;
     bool any = false;
     // FB-7: what earlier batches kept back there reaches the host first (the host import is read or written next)
-    FlushDeferred(addr, size, cb, seq, false, 0);
+    FlushDeferred(addr, size, cb, seq, false, 0, skip_gpu_only);
     for (const auto& [b, e] : written_) {
         if (b >= end || e <= addr) {
             continue;
@@ -1186,7 +1209,7 @@ void BufferCache::RecordWriteBack(VkCommandBuffer cb, u64 seq) {
             for (u64 blk = (d.b + kBlock - 1) >> kBlockBits; blk < (d.e >> kBlockBits); ++blk) {
                 Block* bp = FindBlock(blk);
                 bool keep = bp != nullptr && bp->deferred;
-                if (!keep && bp != nullptr && !bp->eager && bp->valid == 0xFFFF) {
+                if (!keep && bp != nullptr && !bp->eager && bp->valid == 0xFFFF && (lazy_ != 3 || InGpuOnlyRange(blk))) {
                     if (lazy_ == 2) {
                         ++stats_.lazy_would_defer;
                     } else if (tracker_->Hide(blk << kBlockBits)) {
@@ -1300,11 +1323,17 @@ void BufferCache::DiffPiece(VkCommandBuffer cb, u64 a, u64 piece, const WbShadow
 }
 
 bool BufferCache::KeptBack(u64 addr, u64 size) const {
-    return lazy_ == 1 && tracker_ != nullptr && tracker_->Hidden(addr, size);
+    return (lazy_ == 1 || lazy_ == 3) && tracker_ != nullptr && tracker_->Hidden(addr, size);
 }
 
-bool BufferCache::FlushDeferred(u64 addr, u64 size, VkCommandBuffer cb, u64 seq, bool eager, u32 why) {
+bool BufferCache::FlushDeferred(u64 addr, u64 size, VkCommandBuffer cb, u64 seq, bool eager, u32 why,
+                                bool skip_gpu_only) {
     if (deferred_count_ == 0 || size == 0) {
+        return false;
+    }
+    if (skip_gpu_only && lazy_ == 3) {
+        // (R12 mode 3 keeps back only blocks of the registered GPU-only ranges: a heap reading leaves them all)
+        ++gpu_only_heap_skips_;
         return false;
     }
     const u64 end = std::min(addr + size, space_);
