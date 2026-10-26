@@ -6557,13 +6557,21 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     DiagCaptureDraw(prep.pipeline, color_img, true);
     stage(stats_.t_emit);
     if (prof_) {
-        ProfMark((u64{prep.pipeline} << 2) | 0,
-                 fmt::format("draw pipeline {} vs {:#x} ps {:#x} prim {} target {}x{} rt0 fmt {} depth {}", prep.pipeline,
-                             vs.address, has_ps ? ps.address : 0, d.primitive_type, key.width, key.height,
-                             color_img[0] != nullptr ? color_img[0]->layout.pixel_format : 0, depth_img != nullptr));
-        ProfDescribe((u64{prep.pipeline} << 2) | 0, "draw: vertex stage", &vs, bound);
+        // R12 wfx: the key also tells the targets apart (16 bits of a hash of the rt0 and depth guest addresses in
+        // bits 48..63; the low bits stay the pipeline's) - the same pipeline in two passes shows as two rows, each with
+        // its targets' addresses, which name the engine's pass (frame trace, RENDER_ENGINE_PASSES.md)
+        const u64 rt0_addr = color_img[0] != nullptr ? color_img[0]->layout.guest_address : 0;
+        const u64 depth_addr = depth_img != nullptr ? depth_img->layout.guest_address : 0;
+        const u64 tgt_hash = ((rt0_addr * 0x9E3779B97F4A7C15ull) ^ (depth_addr * 0xC2B2AE3D27D4EB4Full)) >> 48;
+        ProfMark((tgt_hash << 48) | (u64{prep.pipeline} << 2) | 0,
+                 fmt::format("draw pipeline {} vs {:#x} ps {:#x} prim {} target {}x{} rt0 fmt {} depth {} rt0 {:#x} "
+                             "ds {:#x}",
+                             prep.pipeline, vs.address, has_ps ? ps.address : 0, d.primitive_type, key.width,
+                             key.height, color_img[0] != nullptr ? color_img[0]->layout.pixel_format : 0,
+                             depth_img != nullptr, rt0_addr, depth_addr));
+        ProfDescribe((tgt_hash << 48) | (u64{prep.pipeline} << 2) | 0, "draw: vertex stage", &vs, bound);
         if (has_ps) {
-            ProfDescribe((u64{prep.pipeline} << 2) | 0x8000000000000000ull, "draw: pixel stage", &ps, bound);
+            ProfDescribe(((tgt_hash << 48) | (u64{prep.pipeline} << 2)) ^ 0x8000000000000000ull, "draw: pixel stage", &ps, bound);
         }
     }
     if (texdump_.active) { // (F8: the textures this draw reads, once each)
