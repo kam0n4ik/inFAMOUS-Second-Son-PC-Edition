@@ -908,7 +908,8 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
               !contains(graphics, "graphics.fsr") && !contains(graphics, "upscaling.output") &&
               !contains(graphics, "upscaling.frameGenMultiplier") && contains(graphics, "graphics.smokeQuality") &&
               contains(graphics, "info.render") && contains(graphics, "graphics.motionBlur") &&
-              contains(graphics, "graphics.motionBlurStrength") && !contains(graphics, "graphics.filmGrain") &&
+              contains(graphics, "graphics.motionBlurStrength") && contains(graphics, "graphics.reflectionQuality") &&
+              !contains(graphics, "graphics.filmGrain") &&
               !contains(graphics, "graphics.depthOfField"),
           fmt::format("{} rows", graphics.size()));
 
@@ -1186,6 +1187,53 @@ void PostFxChecks(const CheckFn& check, const fs::path& dir) {
           "");
 }
 
+// R12 refl: [Graphics] reflectionQuality (docs/R12_REFLECTIONS.md)
+void ReflectionChecks(const CheckFn& check, const fs::path& dir) {
+    const auto g = "Settings.reflections";
+    const auto defaults = TestConfig();
+    Service s;
+    const auto file = dir / "reflections.toml";
+    std::error_code ec;
+    fs::remove(file, ec);
+    s.Init(defaults, {}, defaults, file, Capability::Window | Capability::LiveVolume);
+    std::vector<std::string> applied;
+    s.AddApplier([&applied](const App::Config&, std::span<const Desc* const> changed) {
+        for (const auto* d : changed) {
+            applied.emplace_back(d->id);
+        }
+    });
+    const Desc* rq = Find("graphics.reflectionQuality");
+    check(g, "reflection quality exists, a live choice in [Graphics], available on either backend",
+          rq && rq->apply == Apply::Live && rq->type == Type::Choice && rq->table == "Graphics" &&
+              rq->key == "reflectionQuality" && rq->category == Category::Graphics && s.Available(*rq).available,
+          "");
+    if (!rq) {
+        return;
+    }
+    check(g, "levels: original and low only (no level that is not measured)",
+          rq->choices.size() == 2 && rq->choices[0].value == "original" && rq->choices[1].value == "low", "");
+    check(g, "default: the game's own (original)",
+          std::get<std::string>(s.Get(*rq)) == "original" && defaults.pc.reflection_quality == "original" &&
+              !s.IsOverridden(*rq),
+          "");
+    check(g, "low: applied live, an unknown value refused",
+          s.Set(*rq, Value{std::string("low")}) == SetResult::Ok && s.Current().pc.reflection_quality == "low" &&
+              applied == std::vector<std::string>{"graphics.reflectionQuality"} &&
+              s.Set(*rq, Value{std::string("ultra")}) == SetResult::Invalid,
+          s.Current().pc.reflection_quality);
+    const bool flushed = s.Flush(5000);
+    Overrides on_disk;
+    const auto rep = LoadUserFile(file, on_disk);
+    auto restarted = defaults;
+    ApplyOverrides(restarted, on_disk);
+    check(g, "saved and restored at the next start",
+          flushed && rep.status == LoadReport::Status::Loaded && restarted.pc.reflection_quality == "low",
+          fmt::format("{} keys", on_disk.size()));
+    s.ResetCategory(Category::Graphics);
+    check(g, "reset Graphics: back to the game's own",
+          s.Current().pc.reflection_quality == "original" && !s.IsOverridden(*rq), "");
+}
+
 void RunChecks(const CheckFn& check, const std::filesystem::path& scratch) {
     std::error_code ec;
     std::filesystem::create_directories(scratch, ec);
@@ -1193,6 +1241,7 @@ void RunChecks(const CheckFn& check, const std::filesystem::path& scratch) {
     UserFile(check, scratch);
     ServiceChecks(check, scratch);
     PostFxChecks(check, scratch);
+    ReflectionChecks(check, scratch);
     ConfigChecks(check, scratch);
     BindingChecks(check);
     KeyboardMouseChecks(check);

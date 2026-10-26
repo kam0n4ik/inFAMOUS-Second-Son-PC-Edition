@@ -43,6 +43,9 @@ struct PcSettings {
     // the game's own
     bool motion_blur = true;
     u32 motion_blur_strength = 100; // 10..100 %: the game's blur length scaled
+    // [Graphics] the game's reflections (src/engine/render/reflections.h); both backends. "original" (the game's own) |
+    // "low" (no screen-space reflections: the environment's cube maps, the wetness and the water stay)
+    std::string reflection_quality = "original";
     // [Graphics] upscaling and frame generation (native backend; docs/UPSCALING_FRAME_GENERATION.md)
     std::string upscaler = "off";            // "off" | "dlss" | "fsr"
     std::string upscale_quality = "quality"; // "native" | "quality" | "balanced" | "performance" | "ultra"

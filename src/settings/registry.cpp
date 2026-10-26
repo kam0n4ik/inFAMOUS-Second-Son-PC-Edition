@@ -130,6 +130,10 @@ constexpr Choice kParticleResolutions[] = {
     {"half", "Half", "Половина"},
     {"quarter", "Quarter", "Четверть"},
 };
+constexpr Choice kReflectionQualities[] = { // (R12 refl; docs/R12_REFLECTIONS.md)
+    {"original", "Original", "Исходное"},
+    {"low", "Low (no screen-space reflections)", "Низкое (без экранных отражений)"},
+};
 constexpr Choice kUpscalers[] = {
     {"off", "Off (Render scale)", "Выключено (масштаб рендеринга)"},
     {"dlss", "NVIDIA DLSS", "NVIDIA DLSS"},
@@ -561,6 +565,23 @@ void Build(Registry& r) {
             c.pc.motion_blur_strength = static_cast<u32>(std::get<s64>(x));
         },
         .requires_on = "graphics.motionBlur",
+    });
+    // ------------------------------------------------------------------ Graphics: reflections (R12 refl)
+    v.push_back(Desc{
+        .id = "graphics.reflectionQuality", .table = "Graphics", .key = "reflectionQuality",
+        .category = Category::Graphics, .type = Type::Choice, .apply = Apply::Live, .choices = kReflectionQualities,
+        .en = "Reflection quality", .ru = "Качество отражений",
+        .help_en = "Original: as in the game. Low: without the game's screen-space reflections - what is on screen "
+                   "(lamps, signs, headlights, buildings) mirrored in wet roads and puddles. The lights themselves, "
+                   "their highlights on wet surfaces, the wetness, the reflection maps and the water's own reflection "
+                   "stay. Saves about 0.4 ms of GPU time per frame (about 2% FPS in the evening city). Applies at "
+                   "once.",
+        .help_ru = "«Исходное» — как в игре. «Низкое» — без экранных отражений игры: того, что видно на экране "
+                   "(фонари, вывески, фары, дома), в мокрой дороге и лужах. Сами источники света, их блики на мокром, "
+                   "мокрота, карты отражений и собственное отражение воды остаются. Экономит около 0,4 мс работы "
+                   "видеокарты на кадр (около 2 % FPS в вечернем городе). Применяется сразу.",
+        .get = [](const Config& c, const Desc&) -> Value { return c.pc.reflection_quality; },
+        .set = [](Config& c, const Desc&, const Value& x) { c.pc.reflection_quality = std::get<std::string>(x); },
     });
     // (film grain: the pass and its parameter exist, but no place played so far sets it - not offered; depth of
     // field: see kMissing; R11_POSTFX.md)
