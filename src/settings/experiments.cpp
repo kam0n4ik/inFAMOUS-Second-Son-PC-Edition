@@ -25,6 +25,18 @@ constexpr Choice kWeatherStates[] = {
     {"log", "Journal only", "Только журнал"},
     {"dry", "Dry surfaces", "Сухие поверхности"},
 };
+constexpr Choice kReflDiags[] = {
+    {"", "Off", "Выключено"},
+    {"ssroff", "No screen-space reflections", "Без экранных отражений"},
+    {"ssrflip", "Screen-space reflections every other frame", "Экранные отражения через кадр"},
+    {"ssrcycle", "Screen-space reflections every other second", "Экранные отражения через секунду"},
+    {"planaroff", "No planar reflections", "Без планарных отражений"},
+    {"wateroff", "No water reflection (black)", "Без отражения воды (чёрное)"},
+};
+constexpr Choice kReflStats[] = {
+    {"", "Off", "Выключено"},
+    {"5", "Every 5 s", "Раз в 5 с"},
+};
 
 constexpr std::string_view kCpEn = "Command processor", kCpRu = "Обработчик команд GPU";
 constexpr std::string_view kVkEn = "Vulkan recording", kVkRu = "Запись команд Vulkan";
@@ -257,6 +269,26 @@ constexpr Experiment kExperiments[] = {
                 "(~2 мкс на кадр). «Сухие поверхности» — мокрота и лужи 0 во времени суток, которое загрузила "
                 "игра; на выходе возвращаются её значения, сохранения не меняются. Дождь и ночь задаёт сохранение, "
                 "а не этот переключатель. Действует со следующего запуска."},
+    // R12 reflections (docs/R12_REFLECTIONS.md); the player's switch is [Graphics] reflectionQuality
+    {.env = "SSPC_R12_REFL_STATS", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kReflStats, .unset_shows = "", .en = "Reflection statistics", .ru = "Статистика отражений",
+     .help_en = "Diagnostics, off. A log line every few seconds: the reflection passes' calls and the time of day's "
+                "reflection values. The picture is unchanged.",
+     .help_ru = "Диагностика, выключено. Строка журнала раз в несколько секунд: вызовы проходов отражений и "
+                "значения отражений времени суток. Картинка не меняется."},
+    {.env = "SSPC_R12_REFL_DIAG", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kReflDiags, .unset_shows = "", .en = "Reflection diagnostics (changes the picture)",
+     .ru = "Диагностика отражений (меняет картинку)",
+     .help_en = "Diagnostics for A/B runs, off. Skips one reflection pass to measure its cost; without the water "
+                "reflection the water turns black (the game has no other path), so it is not a quality level.",
+     .help_ru = "Диагностика для A/B, выключено. Пропускает один проход отражений, чтобы измерить его цену; без "
+                "отражения воды вода чёрная (другого пути у игры нет), поэтому это не уровень качества."},
+    {.env = "SSPC_R12_REFL_HOOK", .group_en = kStandEn, .group_ru = kStandRu, .on = "0", .off = "",
+     .en = "No reflection probe", .ru = "Без пробы отражений",
+     .help_en = "Diagnostics, off. The reflection probe is not installed: the game's own path, and «Reflection "
+                "quality» has no effect.",
+     .help_ru = "Диагностика, выключено. Проба отражений не ставится: путь игры как есть, пункт «Качество "
+                "отражений» не действует."},
 };
 
 std::string GetEnv(std::string_view name) {
