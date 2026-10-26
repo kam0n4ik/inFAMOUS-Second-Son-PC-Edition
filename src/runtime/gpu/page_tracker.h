@@ -60,6 +60,8 @@ public:
     /// Some block of [addr, addr + size) is hidden. Any thread.
     bool Hidden(u64 addr, u64 size) const;
     u64 HiddenFaults() const { return hidden_faults_.load(std::memory_order_relaxed); }
+    /// Read faults on a block shown (or hidden again) by another thread between the fault and its check: retried
+    u64 HiddenRaced() const { return hidden_raced_.load(std::memory_order_relaxed); }
 
     /// Calls `fn(addr, size)` for every range written since the last drain (adjacent blocks coalesced). GPU thread.
     template <class F>
@@ -133,6 +135,8 @@ private:
     std::atomic<HiddenSync> hidden_sync_{nullptr};
     void* hidden_sync_ctx_ = nullptr;
     std::atomic<u64> hidden_faults_{0};
+    std::atomic<u64> hidden_raced_{0};
+    std::atomic<bool> ever_hidden_{false}; ///< some block was hidden (only then a read fault can be FB-7's)
     std::atomic<bool> any_{false};
     std::atomic<u64> armed_pages_{0}, arms_{0}, disarms_{0}, faults_{0}, faults_raced_{0}, forgotten_{0};
     std::atomic<u64> never_blocks_{0};

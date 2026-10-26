@@ -2760,14 +2760,14 @@ std::string Backend::Report() {
         if (buffers_->Lazy() != 0) {
             const auto& es = executor_->Stats();
             out += fmt::format("FB-7 lazy write-back ({}): blocks kept back {}, would have been {}; written back by a "
-                               "reader {} times ({} blocks, {} runs of several, {} without a shadow); CPU faults on hidden blocks {}, "
+                               "reader {} times ({} blocks, {} runs of several, {} without a shadow); CPU faults on hidden blocks {} (raced with another thread's and retried {}), "
                                "served for other threads {} (on the recording thread itself {}); exact invalidations "
                                "of a hidden block {}, dropped (unmapped) {}; written back by a GPU reader of the host "
                                "import {}, the executor's CPU-side reads {}, the processor {}, a request {}\n",
                                buffers_->Lazy() == 1 ? "on" : buffers_->Lazy() == 3 ? "R12 light index list only"
                                                                                    : "verify",
                                b.lazy_deferred, b.lazy_would_defer,
-                               b.lazy_flushes, b.lazy_flush_blocks, b.lazy_flush_runs, b.lazy_flush_plain, tracker_.HiddenFaults(),
+                               b.lazy_flushes, b.lazy_flush_blocks, b.lazy_flush_runs, b.lazy_flush_plain, tracker_.HiddenFaults(), tracker_.HiddenRaced(),
                                es.lazy_served, es.lazy_inline, b.lazy_unsynced_inval, b.lazy_dropped,
                                b.lazy_flush_by[0], b.lazy_flush_by[1], b.lazy_flush_by[2], b.lazy_flush_by[3]);
         }
