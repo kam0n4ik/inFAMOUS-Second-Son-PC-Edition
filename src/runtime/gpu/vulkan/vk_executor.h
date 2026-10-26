@@ -777,6 +777,15 @@ private:
     u32 inst_next_module_ = 0x40000000u, inst_next_pipeline_ = 0x80000000u;
     std::vector<InstancedBuffer> inst_bufs_;            ///< the batch being recorded: its buffers that differ
     std::vector<std::pair<u32, VkDescriptorBufferInfo>> inst_bind_; ///< BindStage: those buffers' copies (index, info)
+    /// SSPC_R12_PSORT=1 (R12 wfx, docs/R12_WEATHER_PROFILE.md): the particle ranking CS 0x2edaa0c00 replaced by
+    /// a variant of its own translation (tools/r12/psort_patch.py): its ranking loop over all the emitter's records is
+    /// computed before it by an equivalent loop without the exec-mask emulation (4 keys a step, the same compares in the
+    /// same order; the original loop then only exits). Only that exact SPIR-V (its length and FNV-1a) is replaced;
+    /// module id -> the variant (nullptr: another SPIR-V, used as it is). Ids from 0x60000000 (transient).
+    int psort_on_ = -1;
+    std::unordered_map<u32, std::unique_ptr<GS::Module>> psort_variants_;
+    u32 psort_next_module_ = 0x60000000u;
+    const GS::Module* PsortVariant(const GS::Module& cs, u64 address);
     std::vector<VkMultiDrawIndexedInfoEXT> inst_draws_;
     std::vector<std::pair<u32, VkDescriptorBufferInfo>> inst_runs_; ///< the copies' descriptors (binding, info)
     bool InstancingOn();

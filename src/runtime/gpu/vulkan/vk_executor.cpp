@@ -39,6 +39,7 @@
 #include "runtime/gpu/vulkan/vk_formats.h"
 #include "runtime/gpu/vulkan/vk_image_cache.h"
 #include "runtime/gpu/vulkan/vk_presenter.h"
+#include "runtime/gpu/vulkan/vk_r12_psort_spv.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
 #include "runtime/filesystem/fs_host.h"
 #include "runtime/media/videodec.h"
@@ -4851,6 +4852,50 @@ Executor::InstVariant* Executor::InstancedVariant(const GS::Module& vs) {
     return &v;
 }
 
+const GS::Module* Executor::PsortVariant(const GS::Module& cs, u64 address) {
+    if (psort_on_ < 0) {
+        char v[4] = {};
+        psort_on_ = GetEnvironmentVariableA("SSPC_R12_PSORT", v, sizeof(v)) == 1 && v[0] == '1' ? 1 : 0;
+        SSPC_LOG(GPU, Info, "SSPC_R12_PSORT: {}", psort_on_ != 0 ? "on (cs 0x2edaa0c00's ranking loop without the exec-mask emulation)" : "off");
+        if (psort_on_ == 0) {
+            return nullptr;
+        }
+    }
+    const std::vector<u32>& spirv = cs.result.spirv;
+    if (spirv.size() != kR12PsortOrigWords) {
+        return nullptr; // (most programs: one compare)
+    }
+    auto [it, fresh] = psort_variants_.try_emplace(cs.id);
+    if (fresh) {
+        u64 h = 1469598103934665603ull; // FNV-1a over the SPIR-V's bytes (as tools/r12/psort_patch.py)
+        for (const u32 w : spirv) {
+            for (u32 b = 0; b < 4; ++b) {
+                h = (h ^ ((w >> (b * 8)) & 0xFFu)) * 1099511628211ull;
+            }
+        }
+        if (h != kR12PsortOrigFnv) {
+            SSPC_LOG(GPU, Info, "SSPC_R12_PSORT: cs {:#x} module {}: another SPIR-V ({:016x}), used as it is",
+                     address, cs.id, h);
+            return nullptr;
+        }
+        auto m = std::make_unique<GS::Module>();
+        m->id = psort_next_module_++; // (>= 0x40000000: transient, not in the precompile manifest)
+        m->key = cs.key;
+        m->keyed = cs.keyed;
+        m->result = cs.result;
+        m->result.spirv.assign(std::begin(kR12PsortSpirv), std::end(kR12PsortSpirv));
+        m->runtime = cs.runtime;
+        m->start = cs.start;
+        m->prepared = true;
+        m->spirv_hash = GS::HashSpirv(m->result.spirv);
+        m->state.store(GS::ModuleState::Ready, std::memory_order_release);
+        SSPC_LOG(GPU, Info, "SSPC_R12_PSORT: cs {:#x} module {} -> variant {} ({} -> {} SPIR-V words)", address,
+                 cs.id, m->id, spirv.size(), m->result.spirv.size());
+        it->second = std::move(m);
+    }
+    return it->second.get();
+}
+
 bool Executor::GatherInstanced(u64 align) {
     inst_bind_.clear();
     const u64 completed = timeline_.CompletedCached();
@@ -7387,7 +7432,13 @@ void Executor::RecordDispatch(const Cp::DispatchDescriptor& d, const Cp::Compute
         }
     }
     std::string err;
-    const PipelineObjects* pipe = pipelines_.Compute(*csv.module, csv.plan, err);
+    const GS::Module* cs_module = csv.module;
+    if (psort_on_ != 0) { // SSPC_R12_PSORT: the particle ranking CS's variant (the same bindings and plan)
+        if (const GS::Module* v = PsortVariant(*csv.module, csv.address); v != nullptr) {
+            cs_module = v;
+        }
+    }
+    const PipelineObjects* pipe = pipelines_.Compute(*cs_module, csv.plan, err);
     DiagDumpShader(csv.address, csv.program != nullptr ? &csv.program->code : nullptr, csv.module->result.spirv,
                    csv.runtime, 0);
     if (pipe == nullptr) {
