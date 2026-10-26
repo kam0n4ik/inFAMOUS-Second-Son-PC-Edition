@@ -68,6 +68,7 @@ constexpr std::string_view kCpuEn = "Processor threads", kCpuRu = "Потоки 
 constexpr std::string_view kEngineEn = "Draws from the engine's data (R10)", kEngineRu = "Отрисовка из данных движка (R10)";
 constexpr std::string_view kSysEn = "System libraries", kSysRu = "Системные библиотеки";
 constexpr std::string_view kStandEn = "Stand tools (R12)", kStandRu = "Инструменты стенда (R12)";
+constexpr std::string_view kFxEn = "Particles and weather (R12)", kFxRu = "Частицы и погода (R12)";
 
 constexpr Experiment kExperiments[] = {
     // ---- command processor (play.cmd)
@@ -298,6 +299,14 @@ constexpr Experiment kExperiments[] = {
                 "walking its resource tables (15.2 million checks, no difference). No FPS change measured.",
      .help_ru = "Эксперимент, выключено. Отрисовки теней (0x43d480) готовятся из состояния движка, без обхода "
                 "таблиц ресурсов (15,2 млн проверок, расхождений нет). Изменения FPS не замерено."},
+
+    // ---- particles and weather (R12)
+    {.env = "SSPC_R12_PSORT", .group_en = kFxEn, .group_ru = kFxRu, .on = "1", .off = "0",
+     .en = "Fast particle sort (R12)", .ru = "Быстрая сортировка частиц (R12)",
+     .help_en = "Experiment, off. The particles' ranking shader (0x2edaa0c00, 80 runs a frame in the owner's save) "
+                "without the emulation of the console's lane masks: 8.5 -> 1.5 ms of GPU a frame there, the same results.",
+     .help_ru = "Эксперимент, выключено. Шейдер ранжирования частиц (0x2edaa0c00, 80 запусков за кадр в сохранении "
+                "владельца) без эмуляции масок линий консоли: 8,5 -> 1,5 мс видеокарты за кадр, результат тот же."},
 
     // ---- system libraries (play.cmd)
     {.env = "SSPC_R10_AJM", .group_en = kSysEn, .group_ru = kSysRu, .on = "native", .off = "bridge",
