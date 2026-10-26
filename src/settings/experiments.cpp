@@ -20,6 +20,11 @@ constexpr Choice kCpRings[] = {
     {"128", "128 records (play.cmd)", "128 записей (play.cmd)"},
     {"512", "512 records", "512 записей"},
 };
+constexpr Choice kWeatherStates[] = {
+    {"", "Off (the game's own)", "Выключено (как в игре)"},
+    {"log", "Journal only", "Только журнал"},
+    {"dry", "Dry surfaces", "Сухие поверхности"},
+};
 
 constexpr std::string_view kCpEn = "Command processor", kCpRu = "Обработчик команд GPU";
 constexpr std::string_view kVkEn = "Vulkan recording", kVkRu = "Запись команд Vulkan";
@@ -28,6 +33,7 @@ constexpr std::string_view kQueueEn = "GPU queues and frame pacing", kQueueRu = 
 constexpr std::string_view kCpuEn = "Processor threads", kCpuRu = "Потоки процессора";
 constexpr std::string_view kEngineEn = "Draws from the engine's data (R10)", kEngineRu = "Отрисовка из данных движка (R10)";
 constexpr std::string_view kSysEn = "System libraries", kSysRu = "Системные библиотеки";
+constexpr std::string_view kStandEn = "Stand tools (R12)", kStandRu = "Инструменты стенда (R12)";
 
 constexpr Experiment kExperiments[] = {
     // ---- command processor (play.cmd)
@@ -238,6 +244,19 @@ constexpr Experiment kExperiments[] = {
                 "On in play.cmd. Off: shadPS4's.",
      .help_ru = "CommonDialog, libSceNet и часть libc на собственном коде SecondSonPC (102 проверки самотеста). "
                 "Включено в play.cmd. Выключено — как в shadPS4."},
+
+    // ---- stand tools (R12 weather, docs/R12_WEATHER.md)
+    {.env = "SSPC_R12_WEATHER", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kWeatherStates, .unset_shows = "", .en = "Weather state for measurements",
+     .ru = "Состояние погоды для замеров",
+     .help_en = "Stand tool, off. Journal only: writes the engine's weather values to weather.log (~2 us a frame). "
+                "Dry surfaces: wetness and puddles at 0 in the time of day the game loaded, its own values restored "
+                "on exit; saves are never written. Rain and night come from the save, not from this switch. Takes "
+                "effect at the next start.",
+     .help_ru = "Инструмент стенда, выключено. «Только журнал» — значения погоды движка пишутся в weather.log "
+                "(~2 мкс на кадр). «Сухие поверхности» — мокрота и лужи 0 во времени суток, которое загрузила "
+                "игра; на выходе возвращаются её значения, сохранения не меняются. Дождь и ночь задаёт сохранение, "
+                "а не этот переключатель. Действует со следующего запуска."},
 };
 
 std::string GetEnv(std::string_view name) {

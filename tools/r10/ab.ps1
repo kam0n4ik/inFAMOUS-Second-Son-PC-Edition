@@ -69,6 +69,9 @@ foreach ($sc in $Scenes.Split(',', [StringSplitOptions]::RemoveEmptyEntries)) {
                     "fight" { & "$Worktree\tools\r9\r9run.ps1" -Worktree $Worktree -Tag $tag -Route fight -Scene city -Env $envs -Out $dir | Out-Null; $w = 45, 140 }
                     "city"  { & "$Worktree\tools\r9\r9run.ps1" -Worktree $Worktree -Tag $tag -Route traverse -Scene city -Env $envs -Out $dir | Out-Null; $w = 45, 140 }
                     "neon"  { & "$Worktree\tools\r9\r9run.ps1" -Worktree $Worktree -Tag $tag -Route neon -Scene neon -Env $envs -Out $dir | Out-Null; $w = 42, 133 }
+                    # R12: rain by day (time_of_day_blustery save, docs/R12_WEATHER.md), standing / running
+                    "rainday" { & "$Worktree\tools\r9\r9run.ps1" -Worktree $Worktree -Tag $tag -Route calm -Scene rainday -Env $envs -Out $dir | Out-Null; $w = 45, 118 }
+                    "rainrun" { & "$Worktree\tools\r9\r9run.ps1" -Worktree $Worktree -Tag $tag -Route traverse -Scene rainday -Env $envs -Out $dir | Out-Null; $w = 45, 140 }
                     default { & "E:\research\deep_perf\tools\run1.ps1" -Worktree $Worktree -Tag $tag -Scene $scene -Env "$launcher;$envs" -Out $dir | Out-Null; $w = 62, 88 }
                 }
                 $bg = Get-Background "$dir\$tag" $w[0] $w[1]
