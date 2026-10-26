@@ -37,6 +37,19 @@ constexpr Choice kReflStats[] = {
     {"", "Off", "Выключено"},
     {"5", "Every 5 s", "Раз в 5 с"},
 };
+constexpr Choice kRainStats[] = {
+    {"", "Off", "Выключено"},
+    {"5", "Every 5 s", "Раз в 5 с"},
+};
+constexpr Choice kRainDistances[] = {
+    {"", "Off (the game's 10000)", "Выключено (как в игре, 10000)"},
+    {"5000", "5000", "5000"},
+    {"2500", "2500", "2500"},
+};
+constexpr Choice kRainCycles[] = {
+    {"", "Off", "Выключено"},
+    {"10", "Every 10 s", "Каждые 10 с"},
+};
 constexpr Choice kWriterDetails[] = {
     {"", "Off", "Выключено"},
     {"2edafa400", "Tiled lighting shader", "Шейдер тайлового освещения"},
@@ -332,6 +345,44 @@ constexpr Experiment kExperiments[] = {
                 "quality» has no effect.",
      .help_ru = "Диагностика, выключено. Проба отражений не ставится: путь игры как есть, пункт «Качество "
                 "отражений» не действует."},
+    // R12 rain shadows (docs/R12_RAIN_SHADOWS.md); the player's switch is [Graphics] rainShadows
+    {.env = "SSPC_R12_RAIN_STATS", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kRainStats, .unset_shows = "", .en = "Rain shadow statistics", .ru = "Статистика теней дождя",
+     .help_en = "Diagnostics, off. A log line every few seconds: the rain shadow maps' updates, emptied and "
+                "released maps, their cascades, the wetness and the rain shadow distance. The picture is unchanged.",
+     .help_ru = "Диагностика, выключено. Строка журнала раз в несколько секунд: обновления, опустошённые и "
+                "освобождённые карты теней дождя, их каскады, мокрота и дальность теней дождя. Картинка не "
+                "меняется."},
+    {.env = "SSPC_R12_RAIN_DIST", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kRainDistances, .unset_shows = "", .en = "Rain shadow distance (changes the picture)",
+     .ru = "Дальность теней дождя (меняет картинку)",
+     .help_en = "Diagnostics for A/B runs, off. Writes the engine's own CSM1_RAIN_SHADOW_DISTANCE (10000 in the "
+                "game) before each rain shadow update, to measure what a shorter map saves. Not a quality level.",
+     .help_ru = "Диагностика для A/B, выключено. Записывает собственный параметр движка CSM1_RAIN_SHADOW_DISTANCE "
+                "(в игре 10000) перед каждым обновлением теней дождя, чтобы измерить, что даёт меньшая карта. Не "
+                "уровень качества."},
+    {.env = "SSPC_R12_RAIN_CYCLE", .group_en = kStandEn, .group_ru = kStandRu, .type = Type::Choice,
+     .choices = kRainCycles, .unset_shows = "", .en = "Rain shadows on and off (changes the picture)",
+     .ru = "Тени дождя вкл/выкл по очереди (меняет картинку)",
+     .help_en = "Diagnostics, off. Switches the rain shadows off and back on every few seconds - the path of the "
+                "live switch, over and over, to check it in motion. Overrides «Rain shadows».",
+     .help_ru = "Диагностика, выключено. Каждые несколько секунд выключает и снова включает тени дождя — путь "
+                "переключения на лету, много раз подряд, для проверки в движении. Перекрывает пункт «Тени дождя»."},
+    {.env = "SSPC_R12_RAIN_DIAG", .group_en = kStandEn, .group_ru = kStandRu, .on = "release", .off = "",
+     .en = "Rain shadows off by releasing the maps (breaks the picture)",
+     .ru = "Тени дождя выкл. освобождением карт (ломает картинку)",
+     .help_en = "Diagnostics, off. «Rain shadows: Off» takes the game's own dry-weather path (the maps are released) "
+                "while it rains: on this emulator the whole frame turns grey and loses its haze. Kept only to show "
+                "why the setting empties the map instead.",
+     .help_ru = "Диагностика, выключено. «Тени дождя: выключены» идут путём игры для сухой погоды (карты "
+                "освобождаются) во время дождя: на этом эмуляторе весь кадр становится серым и теряет дымку. "
+                "Оставлено только чтобы показать, почему пункт вместо этого опустошает карту."},
+    {.env = "SSPC_R12_RAIN_HOOK", .group_en = kStandEn, .group_ru = kStandRu, .on = "0", .off = "",
+     .en = "No rain shadow hooks", .ru = "Без перехвата теней дождя",
+     .help_en = "Diagnostics, off. The rain shadow hooks are not installed: the game's own path, and «Rain "
+                "shadows» has no effect.",
+     .help_ru = "Диагностика, выключено. Перехват теней дождя не ставится: путь игры как есть, пункт «Тени "
+                "дождя» не действует."},
     // R12 lights (docs/R12_LIGHTS.md)
     {.env = "SSPC_R12_LIGHT_CENSUS", .group_en = kStandEn, .group_ru = kStandRu, .on = "1", .off = "",
      .en = "Light census", .ru = "Перепись источников света",

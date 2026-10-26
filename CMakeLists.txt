@@ -43,6 +43,7 @@ add_library(sspc_runtime STATIC
     src/engine/render/post_effects.cpp
     src/engine/render/weather.cpp
     src/engine/render/reflections.cpp
+    src/engine/render/rain_shadows.cpp
     src/engine/ui/game_menu.cpp
     src/engine/render/display_plan.cpp
     src/engine/render/render_resolution.cpp

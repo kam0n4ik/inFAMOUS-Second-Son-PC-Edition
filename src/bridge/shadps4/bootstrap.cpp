@@ -74,6 +74,7 @@
 #include "engine/particles/smoke_quality.h"
 #include "engine/render/post_effects.h"
 #include "engine/render/weather.h"
+#include "engine/render/rain_shadows.h"
 #include "engine/render/reflections.h"
 #include "engine/render/frame_trace.h"
 #include "engine/render/draw_census.h"
@@ -910,6 +911,9 @@ void RunSspcLoader(const App::Config& cfg, const std::string& guest_eboot_path,
     // R12 reflections (both backends; docs/R12_REFLECTIONS.md): the game's own unless [Graphics] reflectionQuality
     // (SSPC_REFLECTION_QUALITY); diagnostics SSPC_R12_REFL_STATS / _DIAG
     Engine::Render::Reflections::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.reflection_quality);
+    // R12 rain shadows (both backends; docs/R12_RAIN_SHADOWS.md): the game's own unless [Graphics] rainShadows
+    // (SSPC_RAIN_SHADOWS); diagnostics SSPC_R12_RAIN_STATS / _DIST / _HOOK
+    Engine::Render::RainShadows::Install(linker.GetModule(eboot_index)->Base(), cfg.pc.rain_shadows);
     // Upscaling (docs/UPSCALING_FRAME_GENERATION.md): with DLSS / FSR the game's scene renders at the quality's render
     // size (the engine's own render size, written before it starts); the display and the UI keep the plan's size.
     {

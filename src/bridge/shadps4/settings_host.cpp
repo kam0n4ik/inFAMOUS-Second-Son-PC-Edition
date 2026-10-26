@@ -17,6 +17,7 @@
 #include "core/emulator_settings.h"
 #include "engine/particles/smoke_quality.h"
 #include "engine/render/post_effects.h"
+#include "engine/render/rain_shadows.h"
 #include "engine/render/reflections.h"
 #include "engine/render/render_resolution.h"
 #include "runtime/gpu/native_backend.h"
@@ -158,6 +159,8 @@ void InstallSettingsHost(const App::Config& cfg, SDL_Window* window, bool test_m
                 Engine::Render::PostFx::SetMotionBlurStrength(c.pc.motion_blur_strength);
             } else if (d->id == "graphics.reflectionQuality") {
                 Engine::Render::Reflections::SetQuality(c.pc.reflection_quality); // at the game's next frame
+            } else if (d->id == "graphics.rainShadows") {
+                Engine::Render::RainShadows::SetMode(c.pc.rain_shadows); // at the game's next frame
             } else if (d->id == "graphics.renderScale" && !bridge_presenter) {
                 Engine::Render::SetRenderScale(Engine::Render::ParseRenderScale(c.pc.render_scale));
                 upscaling = true; // (the scene size switches at the game's next frame, as the upscalers')

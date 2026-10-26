@@ -909,7 +909,7 @@ void MenuChecks(const CheckFn& check, const fs::path& dir) {
               !contains(graphics, "upscaling.frameGenMultiplier") && contains(graphics, "graphics.smokeQuality") &&
               contains(graphics, "info.render") && contains(graphics, "graphics.motionBlur") &&
               contains(graphics, "graphics.motionBlurStrength") && contains(graphics, "graphics.reflectionQuality") &&
-              !contains(graphics, "graphics.filmGrain") &&
+              contains(graphics, "graphics.rainShadows") && !contains(graphics, "graphics.filmGrain") &&
               !contains(graphics, "graphics.depthOfField"),
           fmt::format("{} rows", graphics.size()));
 
@@ -1234,6 +1234,53 @@ void ReflectionChecks(const CheckFn& check, const fs::path& dir) {
           s.Current().pc.reflection_quality == "original" && !s.IsOverridden(*rq), "");
 }
 
+// R12 rain: [Graphics] rainShadows (docs/R12_RAIN_SHADOWS.md)
+void RainShadowChecks(const CheckFn& check, const fs::path& dir) {
+    const auto g = "Settings.rainShadows";
+    const auto defaults = TestConfig();
+    Service s;
+    const auto file = dir / "rain_shadows.toml";
+    std::error_code ec;
+    fs::remove(file, ec);
+    s.Init(defaults, {}, defaults, file, Capability::Window | Capability::LiveVolume);
+    std::vector<std::string> applied;
+    s.AddApplier([&applied](const App::Config&, std::span<const Desc* const> changed) {
+        for (const auto* d : changed) {
+            applied.emplace_back(d->id);
+        }
+    });
+    const Desc* rs = Find("graphics.rainShadows");
+    check(g, "rain shadows exist, a live choice in [Graphics], available on either backend",
+          rs && rs->apply == Apply::Live && rs->type == Type::Choice && rs->table == "Graphics" &&
+              rs->key == "rainShadows" && rs->category == Category::Graphics && s.Available(*rs).available,
+          "");
+    if (!rs) {
+        return;
+    }
+    check(g, "levels: original and off only (no level that is not measured)",
+          rs->choices.size() == 2 && rs->choices[0].value == "original" && rs->choices[1].value == "off", "");
+    check(g, "default: the game's own (original)",
+          std::get<std::string>(s.Get(*rs)) == "original" && defaults.pc.rain_shadows == "original" &&
+              !s.IsOverridden(*rs),
+          "");
+    check(g, "off: applied live, an unknown value refused",
+          s.Set(*rs, Value{std::string("off")}) == SetResult::Ok && s.Current().pc.rain_shadows == "off" &&
+              applied == std::vector<std::string>{"graphics.rainShadows"} &&
+              s.Set(*rs, Value{std::string("low")}) == SetResult::Invalid,
+          s.Current().pc.rain_shadows);
+    const bool flushed = s.Flush(5000);
+    Overrides on_disk;
+    const auto rep = LoadUserFile(file, on_disk);
+    auto restarted = defaults;
+    ApplyOverrides(restarted, on_disk);
+    check(g, "saved and restored at the next start",
+          flushed && rep.status == LoadReport::Status::Loaded && restarted.pc.rain_shadows == "off",
+          fmt::format("{} keys", on_disk.size()));
+    s.ResetCategory(Category::Graphics);
+    check(g, "reset Graphics: back to the game's own",
+          s.Current().pc.rain_shadows == "original" && !s.IsOverridden(*rs), "");
+}
+
 void RunChecks(const CheckFn& check, const std::filesystem::path& scratch) {
     std::error_code ec;
     std::filesystem::create_directories(scratch, ec);
@@ -1242,6 +1289,7 @@ void RunChecks(const CheckFn& check, const std::filesystem::path& scratch) {
     ServiceChecks(check, scratch);
     PostFxChecks(check, scratch);
     ReflectionChecks(check, scratch);
+    RainShadowChecks(check, scratch);
     ConfigChecks(check, scratch);
     BindingChecks(check);
     KeyboardMouseChecks(check);

@@ -46,6 +46,9 @@ struct PcSettings {
     // [Graphics] the game's reflections (src/engine/render/reflections.h); both backends. "original" (the game's own) |
     // "low" (no screen-space reflections: the environment's cube maps, the wetness and the water stay)
     std::string reflection_quality = "original";
+    // [Graphics] the game's rain shadow maps (src/engine/render/rain_shadows.h); both backends. "original" (the game's
+    // own) | "off" (the rain kinds take the game's wetness-0 path: nothing is covered from the rain)
+    std::string rain_shadows = "original";
     // [Graphics] upscaling and frame generation (native backend; docs/UPSCALING_FRAME_GENERATION.md)
     std::string upscaler = "off";            // "off" | "dlss" | "fsr"
     std::string upscale_quality = "quality"; // "native" | "quality" | "balanced" | "performance" | "ultra"
