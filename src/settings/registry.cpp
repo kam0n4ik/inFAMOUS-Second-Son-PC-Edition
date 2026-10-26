@@ -571,13 +571,15 @@ void Build(Registry& r) {
         .id = "graphics.reflectionQuality", .table = "Graphics", .key = "reflectionQuality",
         .category = Category::Graphics, .type = Type::Choice, .apply = Apply::Live, .choices = kReflectionQualities,
         .en = "Reflection quality", .ru = "Качество отражений",
-        .help_en = "Original: as in the game. Low: without the game's screen-space reflections (what is on screen "
-                   "mirrored in wet roads, puddles, glass and water: buildings, signs, lamps and headlights). The "
-                   "lights themselves, their highlights on wet surfaces, the wetness and the sky's reflections stay. "
-                   "Applies at once.",
-        .help_ru = "«Исходное» — как в игре. «Низкое» — без экранных отражений игры (то, что видно на экране, "
-                   "в мокрой дороге, лужах, стёклах и воде: дома, вывески, фонари и фары). Сами источники света, "
-                   "их блики на мокром, мокрота и отражение неба остаются. Применяется сразу.",
+        .help_en = "Original: as in the game. Low: without the game's screen-space reflections - what is on screen "
+                   "(lamps, signs, headlights, buildings) mirrored in wet roads and puddles. The lights themselves, "
+                   "their highlights on wet surfaces, the wetness, the reflection maps and the water's own reflection "
+                   "stay. Saves about 0.4 ms of GPU time per frame (about 2% FPS in the evening city). Applies at "
+                   "once.",
+        .help_ru = "«Исходное» — как в игре. «Низкое» — без экранных отражений игры: того, что видно на экране "
+                   "(фонари, вывески, фары, дома), в мокрой дороге и лужах. Сами источники света, их блики на мокром, "
+                   "мокрота, карты отражений и собственное отражение воды остаются. Экономит около 0,4 мс работы "
+                   "видеокарты на кадр (около 2 % FPS в вечернем городе). Применяется сразу.",
         .get = [](const Config& c, const Desc&) -> Value { return c.pc.reflection_quality; },
         .set = [](Config& c, const Desc&, const Value& x) { c.pc.reflection_quality = std::get<std::string>(x); },
     });
