@@ -15,7 +15,7 @@ import statistics as st
 import sys
 
 WINDOWS = {"user": (40, 100), "calm": (45, 118), "fight": (45, 140), "city": (45, 140), "neon": (42, 133), "beach": (62, 88),
-           "harbor": (62, 88), "village": (62, 88)}
+           "harbor": (62, 88), "village": (62, 88), "rainday": (45, 118), "rainrun": (45, 140)}
 
 
 def pct(v, q):
