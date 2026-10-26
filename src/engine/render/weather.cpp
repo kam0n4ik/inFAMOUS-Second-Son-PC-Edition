@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 #include <windows.h>
 
+#include "base/lifecycle.h"
 #include "base/log.h"
 #include "engine/guest_probe.h"
 #include "runtime/gpu/frame_log.h"
@@ -97,6 +98,7 @@ std::string g_unsafe_reason = "start";
 double g_next_log = 0.0;
 u64 g_period_frames = 0;
 u64 g_period_unsafe = 0;
+u64 g_period_cost_ns = 0, g_period_cost_max_ns = 0; // the tool's own time on the game's main thread (Frame)
 bool g_done = false; // UNTIL passed: never again
 double g_dt_zero_since = -1.0; // the game's step has been 0 since then
 struct Applied {
@@ -128,21 +130,50 @@ void Wr(u64 at, T v) {
     std::memcpy(reinterpret_cast<void*>(at), &v, sizeof(T));
 }
 
+/// The committed, readable regions VirtualQuery reported (forgotten when the world changes, see Frame): VirtualQuery
+/// is not cheap on the guest's address space - ~1 TB of reservations, commit on demand: the region size it reports
+/// is found by walking the pages, milliseconds a call [E] - and the objects the tool reads sit in a few regions.
+struct Region {
+    u64 lo, hi;
+};
+std::vector<Region> g_regions;
+
 bool Readable(u64 at, size_t size) {
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (at < 0x10000 || VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) == 0 ||
-        mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+    if (at < 0x10000) {
         return false;
     }
-    return at + size <= reinterpret_cast<u64>(mbi.BaseAddress) + mbi.RegionSize;
+    for (const Region& r : g_regions) {
+        if (at >= r.lo && at + size <= r.hi) {
+            return true;
+        }
+    }
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+        return false;
+    }
+    const u64 lo = reinterpret_cast<u64>(mbi.BaseAddress), hi = lo + mbi.RegionSize;
+    if (g_regions.size() < 64) {
+        g_regions.push_back({lo, hi});
+    }
+    return at + size <= hi;
 }
 
+/// (VirtualQuery is not cheap on the guest's address space - ~1 TB of reservations, commit on demand: the region size
+/// it reports is found by walking the pages - so a string is checked a page at a time, not a byte at a time)
 std::string Str(u64 p, size_t max = 64) {
     if (!Readable(p, 1)) {
         return "?";
     }
     std::string s;
-    for (size_t i = 0; i < max && Readable(p + i, 1); ++i) {
+    u64 checked_to = (p | 0xfff) + 1; // the first page is readable (a committed region holds whole pages)
+    for (size_t i = 0; i < max; ++i) {
+        if (p + i >= checked_to) {
+            if (!Readable(p + i, 1)) {
+                break;
+            }
+            checked_to = ((p + i) | 0xfff) + 1;
+        }
         const char c = Rd<char>(p + i);
         if (c == 0) {
             break;
@@ -171,8 +202,16 @@ u64 NameHash(const std::string& s) {
     return h;
 }
 
+/// The current time of day's object and record as last checked readable (the per-frame path reads them without a
+/// VirtualQuery while the manager's current object and its record pointer stay the same; Frame forgets them when the
+/// current object changes).
+u64 g_checked_obj = 0, g_checked_rec = 0;
+
 /// A time-of-day object's record (+0x28), 0 when it is not readable.
 u64 Record(u64 obj) {
+    if (obj != 0 && obj == g_checked_obj && Rd<u64>(obj + kRecord) == g_checked_rec) {
+        return g_checked_rec;
+    }
     if (!Readable(obj, 0x408)) {
         return 0;
     }
@@ -180,14 +219,39 @@ u64 Record(u64 obj) {
     return Readable(rec, 0x70) ? rec : 0;
 }
 
+/// Record() for the manager's current object, remembered for the next frames.
+u64 CheckCurrent(u64 cur) {
+    const u64 rec = Record(cur);
+    if (rec != 0) {
+        g_checked_obj = cur;
+        g_checked_rec = rec;
+    }
+    return rec;
+}
+
 u64 TodId(u64 obj) {
     const u64 rec = Record(obj);
     return rec != 0 ? Rd<u64>(rec + 0x18) : ~0ull;
 }
 
+/// The names read (per object; forgotten with the current object, see Frame): a name costs VirtualQuery calls.
+std::vector<std::pair<u64, std::string>> g_names;
+
 std::string TodName(u64 obj) {
     const u64 rec = Record(obj);
-    return rec != 0 ? Str(Rd<u64>(rec + 0x58)) : std::string("-");
+    if (rec == 0) {
+        return "-";
+    }
+    for (const auto& [o, name] : g_names) {
+        if (o == obj) {
+            return name;
+        }
+    }
+    std::string name = Str(Rd<u64>(rec + 0x58));
+    if (g_names.size() < 64) {
+        g_names.emplace_back(obj, name);
+    }
+    return name;
 }
 
 /// The registered time-of-day objects (the manager's map, 0x59bc70 / 0x59cf80): {id, object}.
@@ -281,6 +345,9 @@ std::string Fields(u64 obj) {
         Rd<u8>(obj + kBlurWaterReflections), Rd<u64>(obj + kDirectionalLight) != 0 ? "yes" : "no");
 }
 
+/// The override objects already checked readable (forgotten with the current time of day, see Frame).
+std::vector<u64> g_overrides_ok;
+
 /// The active visual overrides that carry a wetness (mask bit 57): "n (w x weight, ...)".
 std::string WetOverrides(u32* wet_count) {
     const s64 n = Gd<s64>(kOverrideCount);
@@ -288,8 +355,13 @@ std::string WetOverrides(u32* wet_count) {
     u32 wet = 0;
     for (s64 i = 0; i < std::min<s64>(n, 16); ++i) {
         const u64 o = Gd<u64>(kOverrides + i * 8);
-        if (!Readable(o + kOvrMask, kOvrWeight + 4 - kOvrMask) || !Readable(o + kOvrWetness, 4)) {
-            continue;
+        if (std::find(g_overrides_ok.begin(), g_overrides_ok.end(), o) == g_overrides_ok.end()) {
+            if (!Readable(o + kOvrMask, kOvrWeight + 4 - kOvrMask) || !Readable(o + kOvrWetness, 4)) {
+                continue;
+            }
+            if (g_overrides_ok.size() < 64) {
+                g_overrides_ok.push_back(o);
+            }
         }
         if ((Rd<u64>(o + kOvrMask) & kOvrWetnessBit) != 0) {
             s += fmt::format("{}{:.3f}x{:.2f}", wet == 0 ? "" : ",", Rd<float>(o + kOvrWetness),
@@ -335,7 +407,7 @@ const char* Unsafe(u64 cur) {
     if (!(Gd<float>(kGameDt) > 0.0f) && g_dt_zero_since >= 0.0 && Now() - g_dt_zero_since >= 2.0) {
         return "game clock stopped (pause / menu / loading)";
     }
-    if (cur == 0 || cur == Gd<u64>(kTodManager + 8) || Record(cur) == 0) {
+    if (cur == 0 || cur == Gd<u64>(kTodManager + 8) || CheckCurrent(cur) == 0) {
         return "no time of day (loading)";
     }
     if (Gd<u64>(kTodManager + 0x10) != TodId(cur)) {
@@ -354,7 +426,11 @@ void Restore(const char* why) {
     }
     g_applied.on = false;
     const u64 obj = g_applied.obj;
-    if (RegisteredObject(g_applied.id) != obj || Record(obj) == 0) {
+    // (the manager's current object, checked readable, needs no walk of the registry - a walk costs VirtualQuery
+    // calls; an object the manager no longer holds is looked up in the registry, it may be gone with its world)
+    const bool current = obj == Gd<u64>(kTodManager) && obj == g_checked_obj && Record(obj) != 0 &&
+                         TodId(obj) == g_applied.id;
+    if (!current && (RegisteredObject(g_applied.id) != obj || Record(obj) == 0)) {
         Journal(fmt::format("restore ({}): {} is no longer registered - nothing to put back", why, g_applied.name),
                 true);
         return;
@@ -436,6 +512,10 @@ void Frame(u64 manager) {
             Restore("the game changed the time of day");
         }
         g_last_cur = cur;
+        g_checked_obj = 0; // (checked again: the old objects may be gone with their world)
+        g_names.clear();
+        g_overrides_ok.clear();
+        g_regions.clear();
         g_safe_since = -1.0;
         if (Record(cur) != 0 && cur != Rd<u64>(manager + 8)) {
             Journal(fmt::format("state: {}", Fields(cur)), true);
@@ -485,20 +565,29 @@ void Frame(u64 manager) {
         u32 wet_overrides = 0;
         const std::string ovr = WetOverrides(&wet_overrides);
         Journal(fmt::format("{} | blended wetness {:.3f}, wetness pass {} calls / {} frames ({} unsafe), overrides {} | "
-                            "tool: {}{}",
+                            "tool ({:.1f} us/frame, max {:.1f}): {}{}",
                             Fields(cur), Gd<float>(kWetness), g_wetness_calls.exchange(0), g_period_frames,
-                            g_period_unsafe, ovr, g_spec,
+                            g_period_unsafe, ovr,
+                            g_period_frames != 0 ? g_period_cost_ns / 1000.0 / g_period_frames : 0.0,
+                            g_period_cost_max_ns / 1000.0, g_spec,
                             g_applied.on ? fmt::format(" applied (#{}, since f{})", g_applied.applies, g_applied.frame)
                                          : std::string(g_done ? " done" : " not applied")),
                 false);
         g_period_frames = 0;
         g_period_unsafe = 0;
+        g_period_cost_ns = 0;
+        g_period_cost_max_ns = 0;
     }
 }
 
 SSPC_SYSV_ABI void TodUpdateProbe(u64 manager, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     g_tod_update(manager, a1, a2, a3, a4, a5);
+    const auto t0 = std::chrono::steady_clock::now();
     Frame(manager);
+    const u64 ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    g_period_cost_ns += ns; // (the main thread only; read under g_mutex in Frame - a frame late, which is fine)
+    g_period_cost_max_ns = std::max(g_period_cost_max_ns, ns);
 }
 
 SSPC_SYSV_ABI void WetnessPassProbe(u64 wetness, u64 context, u64 a2, u64 a3, u64 a4, u64 a5) {
@@ -609,7 +698,9 @@ bool InstallFromEnvironment(u64 eboot_base, const std::filesystem::path& logs_di
              "DIAGNOSTICS: SSPC_R12_WEATHER={} - the weather tool's probes on the time-of-day update 0x59cf80{}; "
              "journal {}",
              g_spec, g_wetness_pass != nullptr ? " and the wetness pass 0x597ec0" : "", path);
-    std::atexit(AtExit);
+    // (the orderly exit runs its steps and ends with ExitProcess: no atexit handler runs; the Reports stage comes
+    // first, while the game still runs and before the save data backup)
+    Lifecycle::AddExitStep(Lifecycle::Stage::Reports, "weather tool: restore", AtExit);
     return true;
 }
 
