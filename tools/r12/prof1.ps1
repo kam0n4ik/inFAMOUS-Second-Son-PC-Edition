@@ -32,6 +32,12 @@ $defs = @{
     neon_base_shots = @("neon", "neon", "", "50,70,90,110")
     user_keep_val   = @("user", "calm", "SSPC_R12_LIGHT_LIST_KEEP=1", "", "--gpu-native-validate")
     fight_keep_val  = @("city", "fight", "SSPC_R12_LIGHT_LIST_KEEP=1", "", "--gpu-native-validate")
+    # the light glows (occlusion-query proxies, 146a3bd) are drawn in the user route's first 23-43 s: frames there
+    user_base_glow  = @("user", "calm", "SSPC_R12_LIGHT_CENSUS=1", "26,30,34,38,42")
+    user_rea_glow   = @("user", "calm", "SSPC_R12_LIGHT_CENSUS=1;SSPC_FB_LAZY_WB=1;SSPC_REA_HEAP_READS=1;SSPC_REA_POISON=1", "26,30,34,38,42")
+    user_lazy_glow  = @("user", "calm", "SSPC_R12_LIGHT_CENSUS=1;SSPC_FB_LAZY_WB=1;SSPC_REA_POISON=1", "26,30,34,38,42")
+    user_rea_val    = @("user", "calm", "SSPC_FB_LAZY_WB=1;SSPC_REA_HEAP_READS=1", "", "--gpu-native-validate")
+    fight_rea_val   = @("city", "fight", "SSPC_FB_LAZY_WB=1;SSPC_REA_HEAP_READS=1", "", "--gpu-native-validate")
     fight_readers = @("city", "fight", "SSPC_R12_LIGHT_CENSUS=1;SSPC_R12_READERS_OF=2edc52000;SSPC_DIAG_READ_WATCH=2edc12000:640000")
 }
 New-Item -ItemType Directory -Force $out | Out-Null

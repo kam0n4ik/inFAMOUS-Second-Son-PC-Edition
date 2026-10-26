@@ -317,15 +317,35 @@ public:
         if (!executor_ || !tracker_.Hidden(addr, size)) {
             return;
         }
-        if (GetCurrentThreadId() == loop_tid_.load(std::memory_order_relaxed)) {
+        // R12 lights (SSPC_R12_LAZY_TRACE=1, diagnostics): each wait of a CPU access for kept-back blocks, with the
+        // frame log's time (the origin of gpu_frames.csv), so long frames can be matched with these waits
+        static const bool trace = [] {
+            char v[4] = {};
+            const bool on = GetEnvironmentVariableA("SSPC_R12_LAZY_TRACE", v, sizeof(v)) == 1 && v[0] == '1';
+            if (on) {
+                SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_R12_LAZY_TRACE=1 - each CPU access's wait for blocks kept back "
+                                       "from the host (FB-7) is logged (at most 4000)");
+            }
+            return on;
+        }();
+        static std::atomic<u32> traced{0};
+        const double t0 = trace ? FrameLog::Seconds() : 0.0;
+        const auto c0 = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool on_proc = GetCurrentThreadId() == loop_tid_.load(std::memory_order_relaxed);
+        if (on_proc) {
             // (the processor's own thread: the one that would serve the request - drained, then in place)
             if (parallel_) {
                 parallel_->Drain(DrainReason::MemoryRead);
             }
             executor_->SyncKeptBack(addr, size, true);
-            return;
+        } else {
+            executor_->RequestKeptBack(addr, size);
         }
-        executor_->RequestKeptBack(addr, size);
+        if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 4000) {
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - c0).count();
+            SSPC_LOG(GPU, Info, "R12 lazy wait: t {:.3f} s, {:.0f} us, [{:#x}, +{:#x}), tid {}{}", t0, us, addr, size,
+                     GetCurrentThreadId(), on_proc ? " (processor thread)" : "");
+        }
     }
     std::atomic<u32> loop_tid_{0}; ///< Loop's thread (FB-7)
 
