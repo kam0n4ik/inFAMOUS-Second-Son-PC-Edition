@@ -420,13 +420,13 @@ void NotifyHost() {
 
 SSPC_SYSV_ABI u32 Initialize() {
     std::scoped_lock lock{g_mutex};
-    if (!CommonDialog::LayerInitialized()) {
+    if (!Runtime::CommonDialog::LayerInitialized()) {
         return kNotSystemInitialized;
     }
     if (g_status != Status::None) {
         return kAlreadyInitialized;
     }
-    if (!CommonDialog::TryUse()) {
+    if (!Runtime::CommonDialog::TryUse()) {
         return kBusy;
     }
     g_status = Status::Initialized;
@@ -527,7 +527,7 @@ SSPC_SYSV_ABI u32 Terminate() {
         }
         g_status = Status::None;
         g_result = {};
-        CommonDialog::EndUse();
+        Runtime::CommonDialog::EndUse();
     }
     if (closed) {
         SSPC_LOG(SaveData, Warning, "sceSaveDataDialogTerminate closed a dialog the user had not answered");
