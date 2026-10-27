@@ -77,6 +77,7 @@ The standalone add-on **inFAMOUS: First Light** (CUSA00897) runs on this same ru
    | File | What |
    |---|---|
    | `SecondSonPC.exe` | the runtime; started on its own it opens the [launcher](#launcher) first |
+   | `Launcher\` | the inFAMOUS PC Launcher (Qt): settings, saves, diagnostics, Play |
    | `play.cmd` | starts the game at once, without the launcher, with every improvement that is on for players, after backing up the saves |
    | `play_experimental.cmd` | `play.cmd` plus faster experiments (REA-3 + AQ + R10's MAIN_FREE + R11's AQ_IMAGES and AQ_ORDER_EPOCH, [R9_REA3_FIX.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-20261023/docs/R9_REA3_FIX.md), [R10_PACING.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r10-20261024/docs/R10_PACING.md), [R11_NEON.md](https://github.com/kam0n4ik/inFAMOUS-Second-Son-PC-Edition/blob/archive/docs-r11-20261025/docs/R11_NEON.md)): +17 % FPS on the owner's save and +9 % in a fight against `play.cmd`, but a lower 1 % low in Neon Dash |
    | `SecondSonPC.toml` | defaults: window, language, keys, PC settings |
@@ -472,24 +473,32 @@ These are new and not yet played through from start to end: if a Paper Trail or 
 
 ## Launcher
 
-`SecondSonPC.exe` started without arguments opens the launcher; **Играть** (Play) starts the game with what is chosen there. It is in Russian for now.
+`SecondSonPC.exe` started without arguments opens the inFAMOUS PC Launcher from `Launcher\`; **Играть** (Play) starts the game with what is chosen there. The same launcher serves [First Light](https://github.com/kam0n4ik/inFAMOUS-First-Light-PC-Edition): it finds the game from the folder it stands in and takes that game's art and colours. It is in Russian for now.
 
 <p align="center">
-  <img src=".github/readme/launcher-home.png" alt="The launcher: Play, the launch profile, the PC's configuration" width="880">
+  <img src=".github/readme/launcher-home.jpg" alt="The launcher's home page: Play, the launch profile, the shader cache" width="880">
 </p>
 
-- **Home**: Play, the launch profile and whether the game's folder is found. *Standard* is `play.cmd`'s preset, *Experimental* is `play_experimental.cmd`'s. Before every start the saves are copied to `userdata\savedata_backups\<date_time>`, as `play.cmd` does.
-- **Display, Graphics, Effects, Controls, Audio, Advanced**: the same settings as the in-game window, saved to the same `settings.toml`, so a change in one shows in the other. Settings that need a restart and settings that are unavailable say so; Advanced ends with the closed Experiments section.
-- The game's own art (`sce_sys\pic0.png` of your copy) is the home page's background; it is read from the game's folder, not shipped.
-- `play.cmd` and any command line with arguments start the game at once, without the launcher.
-
-<p align="center">
-  <img src=".github/readme/launcher-graphics.png" alt="The launcher's Graphics page: shadow, reflection and texture quality, anisotropic filtering" width="880">
-</p>
+- **Home**: Play, the launch profile, the last start and the shader cache. *Standard* is `play.cmd`'s preset, *Experimental* is `play_experimental.cmd`'s. Before every start the saves are copied to `userdata\savedata_backups\<date_time>`, as `play.cmd` does.
+- **Settings**: Display, Rendering, Effects, Game and Experiments, the same settings as the in-game window, written to the same `%LOCALAPPDATA%\SecondSonPC\settings.toml` (unknown keys and comments are kept), so a change in one shows in the other. Settings the PC cannot use say why.
+- **Saves**: the game's saves with their own titles, and the backups; any backup can be restored.
+- **Diagnostics**: the game's serial and version, the folders, the runtime, the GPU, the shader cache; the report can be copied for a bug report.
+- The background is the game's own art (`sce_sys\pic0.png` of your copy), read from the game's folder, not shipped.
+- `play.cmd` and any command line with arguments start the game at once; `SecondSonPC.exe --launcher` opens the older built-in launcher, which also opens when `Launcher\` is missing.
 
 <p align="center">
-  <img src=".github/readme/launcher-controls.png" alt="The launcher's Controls page: mouse settings" width="880">
+  <img src=".github/readme/launcher-settings.jpg" alt="The launcher's Settings page" width="880">
 </p>
+
+<p align="center">
+  <img src=".github/readme/launcher-saves.jpg" alt="The launcher's Saves page: the game's saves and the backups" width="880">
+</p>
+
+<p align="center">
+  <img src=".github/readme/launcher-diagnostics.jpg" alt="The launcher's Diagnostics page" width="880">
+</p>
+
+The launcher's source is in `pc-launcher\` (Qt 6, [pc-launcher/README.md](pc-launcher/README.md)).
 
 ## PC settings
 
