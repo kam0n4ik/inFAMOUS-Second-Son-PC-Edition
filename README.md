@@ -23,10 +23,17 @@ The original PlayStation 4 game runs on Windows on SecondSonPC; its executable a
   <a href="#launcher">Launcher</a> ·
   <a href="#pc-settings">PC settings</a> ·
   <a href="#known-issues">Known issues</a> ·
-  <a href="#reports">Reports</a>
+  <a href="#reports">Reports</a> ·
+  <a href="#infamous-first-light--pc-edition">First Light</a>
 </p>
 
 ---
+
+## inFAMOUS: First Light — PC Edition
+
+<a href="https://github.com/kam0n4ik/inFAMOUS-First-Light-PC-Edition"><img src="https://raw.githubusercontent.com/kam0n4ik/inFAMOUS-First-Light-PC-Edition/main/.github/readme/first-light-banner.jpg" alt="inFAMOUS: First Light — PC Edition" width="100%"></a>
+
+The standalone add-on **inFAMOUS: First Light** (CUSA00897) runs on this same runtime: **[inFAMOUS-First-Light-PC-Edition](https://github.com/kam0n4ik/inFAMOUS-First-Light-PC-Edition)**. Both games share one engine, so First Light is a second product of the same code (`SSPC_PRODUCT=FirstLight`), with its own import table, system libraries, engine hook addresses, button prompts, settings and saves; a fix in the shared runtime reaches both games. It is early: the game reaches gameplay, and Second Son's engine-specific optimisations are not mapped to it yet. Download it from its [Releases](https://github.com/kam0n4ik/inFAMOUS-First-Light-PC-Edition/releases).
 
 ## What makes it different
 
