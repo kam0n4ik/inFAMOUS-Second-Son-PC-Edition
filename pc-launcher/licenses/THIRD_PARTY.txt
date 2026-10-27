@@ -1,0 +1,8 @@
+inFAMOUS PC Launcher uses Qt 6.10.3 (https://www.qt.io), linked dynamically: the Qt6*.dll files and the
+plugin folders next to Launcher.exe are Qt's, under the GNU Lesser General Public License version 3
+(LGPL-3.0.txt, which extends GPL-3.0.txt). They can be replaced by any compatible build of Qt 6.10.
+Qt's source code: https://download.qt.io/official_releases/qt/6.10/
+
+Roboto Condensed (the launcher's font) is under the SIL Open Font License 1.1 (OFL-RobotoCondensed.txt).
+
+The MSVC runtime DLLs (msvcp140*.dll, vcruntime140*.dll) are redistributed under the Visual Studio license.

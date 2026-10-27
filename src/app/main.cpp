@@ -1,6 +1,7 @@
 // SecondSonPC — entry point.
-//   SecondSonPC.exe                the launcher (src/launcher/app.h): settings, the launch profile, Play
-//   SecondSonPC.exe --launcher [args]   the same; its Play passes [args] to the game
+//   SecondSonPC.exe                Launcher\Launcher.exe (the inFAMOUS PC Launcher) when the install has it, else the
+//                                  built-in launcher (src/launcher/app.h): settings, the launch profile, Play
+//   SecondSonPC.exe --launcher [args]   the built-in launcher; its Play passes [args] to the game
 //   SecondSonPC.exe --no-launcher [options]   the game at once (play.cmd, the launcher's Play, automated runs:
 //                                  any argument but --launcher starts the game too)
 //   SecondSonPC.exe [--lang <locale>] [--loader sspc|shadps4] [options]
@@ -149,6 +150,34 @@ std::wstring QuoteArg(const std::wstring& s) {
     return L"\"" + s + L"\"";
 }
 
+/// The inFAMOUS PC Launcher (Qt, Launcher\Launcher.exe beside the .toml or beside this exe) in place of the built-in
+/// launcher: it finds the game from its own folder and starts this exe with --no-launcher. False when there is none
+/// or it does not start: the built-in launcher opens as before.
+bool StartQtLauncher() {
+    using namespace SecondSon;
+    std::wstring exe(MAX_PATH, L'\0');
+    exe.resize(GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size())));
+    for (const auto& dir : {App::RootDir(), std::filesystem::path(exe).parent_path()}) {
+        const auto launcher = dir / "Launcher" / "Launcher.exe";
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(launcher, ec)) {
+            continue;
+        }
+        std::wstring cmd = QuoteArg(launcher.wstring());
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(launcher.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                           launcher.parent_path().c_str(), &si, &pi) == 0) {
+            return false;
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return true;
+    }
+    return false;
+}
+
 /// Every shader of the game's packs compiled before it starts (docs/REA_ENGINE_REVERSE.md §8): this program again with
 /// --predict-shaders --if-needed in a console window of its own that shows the progress; the game waits for it (a
 /// second when the cache was prepared already). A failure only costs the preparation: the game starts as before.
@@ -274,6 +303,9 @@ void PlanGameDisplay(SecondSon::App::Config& config) {
 
 int main(int argc, char* argv[]) {
     using namespace SecondSon;
+    if (argc < 2 && StartQtLauncher()) {
+        return 0;
+    }
     if (argc < 2 || std::string_view(argv[1]) == "--launcher" || std::string_view(argv[1]) == "--launcher-shot") {
         return Launcher::Run(argc, argv); // the launcher's window; its Play starts this exe with --no-launcher
     }

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#26252b"/>
+      <stop offset="1" stop-color="#0c0c10"/>
+    </linearGradient>
+    <linearGradient id="ss" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#ff8a2b"/>
+      <stop offset="1" stop-color="#e3302a"/>
+    </linearGradient>
+    <linearGradient id="fl" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff3fa4"/>
+      <stop offset="1" stop-color="#8b5cff"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d9d4ea"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+  <rect x="8.5" y="8.5" width="239" height="239" rx="51.5" fill="none" stroke="#ffffff" stroke-opacity="0.08"/>
+  <path d="M128 40 A88 88 0 0 0 128 216" fill="none" stroke="url(#ss)" stroke-width="16" stroke-linecap="round"/>
+  <path d="M128 40 A88 88 0 0 1 128 216" fill="none" stroke="url(#fl)" stroke-width="16" stroke-linecap="round"/>
+  <path d="M141 62 L92 138 H124 L113 194 L166 112 H133 Z" fill="url(#bolt)"/>
+</svg>
