@@ -150,6 +150,10 @@ bool ImageServes(const ImageLayout& have, const ImageLayout& want);
 /// `have` (an image the GPU wrote) can be copied into a new image for `want` (the bridge's ExpandImage: more levels or
 /// layers of the same texels, or a block-compressed view of its uncompressed texels).
 bool CanExpandFrom(const CachedImage& have, const ImageLayout& want);
+/// `have` (an image the GPU wrote, at the same address) serves `want` and holds more layers or levels than `same`, the
+/// image of `want`'s own layout (null: none) - the bridge's subresource rule: a slice of an array rendered as a target
+/// of its own goes into the array, not into an image of its own that would split the array's texels.
+bool ServesBetter(const CachedImage& have, const CachedImage* same, const ImageLayout& want);
 
 class ImageCache {
 public:

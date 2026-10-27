@@ -591,6 +591,17 @@ bool CanExpandFrom(const CachedImage& have_img, const ImageLayout& want) {
     return have.levels < want.levels || have.layers < want.layers;
 }
 
+bool ServesBetter(const CachedImage& have, const CachedImage* same, const ImageLayout& want) {
+    if (&have == same || !have.gpu_written || have.superseded || !ImageServes(have.layout, want)) {
+        return false;
+    }
+    if (same == nullptr) {
+        return have.layout.layers > want.layers || have.layout.levels > want.levels;
+    }
+    return ImageServes(have.layout, same->layout) &&
+           (have.layout.layers > same->layout.layers || have.layout.levels > same->layout.levels);
+}
+
 void ImageCache::CopyImage(CachedImage& src, CachedImage& dst, VkCommandBuffer cb) {
     Transition(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -655,6 +666,16 @@ CachedImage* ImageCache::Find(const ImageLayout& layout, Use use, VkCommandBuffe
         if (SameImage(it->second->layout, layout)) {
             match = it->second;
             break;
+        }
+    }
+    // a GPU-written array that serves this layout is the image the GPU keeps writing: First Light renders each slice of
+    // its 4-slice screen mask and shadow map as a target of its own and samples them as one array - an image a slice,
+    // and the array (made once, from slice 0) kept the slices of the frame it was made in: the main menu's characters
+    // stayed in the game as silhouettes
+    for (auto it = lo; it != hi && alias_rule_; ++it) {
+        if (ServesBetter(*it->second, match, layout)) {
+            match = it->second;
+            ++stats_.alias_hits;
         }
     }
     if (match == nullptr) {

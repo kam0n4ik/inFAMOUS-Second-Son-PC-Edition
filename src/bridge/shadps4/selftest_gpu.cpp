@@ -598,6 +598,31 @@ void TestImageCacheRules(TestGroup& g) {
     g.Check("equal-address rule: an image serves a view of a compatible format; not a larger request",
             V::ImageServes(rgba, srgb) && !V::ImageServes(rgba, more) && V::ImageServes(more, rgba), "");
 
+    // the subresource rule: a slice rendered as a target of its own goes into the GPU-written array (First Light's
+    // 4-slice screen mask kept the main menu's slices: silhouettes)
+    V::CachedImage slice0, slice1, array4;
+    for (V::CachedImage* c : {&slice0, &slice1, &array4}) {
+        c->gpu_written = true;
+        c->layout = rgba;
+    }
+    slice1.layout.layers = 2;
+    array4.layout.layers = 4;
+    g.Check("subresource rule: the GPU-written array serves a slice's target over the slice's own image",
+            V::ServesBetter(array4, &slice0, slice0.layout) && V::ServesBetter(array4, &slice1, slice1.layout) &&
+                V::ServesBetter(array4, nullptr, slice0.layout),
+            "");
+    V::CachedImage uploaded4 = array4;
+    uploaded4.gpu_written = false;
+    V::CachedImage superseded4 = array4;
+    superseded4.superseded = true;
+    V::CachedImage other4 = array4;
+    other4.layout.size = {128, 256, 1};
+    g.Check("subresource rule: not an uploaded or superseded array, not another size, not a smaller or equal image",
+            !V::ServesBetter(uploaded4, &slice0, slice0.layout) && !V::ServesBetter(superseded4, &slice0, slice0.layout) &&
+                !V::ServesBetter(other4, &slice0, slice0.layout) && !V::ServesBetter(slice0, &slice1, slice1.layout) &&
+                !V::ServesBetter(array4, &array4, array4.layout) && !V::ServesBetter(slice1, &array4, slice0.layout),
+            "");
+
     // eviction of GPU-written images (R7)
     using E = V::GpuEviction;
     const auto ev = [](V::GpuEvictionCandidate c) { return V::ClassifyGpuEviction(c); };
