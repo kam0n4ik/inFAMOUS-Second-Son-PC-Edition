@@ -34,7 +34,10 @@ QSettings::Format IniFormat() {
 Application::Application(const Options& options, QObject* parent)
     : QObject(parent), options_(options), detector_(AllProfiles()),
       prefs_(Log::Dir() + QStringLiteral("/launcher.ini"), IniFormat()) {
-    language_ = prefs_.value(QStringLiteral("ui/language"), QStringLiteral("ru")).toString() == QLatin1String("en") ? QStringLiteral("en") : QStringLiteral("ru");
+    // until the player picks one: Windows' display language, Russian or else English
+    const QStringList ui = QLocale::system().uiLanguages();
+    const QString systemLanguage = !ui.isEmpty() && ui.first().startsWith(QLatin1String("ru")) ? QStringLiteral("ru") : QStringLiteral("en");
+    language_ = prefs_.value(QStringLiteral("ui/language"), systemLanguage).toString() == QLatin1String("en") ? QStringLiteral("en") : QStringLiteral("ru");
     design_ = prefs_.value(QStringLiteral("ui/concept"), QStringLiteral("cinematic")).toString();
     if (design_ != QLatin1String("neon") && design_ != QLatin1String("desktop")) design_ = QStringLiteral("cinematic");
     reduced_ = prefs_.value(QStringLiteral("ui/reducedEffects"), false).toBool();

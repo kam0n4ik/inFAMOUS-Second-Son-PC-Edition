@@ -88,7 +88,7 @@ The standalone add-on **inFAMOUS: First Light** (CUSA00897) runs on this same ru
    | `SecondSonPC-README.txt` | these steps in short |
 
 3. **The Visual C++ runtime.** Install the [Microsoft Visual C++ 2015–2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) if it is not installed yet.
-4. **Start `SecondSonPC.exe`** and press **Играть** (Play) in the launcher. `play.cmd` still works and starts the game at once with the standard profile.
+4. **Start `SecondSonPC.exe`** and press **Play** in the launcher. `play.cmd` still works and starts the game at once with the standard profile.
    - On the first start a console window prepares the game's shaders: they are compiled before the game starts. This happens once: on the development PC (6 cores / 12 threads) it took 5.5 minutes from an empty cache, about 13 400 pipelines. Later starts skip it in under two seconds.
    - It runs again only after a driver or SecondSonPC update.
 5. **PC settings:** in the launcher, or in the game: **Esc (Options) → Settings → "Additional settings"**.
@@ -473,7 +473,7 @@ These are new and not yet played through from start to end: if a Paper Trail or 
 
 ## Launcher
 
-`SecondSonPC.exe` started without arguments opens the inFAMOUS PC Launcher from `Launcher\`; **Играть** (Play) starts the game with what is chosen there. The same launcher serves [First Light](https://github.com/kam0n4ik/inFAMOUS-First-Light-PC-Edition): it finds the game from the folder it stands in and takes that game's art and colours. It is in Russian for now.
+`SecondSonPC.exe` started without arguments opens the inFAMOUS PC Launcher from `Launcher\`; **Play** starts the game with what is chosen there. The same launcher serves [First Light](https://github.com/kam0n4ik/inFAMOUS-First-Light-PC-Edition): it finds the game from the folder it stands in and takes that game's art and colours. It is in English and Russian: it follows Windows' display language, and Settings → Launcher switches it.
 
 <p align="center">
   <img src=".github/readme/launcher-home.jpg" alt="The launcher's home page: Play, the launch profile, the shader cache" width="880">
@@ -623,7 +623,7 @@ Vulkan 1.3 driver
 - **GPU loss once with early submission.** In one of three 30-minute runs with `SSPC_R11_EARLY_SUBMIT=256` the driver reset the GPU after 18.5 minutes (`VK_ERROR_DEVICE_LOST`). Its exact repeat, another run and a run without it were clean, and the cause is not known. Such resets also happened on that PC before R11. If it happens to you, turn off "Early batch submission (R11)" on the Experiments page: that is R10's behaviour.
 - **Not tested in R11:** flying, cut-scenes, vertical sync switches together with DLSS / FSR frame generation, gamepad navigation of the new rows, two monitors.
 - **R12 is still under its final check.** The experimental switches above are off by default; their comparison with R11 over every scene is running. "Rain shadows: Off" has not yet been checked frame by frame. Not tested in R12: flying, cut-scenes, light from Delsin's powers (none on the routes), harbour and village with the particle sort.
-- **The launcher and the new graphics settings** are new: the launcher is in Russian only, and the FPS cost of shadow quality, texture quality, anisotropic filtering and anti-aliasing is not measured yet. If something looks wrong, set them back to *as in the game*.
+- **The launcher and the new graphics settings** are new: the older built-in launcher (`--launcher`) is in Russian only, and the FPS cost of shadow quality, texture quality, anisotropic filtering and anti-aliasing is not measured yet. If something looks wrong, set them back to *as in the game*.
 - **Online missions, add-ons and trophies are new** and not yet played through: the Paper Trail missions, the Cole's Legacy missions and each trophy's notice have been built, not tested in the game from start to end. The trophy grades (bronze, silver, gold) are not shown: they are in the encrypted trophy texts.
 - There is no full-campaign compatibility guarantee.
 
@@ -667,7 +667,7 @@ Vulkan 1.3 driver
 - [x] Motion blur on / off and its strength (R11)
 - [x] Reflection quality and rain shadows in Graphics (R12)
 - [x] A launcher before the game; shadow quality, texture quality, anisotropic filtering and anti-aliasing in Graphics
-- [ ] The launcher in English
+- [x] The launcher in English (the inFAMOUS PC Launcher)
 - [x] Button prompts for keyboard/mouse, Xbox, PlayStation
 - [x] Native mouse camera (no stick emulation)
 - [x] Any resolution and aspect ratio (4:3 to 32:9, Hor+, HUD, FOV, movies 16:9)
