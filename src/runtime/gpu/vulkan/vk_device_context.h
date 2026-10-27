@@ -134,6 +134,8 @@ public:
         u64 host_budget = 0, host_usage = 0;
     };
     Budget QueryBudget() const;
+    /// The memory heaps for the log: size, flags, VK_EXT_memory_budget's budget and usage, the types on each
+    std::string DescribeMemory() const;
 
     /// The one queue is used by the GPU thread and the presenter: every vkQueueSubmit2 / vkQueuePresentKHR under it.
     std::mutex& QueueMutex() { return queue_mutex_; }

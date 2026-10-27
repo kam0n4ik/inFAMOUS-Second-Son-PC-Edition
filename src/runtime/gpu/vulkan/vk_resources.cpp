@@ -7,6 +7,7 @@
 #include "runtime/gpu/page_tracker.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -364,10 +365,38 @@ bool CreateBuffer(DeviceContext& ctx, u64 size, VkBufferUsageFlags usage, bool h
         DestroyBuffer(ctx, out);
         return false;
     }
-    const VkMemoryAllocateInfo mai{.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                                   .allocationSize = req.size,
-                                   .memoryTypeIndex = static_cast<u32>(type)};
-    if (const VkResult r = Fn().vkAllocateMemory(ctx.Device(), &mai, nullptr, &out.memory); r != VK_SUCCESS) {
+    VkMemoryAllocateInfo mai{.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                             .allocationSize = req.size,
+                             .memoryTypeIndex = static_cast<u32>(type)};
+    constexpr VkMemoryPropertyFlags kBar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    const bool bar_auto = host_visible && placement == HostPlacement::Auto &&
+                          (ctx.Memory().memoryTypes[type].propertyFlags & kBar) == kBar;
+    // SSPC_DIAG_NO_BAR=1: those allocations taken as failed (the path below on any GPU)
+    static const bool diag_no_bar = [] {
+        char v[4] = {};
+        return GetEnvironmentVariableA("SSPC_DIAG_NO_BAR", v, sizeof(v)) > 0 && v[0] == '1';
+    }();
+    VkResult r = bar_auto && diag_no_bar ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                                         : Fn().vkAllocateMemory(ctx.Device(), &mai, nullptr, &out.memory);
+    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY && bar_auto) {
+        // the BAR (without Resizable BAR a ~256 MiB window, shared with the driver and other processes) is full: plain
+        // host memory instead, which the GPU reads over PCIe (issue #3: RTX 3060 Ti, the 64 KiB GDS buffer at start)
+        const s32 host = ctx.FindMemoryType(req.memoryTypeBits,
+                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (host >= 0) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                SSPC_LOG(GPU, Warning, "native backend: {} bytes of device-local host-visible memory (type {}) not "
+                                       "available: host memory (type {}) instead; {}",
+                         req.size, type, host, ctx.DescribeMemory());
+            }
+            type = host;
+            mai.memoryTypeIndex = static_cast<u32>(type);
+            r = Fn().vkAllocateMemory(ctx.Device(), &mai, nullptr, &out.memory);
+        }
+    }
+    if (r != VK_SUCCESS) {
         error = fmt::format("vkAllocateMemory of {} bytes failed ({})", req.size, static_cast<int>(r));
         out.memory = VK_NULL_HANDLE;
         DestroyBuffer(ctx, out);

@@ -1043,6 +1043,32 @@ DeviceContext::Budget DeviceContext::QueryBudget() const {
     return b;
 }
 
+std::string DeviceContext::DescribeMemory() const {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    const bool has_budget = caps_.memory_budget && g_api.vkGetPhysicalDeviceMemoryProperties2 != nullptr;
+    if (has_budget) {
+        VkPhysicalDeviceMemoryProperties2 mp{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+                                             .pNext = &budget};
+        g_api.vkGetPhysicalDeviceMemoryProperties2(physical_, &mp);
+    }
+    std::string out;
+    for (u32 h = 0; h < memory_.memoryHeapCount; ++h) {
+        const VkMemoryHeap& heap = memory_.memoryHeaps[h];
+        out += fmt::format("{}heap {}: {} MiB{}", h ? "; " : "", h, heap.size >> 20,
+                           heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " device-local" : "");
+        if (has_budget) {
+            out += fmt::format(" (budget {} MiB, used {} MiB)", budget.heapBudget[h] >> 20, budget.heapUsage[h] >> 20);
+        }
+        out += ", types";
+        for (u32 t = 0; t < memory_.memoryTypeCount; ++t) {
+            if (memory_.memoryTypes[t].heapIndex == h) {
+                out += fmt::format(" {}:{:#x}", t, static_cast<u32>(memory_.memoryTypes[t].propertyFlags));
+            }
+        }
+    }
+    return out;
+}
+
 void DeviceContext::Name(VkObjectType type, u64 handle, const char* name) const {
     if (!caps_.debug_utils || g_api.vkSetDebugUtilsObjectNameEXT == nullptr || handle == 0) {
         return;

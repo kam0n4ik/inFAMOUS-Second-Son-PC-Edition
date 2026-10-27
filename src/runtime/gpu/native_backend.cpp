@@ -622,6 +622,7 @@ bool Backend::Start(const Options& o, std::string& error) {
         return false;
     }
     ctx_->QueryProfile(profile_);
+    SSPC_LOG(GPU, Info, "native backend: memory {}", ctx_->DescribeMemory());
     DiagBenchAt(*ctx_, profile_, o, "ctx");
     timeline_ = std::make_unique<Vk::Timeline>(*ctx_);
     DiagBenchAt(*ctx_, profile_, o, "timeline");
