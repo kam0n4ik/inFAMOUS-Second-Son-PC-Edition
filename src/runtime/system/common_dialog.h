@@ -25,6 +25,19 @@ void SetInitializeListener(InitializeListener listener);
 /// The layer is initialised (sceCommonDialogInitialize succeeded once in this process).
 bool Initialized();
 
+/// For SecondSonPC's own dialog libraries (the save data dialog): while sceCommonDialogInitialize is the bridge's
+/// (sysrt-dialog BRIDGE) the layer's state is the bridge's flag, read through `source` (src/bridge/shadps4/sysrt_host.cpp).
+using StateSource = bool (*)();
+void SetBridgeInitializedSource(StateSource source);
+/// Initialized(), or the bridge's state when it owns sceCommonDialogInitialize.
+bool LayerInitialized();
+/// One system dialog at a time (the oracle's CommonDialog::g_isUsed): a dialog library takes it at its Initialize and
+/// gives it back at its Terminate. While MsgDialog / ErrorDialog are the bridge's the flag is the bridge's own
+/// (`flag`, set once by the bridge before the game runs), so that they and SecondSonPC's dialogs exclude each other.
+void SetSharedUseFlag(bool* flag);
+bool TryUse(); ///< false: another dialog library holds it (SCE_COMMON_DIALOG_ERROR_BUSY)
+void EndUse();
+
 std::span<const Export> CommonDialogExports();
 
 } // namespace SecondSon::Runtime::CommonDialog

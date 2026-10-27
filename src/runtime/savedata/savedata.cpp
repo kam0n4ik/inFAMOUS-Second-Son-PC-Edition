@@ -702,6 +702,16 @@ void Configure(const Settings& settings) {
     g_settings = settings;
 }
 
+Settings Current() {
+    std::scoped_lock lock{g_mutex};
+    return g_settings;
+}
+
+fs::path SaveDir(s32 user, std::string_view title, std::string_view dir) {
+    std::scoped_lock lock{g_mutex};
+    return TitlePath(user, title.empty() ? std::string_view(g_settings.title_dir) : title) / std::string(dir);
+}
+
 std::span<const Runtime::Export> Exports() {
     return kExports;
 }

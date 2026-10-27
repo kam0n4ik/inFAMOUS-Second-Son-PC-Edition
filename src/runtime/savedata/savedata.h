@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <span>
 #include <string>
+#include <string_view>
 
 #include "base/abi.h"
 
@@ -25,6 +26,10 @@ struct Settings {
 
 /// Before the game runs (the bootstrap, beside the bridge's SaveData setup).
 void Configure(const Settings& settings);
+/// What Configure was given (the save data dialog lists the same folders).
+Settings Current();
+/// A save's folder <home>\<user>\savedata\<title>\<dir>; an empty `title` is the game's own (Settings::title_dir).
+std::filesystem::path SaveDir(s32 user, std::string_view title, std::string_view dir);
 
 std::span<const Runtime::Export> Exports();
 

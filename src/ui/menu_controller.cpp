@@ -31,10 +31,12 @@
 #include "runtime/gpu/native_backend.h"
 #include "runtime/gpu/upscale/upscale_settings.h"
 #include "runtime/pad/pad.h"
+#include "runtime/savedata/savedata_dialog.h"
 #include "settings/registry.h"
 #include "settings/settings_service.h"
 #include "ui/overlay_win32.h"
 #include "ui/prompt_service.h"
+#include "ui/save_data_dialog.h"
 #include "ui/settings_menu.h"
 
 namespace SecondSon::Runtime::Trophies {
@@ -117,6 +119,8 @@ struct State {
     u64 nav_wait_seq = 0;        // then for a frame read after them
     float nav_last_center = -1;
     int nav_last_dir = 0;
+    // the system's save data dialog (the game's Save / Load), on `overlay` while the settings menu is closed
+    SaveDataDialogView save_view;
 };
 
 /// Marks the main thread busy in the menu for a scope: WM_TIMER dispatched by SDL calls inside it only sets `dirty`.
@@ -148,7 +152,7 @@ void ForgetPadState() {
     st.held_from_stick = false;
     st.held_nav_button = 0xFF;
     st.stick_x = st.stick_y = 0;
-    if (st.block_until_release && !(st.menu && st.menu->IsOpen())) {
+    if (st.block_until_release && !(st.menu && st.menu->IsOpen()) && !st.save_view.IsOpen()) {
         st.block_until_release = false;
         Pad::SetMenuBlocksInput(false);
     }
@@ -656,7 +660,7 @@ void TrackPad(const SDL_Event& e, bool down) {
         const char* name = SDL_GetGamepadNameForID(e.gbutton.which);
         st.pad_name = name != nullptr ? name : "";
     }
-    if (st.block_until_release && st.pad_held == 0 && !(st.menu && st.menu->IsOpen())) {
+    if (st.block_until_release && st.pad_held == 0 && !(st.menu && st.menu->IsOpen()) && !st.save_view.IsOpen()) {
         st.block_until_release = false;
         Pad::SetMenuBlocksInput(false); // the button that closed the menu is up: the game gets the pad again
     }
@@ -793,6 +797,224 @@ void OnTrophyEvent() {
     }
     if (st.trophy_id < 0) {
         ShowNextTrophy();
+    }
+}
+
+// ---- the system's save data dialog (runtime/savedata/savedata_dialog.h): the game's Save / Load lists and messages,
+// on the menu's overlay; the game waits for the answer (it polls the dialog's status) and gets no input meanwhile
+
+std::atomic<u32> g_save_event{0}; // SDL user event: a dialog opened or finished (any thread)
+
+/// SaveData::Dialog's host (any thread): the main thread looks at the running dialog.
+bool SaveDialogHost() {
+    const u32 ev = g_save_event.load();
+    if (ev == 0) {
+        return false;
+    }
+    SDL_Event e{};
+    e.type = ev;
+    return SDL_PushEvent(&e);
+}
+
+SaveDataDialogView::Env SaveDialogEnv() {
+    auto& st = S();
+    const auto cfg = Settings::Instance().Current();
+    SaveDataDialogView::Env env;
+    RECT cr{};
+    if (st.hwnd != nullptr && GetClientRect(st.hwnd, &cr) && cr.right > 0 && cr.bottom > 0) {
+        env.width = static_cast<float>(cr.right);
+        env.height = static_cast<float>(cr.bottom);
+    }
+    env.ru = Ru(cfg);
+    env.prompts = Input::ResolvePrompts(cfg.pc.prompts, Input::Devices().Active());
+    env.confirm_is_circle = !cfg.enter_button_cross;
+    return env;
+}
+
+void CloseSaveView();
+
+/// false: it could not be drawn (the runtime is told: the dialog is finished as cancelled, the game goes on).
+bool RenderSaveDialog() {
+    auto& st = S();
+    if (!st.save_view.IsOpen()) {
+        return true;
+    }
+    st.save_view.SetEnv(SaveDialogEnv());
+    DrawList list;
+    st.save_view.Build(st.overlay.Measure(), list);
+    if (st.overlay.Present(st.hwnd, list)) {
+        return true;
+    }
+    const u64 id = st.save_view.Id();
+    SSPC_LOG(App, Error, "save data dialog #{}: drawing failed", id);
+    CloseSaveView();
+    SaveData::Dialog::HostFailed(id);
+    return false;
+}
+
+void CloseSaveView() {
+    auto& st = S();
+    if (!st.save_view.IsOpen()) {
+        return;
+    }
+    st.save_view.Close();
+    st.overlay.Hide();
+    LiftExclusive(false);
+    Input::Player1().SetMenuOpen(false);
+    st.closed_ns = NowNs();
+    if (st.pad_held != 0) {
+        st.block_until_release = true; // until the controller button that answered is up
+    } else {
+        Pad::SetMenuBlocksInput(false);
+    }
+}
+
+/// Main thread: the overlay shows the running dialog, or nothing when none runs.
+void SyncSaveDialog() {
+    auto& st = S();
+    const auto running = SaveData::Dialog::Running();
+    if (!running) {
+        CloseSaveView();
+        return;
+    }
+    if (st.save_view.IsOpen() && st.save_view.Id() == running->id) {
+        return;
+    }
+    if (Menu().IsOpen()) {
+        Menu().Close(); // the system's dialog comes first, as on the console
+    }
+    std::vector<std::shared_ptr<const Image>> icons;
+    for (const auto& item : running->items) {
+        icons.push_back(item.icon_png.empty() ? nullptr : DecodePng(item.icon_png));
+    }
+    const bool was_open = st.save_view.IsOpen();
+    st.save_view.Open(*running, std::move(icons));
+    if (!was_open) {
+        st.held_nav.reset();
+        st.block_until_release = false;
+        Input::Player1().SetMenuOpen(true);
+        Pad::SetMenuBlocksInput(true);
+        LiftExclusive(true);
+    }
+    if (RenderSaveDialog()) {
+        SSPC_LOG(App, Info, "save data dialog #{} shown ({} item(s))", running->id, running->items.size());
+    }
+}
+
+/// The user's answer, if the last input gave one, goes to the runtime.
+void AfterSaveInput() {
+    auto& st = S();
+    if (const auto answer = st.save_view.TakeAnswer()) {
+        const u64 id = st.save_view.Id();
+        CloseSaveView();
+        if (!SaveData::Dialog::Respond(id, *answer)) {
+            SSPC_LOG(App, Warning, "save data dialog #{}: the answer came after the game closed it", id);
+        }
+        SyncSaveDialog(); // (the next one, if the game opened it meanwhile)
+        return;
+    }
+    RenderSaveDialog();
+}
+
+/// Input while the dialog is shown: the dialog's, never the game's.
+EventRoute SaveDialogEvent(const SDL_Event& e) {
+    auto& st = S();
+    auto& view = st.save_view;
+    view.SetEnv(SaveDialogEnv());
+    switch (e.type) {
+    case SDL_EVENT_KEY_DOWN: {
+        const auto sc = e.key.scancode;
+        std::optional<Nav> nav = KeyNav(sc, (e.key.mod & SDL_KMOD_SHIFT) != 0);
+        if (!e.key.repeat || (nav && Repeatable(*nav))) {
+            // the keys bound to the controller's cross / circle answer too (the game's own "back" key)
+            if (!nav && Input::Player1().KeyTriggers(static_cast<u16>(sc), Input::Action::Cross)) {
+                nav = Settings::Instance().Current().enter_button_cross ? Nav::Accept : Nav::Back;
+            } else if (!nav && Input::Player1().KeyTriggers(static_cast<u16>(sc), Input::Action::Circle)) {
+                nav = Settings::Instance().Current().enter_button_cross ? Nav::Back : Nav::Accept;
+            }
+            if (nav) {
+                view.OnNav(*nav);
+                AfterSaveInput();
+            }
+        }
+        return EventRoute::Consumed;
+    }
+    case SDL_EVENT_KEY_UP:
+        return EventRoute::Consumed;
+    case SDL_EVENT_MOUSE_MOTION: {
+        const auto [x, y] = ToPixels(e.motion.x, e.motion.y);
+        view.OnMouseMove(x, y);
+        RenderSaveDialog();
+        return EventRoute::Consumed;
+    }
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP: {
+        const bool down = e.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+        const auto [x, y] = ToPixels(e.button.x, e.button.y);
+        if (e.button.button == SDL_BUTTON_LEFT) {
+            view.OnMouseButton(x, y, down);
+        } else if (e.button.button == SDL_BUTTON_RIGHT && down) {
+            view.OnNav(Nav::Back);
+        }
+        AfterSaveInput();
+        return EventRoute::Consumed;
+    }
+    case SDL_EVENT_MOUSE_WHEEL: {
+        const float flip = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.0f : 1.0f;
+        view.OnWheel(e.wheel.y * flip);
+        RenderSaveDialog();
+        return EventRoute::Consumed;
+    }
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
+        TrackPad(e, true);
+        const auto cfg = Settings::Instance().Current();
+        if (const auto nav = PadNav(e.gbutton.button, !cfg.enter_button_cross)) {
+            view.OnNav(*nav);
+            AfterSaveInput();
+        }
+        return EventRoute::BridgeOnly; // the bridge keeps the controller's state; the game reads "intercepted"
+    }
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        TrackPad(e, false);
+        return EventRoute::BridgeOnly;
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+        if (e.gaxis.axis != SDL_GAMEPAD_AXIS_LEFTX && e.gaxis.axis != SDL_GAMEPAD_AXIS_LEFTY) {
+            return EventRoute::BridgeOnly;
+        }
+        const float v = static_cast<float>(e.gaxis.value) / 32767.0f;
+        (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ? st.stick_x : st.stick_y) = v;
+        std::optional<Nav> dir;
+        if (std::abs(st.stick_y) > 0.6f && std::abs(st.stick_y) >= std::abs(st.stick_x)) {
+            dir = st.stick_y < 0 ? Nav::Up : Nav::Down;
+        } else if (std::abs(st.stick_x) > 0.6f) {
+            dir = st.stick_x < 0 ? Nav::Left : Nav::Right;
+        }
+        if (dir && st.held_nav != dir) {
+            view.OnNav(*dir);
+            AfterSaveInput();
+        }
+        st.held_nav = dir; // (one step per push of the stick)
+        return EventRoute::BridgeOnly;
+    }
+    case SDL_EVENT_GAMEPAD_REMOVED:
+        ForgetPadState();
+        return EventRoute::Normal;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        ForgetPadState();
+        return EventRoute::BridgeOnly;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        return EventRoute::BridgeOnly; // the cursor stays free
+    case SDL_EVENT_WINDOW_MOVED:
+    case SDL_EVENT_WINDOW_RESIZED:
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+    case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+    case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+    case SDL_EVENT_WINDOW_RESTORED:
+    case SDL_EVENT_WINDOW_MAXIMIZED:
+        RenderSaveDialog();
+        return EventRoute::Normal;
+    default:
+        return EventRoute::Normal;
     }
 }
 
@@ -1059,6 +1281,17 @@ void MenuController::Install(const Options& options) {
     if (st.poll_event != 0) {
         SDL_AddTimer(kGamePollMs, &GamePollTimer, nullptr);
     }
+    if (st.overlay_ok) {
+        // the game's Save / Load dialogs (SaveData::Dialog): shown on the overlay; without one they cannot be shown
+        // and the runtime finishes them as cancelled
+        g_save_event = SDL_RegisterEvents(1);
+        if (g_save_event != 0) {
+            SaveData::Dialog::SetHost(&SaveDialogHost);
+            if (SaveData::Dialog::Running()) {
+                SaveDialogHost();
+            }
+        }
+    }
     g_trophy_event = SDL_RegisterEvents(1);
     if (g_trophy_event != 0) {
         std::scoped_lock lock{g_trophy_mutex};
@@ -1122,8 +1355,8 @@ bool MenuController::IsOpen() const {
 
 void MenuController::Open() {
     auto& st = S();
-    if (!installed_ || IsOpen()) {
-        return;
+    if (!installed_ || IsOpen() || st.save_view.IsOpen()) {
+        return; // (not over the system's save data dialog: it is answered first)
     }
     if (!st.overlay_ok) {
         if (!st.reported_unavailable) {
@@ -1227,6 +1460,13 @@ EventRoute MenuController::OnEvent(const SDL_Event& e) {
     if (const u32 te = g_trophy_event.load(); te != 0 && e.type == te) {
         OnTrophyEvent();
         return EventRoute::Consumed;
+    }
+    if (const u32 se = g_save_event.load(); se != 0 && e.type == se) {
+        SyncSaveDialog();
+        return EventRoute::Consumed;
+    }
+    if (st.save_view.IsOpen() && !open) {
+        return SaveDialogEvent(e);
     }
     // F1 only for development (SSPC_DEV_F1=1), or when the game's screens cannot be seen (another eboot)
     const bool f1_opens = st.dev_f1 || !Engine::GameMenu::Installed();

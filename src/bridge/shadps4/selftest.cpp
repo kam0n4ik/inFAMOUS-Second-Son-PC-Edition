@@ -60,6 +60,7 @@
 #include "runtime/kernel/pthread_sync.h"
 #include "runtime/memory/direct_memory.h"
 #include "settings/settings_checks.h"
+#include "ui/save_data_dialog.h"
 #include "runtime/psf/param_sfo.h"
 #include "runtime/user/user_service.h"
 
@@ -4851,6 +4852,16 @@ void TestPcSettings(Totals& t, const App::Config& cfg) {
     }
 }
 
+/// The save data dialog (libSceSaveDataDialog with libSceSaveData, NATIVE): the game's Save / Load calls answered
+/// through the dialog's view (ui/save_data_dialog.h), in a scratch save folder under logs.
+void TestSaveDataDialog(Totals& t, const App::Config& cfg) {
+    InputChecks c(t, "save dialog");
+    ::SecondSon::Ui::RunSaveDataDialogChecks(
+        [&](std::string_view what, bool ok, const std::string& detail) { c.Check(std::string(what), ok, detail); },
+        cfg.logs_dir / "selftest_savedata");
+    c.Summary();
+}
+
 int RunSelfTest(const App::Config& cfg) {
     Totals t;
     // P5.3: SSPC_SELFTEST_ONLY=shader - the shader frontend's groups alone (the full run's stack stress takes the
@@ -4862,16 +4873,21 @@ int RunSelfTest(const App::Config& cfg) {
     const bool settings_only = std::string_view(only) == "settings";
     // R10: SSPC_SELFTEST_ONLY=sysrt - CommonDialog, libSceNet and libSceLibcInternal's stdout alone (selftest_sysrt.cpp)
     const bool sysrt_only = std::string_view(only) == "sysrt";
+    // SSPC_SELFTEST_ONLY=savedata - the save data dialog alone
+    const bool savedata_only = std::string_view(only) == "savedata";
     decltype(TestShaderFrontend(cfg)) native_groups;
     if (settings_only) {
         TestPcSettings(t, cfg);
     }
-    if (!shader_only && !settings_only) {
+    if (savedata_only) {
+        TestSaveDataDialog(t, cfg);
+    }
+    if (!shader_only && !settings_only && !savedata_only) {
         for (auto& g : TestSysrt(cfg)) {
             native_groups.push_back(std::move(g));
         }
     }
-    if (!shader_only && !settings_only && !sysrt_only) {
+    if (!shader_only && !settings_only && !sysrt_only && !savedata_only) {
     TestParamSfo(t, cfg);
     TestFileSystem(t, cfg);
     TestPlayGo(t);
@@ -4881,6 +4897,7 @@ int RunSelfTest(const App::Config& cfg) {
     TestPad(t);
     TestInput(t);
     TestPcSettings(t, cfg);
+    TestSaveDataDialog(t, cfg);
     TestKernelTime(t);
     TestKernelSema(t);
     TestKernelEventFlag(t);
@@ -4936,7 +4953,7 @@ int RunSelfTest(const App::Config& cfg) {
         native_groups.push_back(std::move(g));
     }
     } // (!shader_only)
-    if (!settings_only && !sysrt_only) {
+    if (!settings_only && !sysrt_only && !savedata_only) {
     // P5.3: the native operations' direct path through the processor (light: also in the shader-only run).
     for (auto& g : TestGpuNativeDirect()) {
         native_groups.push_back(std::move(g));

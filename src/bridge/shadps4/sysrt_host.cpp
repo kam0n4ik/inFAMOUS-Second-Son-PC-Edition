@@ -1,6 +1,7 @@
 // SecondSonPC — R10 sysrt adapters (TEMPORARY, removed with the bridge's dialog and socket libraries).
-//   sysrt-dialog: the bridge's MsgDialog / SaveDataDialog / ErrorDialog check the bridge's own
-//                 CommonDialog::g_isInitialized; SecondSonPC's sceCommonDialogInitialize sets it there too.
+//   sysrt-dialog: the bridge's MsgDialog / ErrorDialog (and its SaveDataDialog with --bridge savedata) check the
+//                 bridge's own CommonDialog::g_isInitialized; SecondSonPC's sceCommonDialogInitialize sets it there too.
+//                 SecondSonPC's save data dialog reads that flag and shares the bridge's g_isUsed (always).
 //   sysrt-net:    the bridge's sockets, epoll and resolvers (imported, never called offline) keep their own host
 //                 start-up and pool table and their own errno: SecondSonPC's sceNetInit starts the bridge's host
 //                 networking, its pools are mirrored into the bridge's table (same ids: both take the first free of
@@ -38,6 +39,11 @@ void MirrorNetErrno(int orbis_errno) {
 } // namespace
 
 void InstallSysrtHost(const App::Config& cfg) {
+    // SecondSonPC's save data dialog (group "savedata") beside the bridge's MsgDialog / ErrorDialog: the layer's state
+    // and the one-dialog-at-a-time flag are the bridge's (the bridge's sceCommonDialogInitialize sets the first, or the
+    // listener below mirrors SecondSonPC's into it; its dialogs take and give back the second)
+    Runtime::CommonDialog::SetBridgeInitializedSource([] { return Libraries::CommonDialog::g_isInitialized; });
+    Runtime::CommonDialog::SetSharedUseFlag(&Libraries::CommonDialog::g_isUsed);
     if (Listed(cfg.native_groups, "sysrt-dialog")) {
         Runtime::CommonDialog::SetInitializeListener([] { Libraries::CommonDialog::g_isInitialized = true; });
         SSPC_LOG(Bridge, Info, "sysrt-dialog NATIVE: the bridge's dialogs see SecondSonPC's CommonDialog state");
