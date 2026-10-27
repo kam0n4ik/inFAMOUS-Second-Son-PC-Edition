@@ -348,6 +348,18 @@ struct Presenter::Impl {
         return false; // pending remains owned; never reset/destroy on timeout
     }
 
+    /// Without present fences (no swapchainMaintenance1): the presents' references to the swapchain and its semaphores
+    /// retired by the queue going idle (the presents are on it), before they are replaced or destroyed.
+    void WaitPresentsWithoutFences() {
+        if (ctx.Caps().swapchain_maintenance1 || ctx.Failed()) {
+            return;
+        }
+        std::scoped_lock lock{ctx.QueueMutex()};
+        if (const VkResult r = Fn().vkQueueWaitIdle(ctx.Queue()); r != VK_SUCCESS) {
+            ctx.Fail("presentation vkQueueWaitIdle", r);
+        }
+    }
+
     bool WaitSlot(Slot& s, u64 timeout = 2'000'000'000ull) {
         // AcquireFrame also observes these fences. Retire every reference before a slot's
         // fence can be reset, under the same host-side lock.
@@ -537,6 +549,7 @@ struct Presenter::Impl {
                 return false;
             }
         }
+        WaitPresentsWithoutFences();
         std::string error;
         if (!CreateSwapchain(error)) {
             std::scoped_lock lock{stats_mutex};
@@ -801,8 +814,10 @@ std::unique_ptr<Presenter> Presenter::Create(DeviceContext& ctx, Timeline& timel
     auto impl = std::make_unique<Impl>(ctx, timeline);
     impl->wanted_mode = ParsePresentMode(present_mode);
     if (!ctx.Caps().swapchain_maintenance1) {
-        error = "present fences are required (swapchainMaintenance1)";
-        return nullptr;
+        // (issue #2: AMD's driver without swapchain_maintenance1) the presents' resources retired by the queue going
+        // idle where present fences would have been waited for: a swapchain change, frame generation's switch, the end
+        SSPC_LOG(GPU, Warning, "native presenter: no present fences (swapchainMaintenance1): the queue is waited idle "
+                               "before a swapchain is replaced or destroyed");
     }
     impl->window = static_cast<SDL_Window*>(sdl_window);
     if (impl->window == nullptr) {
@@ -920,6 +935,7 @@ Presenter::~Presenter() {
             TerminateProcess(GetCurrentProcess(), 5);
         }
     }
+    m.WaitPresentsWithoutFences();
     for (auto& capture : m.pending_captures) {
         bool pending = true;
         if (!m.WaitFence(capture.fence, pending, 5'000'000'000ull) &&
@@ -1444,8 +1460,10 @@ void Presenter::Present(s32 frame, u64 flip_id) {
                 .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT,
                 .pNext = reflex ? &present_id : nullptr,
                 .swapchainCount = 1, .pFences = &s.present_fence};
+            const bool fences = m.ctx.Caps().swapchain_maintenance1; // (without: no fence, nothing pending on it)
             const VkPresentInfoKHR pi{.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-                                      .pNext = &pf,
+                                      .pNext = fences ? static_cast<const void*>(&pf)
+                                                      : reflex ? static_cast<const void*>(&present_id) : nullptr,
                                       .waitSemaphoreCount = 1,
                                       .pWaitSemaphores = &m.done[index],
                                       .swapchainCount = 1,
@@ -1472,7 +1490,7 @@ void Presenter::Present(s32 frame, u64 flip_id) {
                 s.probe_pending = true;
             }
             // WSI errors below still enqueue semaphore waits and the present fence.
-            s.present_pending = !m.fg && (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR ||
+            s.present_pending = !m.fg && fences && (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR ||
                                 pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_ERROR_SURFACE_LOST_KHR ||
                                 pr == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT);
         }

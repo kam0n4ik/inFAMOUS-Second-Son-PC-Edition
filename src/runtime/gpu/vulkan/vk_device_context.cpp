@@ -130,14 +130,29 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     std::vector<VkExtensionProperties> iexts(n);
     f.vkEnumerateInstanceExtensionProperties(nullptr, &n, iexts.data());
     std::vector<const char*> ienable;
+    // surface_maintenance1 (for swapchain_maintenance1's present fences): KHR (the promoted one, the same structures)
+    // or EXT, whichever the loader has - AMD's driver may have only one of them, or neither (issue #2): then the
+    // presenter goes without present fences (vk_presenter.cpp)
+    const char* surface_m1 = nullptr;
+    char no_m1[4] = {};
+    const bool m1_off = GetEnvironmentVariableA("SSPC_DIAG_NO_SWAPCHAIN_MAINTENANCE", no_m1, sizeof(no_m1)) == 1 &&
+                        no_m1[0] == '1'; // (diagnostics: the presenter's path without them, on any driver)
     if (options.presentation) {
-        for (const char* e : {"VK_KHR_surface", "VK_KHR_win32_surface",
-                              "VK_KHR_get_surface_capabilities2", "VK_EXT_surface_maintenance1"}) {
+        for (const char* e : {"VK_KHR_surface", "VK_KHR_win32_surface"}) {
             if (!Has(iexts, e)) {
                 error = fmt::format("the instance extension {} is missing", e);
                 return nullptr;
             }
             ienable.push_back(e);
+        }
+        if (!m1_off && Has(iexts, "VK_KHR_get_surface_capabilities2")) {
+            surface_m1 = Has(iexts, VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME)   ? VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME
+                         : Has(iexts, VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME) ? VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME
+                                                                                   : nullptr;
+        }
+        if (surface_m1 != nullptr) {
+            ienable.push_back("VK_KHR_get_surface_capabilities2");
+            ienable.push_back(surface_m1);
         }
     }
     // Upscaling: NVIDIA NGX's instance extensions for DLSS (when sspc_dlss.dll is present; docs/UPSCALING_FRAME_GENERATION.md)
@@ -375,11 +390,24 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
             return nullptr;
         }
         denable.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-        if (!Has(dexts, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
-            error = "native presentation requires VK_EXT_swapchain_maintenance1 for safe present resource retirement";
-            return nullptr;
+        // swapchain_maintenance1 of the same kind as the instance's surface_maintenance1 (KHR needs KHR's, EXT EXT's)
+        const char* swap_m1 = nullptr;
+        if (surface_m1 != nullptr) {
+            swap_m1 = std::string_view(surface_m1) == VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME
+                          ? VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME
+                          : VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+            if (!Has(dexts, swap_m1)) {
+                swap_m1 = nullptr;
+            }
         }
-        denable.push_back(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
+        if (swap_m1 != nullptr) {
+            denable.push_back(swap_m1);
+        }
+        SSPC_LOG(GPU, Info, "native presentation: {}", swap_m1 != nullptr
+                     ? fmt::format("present fences through {} and {}", surface_m1, swap_m1)
+                     : fmt::format("no swapchain_maintenance1 ({}): presents retired by the queue going idle at a "
+                                   "swapchain change", m1_off ? "SSPC_DIAG_NO_SWAPCHAIN_MAINTENANCE=1"
+                                                              : "not offered by the driver"));
         // NVIDIA Reflex: the driver's low latency mode on the swapchain, frames tied together by their present ids
         if (Has(dexts, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) && Has(dexts, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
             denable.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
@@ -515,8 +543,8 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
         *tail = &s;
         tail = &s.pNext;
     };
-    if (options.presentation) {
-        link(swap_maintenance);
+    if (enabled(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) || enabled(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+        link(swap_maintenance); // (KHR's structure is EXT's: the same sType and fields)
     }
     if (enabled(VK_NV_LOW_LATENCY_2_EXTENSION_NAME)) {
         link(present_id);
@@ -577,9 +605,10 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     f.vkGetPhysicalDeviceFeatures2(pd, &f2);
     caps.swapchain_maintenance1 = options.presentation && swap_maintenance.swapchainMaintenance1 == VK_TRUE;
     caps.low_latency = enabled(VK_NV_LOW_LATENCY_2_EXTENSION_NAME) && present_id.presentId == VK_TRUE;
-    if (options.presentation && !caps.swapchain_maintenance1) {
-        error = "native presentation requires the swapchainMaintenance1 feature";
-        return nullptr;
+    if (options.presentation && !caps.swapchain_maintenance1 &&
+        (enabled(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) || enabled(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME))) {
+        SSPC_LOG(GPU, Warning, "native presentation: swapchain_maintenance1 offered without its swapchainMaintenance1 "
+                               "feature: presents retired by the queue going idle at a swapchain change");
     }
     const auto need = [&](VkBool32 have, const char* what) {
         if (!have && error.empty()) {
