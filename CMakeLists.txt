@@ -147,6 +147,7 @@ add_library(sspc_runtime STATIC
     src/runtime/kernel/event_flag.cpp
     src/runtime/kernel/equeue.cpp
     src/runtime/savedata/savedata.cpp
+    src/runtime/savedata/savedata_dialog.cpp
     src/runtime/audio/audio_out.cpp
     src/runtime/media/videodec.cpp
     src/runtime/gpu/gcn/gcn_aux.cpp
@@ -336,6 +337,8 @@ set(SSPC_PC_SETTINGS_SOURCES
     src/ui/overlay_win32.cpp
     src/ui/prompt_icons.cpp
     src/ui/prompt_textures.cpp
+    src/ui/save_data_dialog.cpp
+    src/ui/save_data_dialog_checks.cpp
     src/ui/settings_menu.cpp
 )
 # Settings and draw commands are written with designated initializers that leave the other fields at their defaults.
