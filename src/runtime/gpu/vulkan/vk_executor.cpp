@@ -631,6 +631,10 @@ bool Executor::Begin() {
     const VkCommandBufferBeginInfo bi{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     f.vkBeginCommandBuffer(cur_.cb, &bi);
+    // the batch's own first and last journal entries (issue #2): without them the work a batch's end records - the
+    // write-backs and the barrier after them - is invisible, and a GPU that stops in it looks like one that stopped
+    // after the batch's last draw
+    DiagEnd(DiagBegin("batch begins"));
     if (queries_ != VK_NULL_HANDLE) {
         cur_.query_slot = next_query_slot_++ % kQuerySlots;
         if (!ring_.Mirrored()) { // (hybrid ring: the batch's first timestamp is written by its head, before the copies)
@@ -1093,7 +1097,9 @@ void Executor::Flush() {
     if (skip_wb) {
         buffers_.DropWriteBack();
     }
+    const u64 wb_cid = DiagBegin("batch end: write-backs of the GPU's writes to the host");
     buffers_.RecordWriteBack(cur_.cb, cur_.value);
+    DiagEnd(wb_cid);
     // (by the batch's end: 0 a fence/flip/sync/idle flush, 1 full with a fence or a timeline write, 2 full without)
     stats_.wb_bytes_by[!flush_full_ ? 0 : batch_fence_ ? 1 : 2] += buffers_.Stats().writeback_bytes - wb0;
     flush_full_ = false;
@@ -1121,6 +1127,7 @@ void Executor::Flush() {
     if (cur_.query_slot != ~0u) {
         f.vkCmdWriteTimestamp2(cur_.cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, queries_, cur_.query_slot * 2 + 1);
     }
+    DiagEnd(DiagBegin("batch ends")); // (issue #2: the GPU reached the end of this batch's commands)
     f.vkEndCommandBuffer(cur_.cb);
     // hybrid stream ring: the bytes the CPU put into the ring for this batch, copied into the video memory mirror its
     // commands read - before the first of them (one or two copies; the previous batch ended with a full barrier, so
