@@ -69,6 +69,11 @@ struct DeviceCaps {
     bool calibrated_timestamps = false; ///< VK_EXT_calibrated_timestamps (P4.12 stall trace, deep mode only)
     bool validation = false; ///< the validation layer is on
     u32 subgroup_size = 0;
+    u32 subgroup_size_min = 0, subgroup_size_max = 0;
+    /// the stages whose pipelines ask for subgroup_size (requiredSubgroupSize): a SPIR-V 1.6 module may run at any
+    /// subgroup size between the minimum and the maximum the driver picks (AMD RDNA: 32 or 64), and the translated
+    /// shaders' lane arithmetic is for subgroup_size (issue #2); 0 when the size cannot vary (NVIDIA: 32 only)
+    VkShaderStageFlags subgroup_size_stages = 0;
     u32 max_push_descriptors = 0;
     u64 min_storage_buffer_alignment = 256;
     u64 min_uniform_buffer_alignment = 256;

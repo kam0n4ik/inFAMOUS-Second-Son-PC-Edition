@@ -612,6 +612,13 @@ bool PipelineFactory::Build(const GS::PipelineDesc& desc, VkShaderModule vs_mod,
     };
     VkPipelineCreationFeedback feedback{};
     std::array<VkPipelineCreationFeedback, 4> stage_feedback{};
+    // the subgroup size the shaders were translated for (else a SPIR-V 1.6 module may run at another: issue #2)
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .requiredSubgroupSize = ctx_.Caps().subgroup_size};
+    const auto subgroup_for = [&](VkShaderStageFlagBits stage) -> const void* {
+        return (ctx_.Caps().subgroup_size_stages & stage) != 0 ? &subgroup : nullptr;
+    };
     if (desc.compute) {
         const VkPipelineCreationFeedbackCreateInfo fci{.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
                                                        .pPipelineCreationFeedback = &feedback,
@@ -621,6 +628,7 @@ bool PipelineFactory::Build(const GS::PipelineDesc& desc, VkShaderModule vs_mod,
                                              .pNext = &fci,
                                              .flags = create_flags,
                                              .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                       .pNext = subgroup_for(VK_SHADER_STAGE_COMPUTE_BIT),
                                                        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                                                        .module = vs_mod,
                                                        .pName = "main"},
@@ -638,6 +646,7 @@ bool PipelineFactory::Build(const GS::PipelineDesc& desc, VkShaderModule vs_mod,
 
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     stages.push_back({.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                      .pNext = subgroup_for(VK_SHADER_STAGE_VERTEX_BIT),
                       .stage = VK_SHADER_STAGE_VERTEX_BIT,
                       .module = vs_mod,
                       .pName = "main"});
@@ -651,16 +660,19 @@ bool PipelineFactory::Build(const GS::PipelineDesc& desc, VkShaderModule vs_mod,
             return fail("rect/quad list tessellation stages: " + error);
         }
         stages.push_back({.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                          .pNext = subgroup_for(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT),
                           .stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
                           .module = tcs,
                           .pName = "main"});
         stages.push_back({.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                          .pNext = subgroup_for(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT),
                           .stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
                           .module = tes,
                           .pName = "main"});
     }
     if (desc.has_ps) {
         stages.push_back({.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                          .pNext = subgroup_for(VK_SHADER_STAGE_FRAGMENT_BIT),
                           .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
                           .module = ps_mod,
                           .pName = "main"});

@@ -307,8 +307,10 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
     VkPhysicalDevicePushDescriptorPropertiesKHR push_props{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR, .pNext = &host_props};
-    VkPhysicalDeviceVulkan11Properties p11{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES,
+    VkPhysicalDeviceVulkan13Properties p13{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES,
                                            .pNext = &push_props};
+    VkPhysicalDeviceVulkan11Properties p11{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES,
+                                           .pNext = &p13};
     VkPhysicalDeviceProperties2 p2{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p11};
     f.vkGetPhysicalDeviceProperties2(pd, &p2);
     ctx->name_ = p2.properties.deviceName;
@@ -326,6 +328,8 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     const VkPhysicalDeviceLimits& lim = p2.properties.limits;
     DeviceCaps& caps = ctx->caps_;
     caps.subgroup_size = p11.subgroupSize;
+    caps.subgroup_size_min = p13.minSubgroupSize;
+    caps.subgroup_size_max = p13.maxSubgroupSize;
     caps.max_push_descriptors = push_props.maxPushDescriptors;
     caps.min_storage_buffer_alignment = lim.minStorageBufferOffsetAlignment;
     caps.min_uniform_buffer_alignment = lim.minUniformBufferOffsetAlignment;
@@ -624,6 +628,21 @@ std::unique_ptr<DeviceContext> DeviceContext::Create(const ContextOptions& optio
     need(div.vertexAttributeInstanceRateDivisor, "vertexAttributeInstanceRateDivisor");
     if (!error.empty()) {
         return nullptr;
+    }
+    // the translated shaders run at the subgroup size they were translated for (subgroupSizeControl, core in 1.3)
+    if (caps.subgroup_size_min != caps.subgroup_size_max && v13.subgroupSizeControl == VK_TRUE &&
+        caps.subgroup_size_min <= caps.subgroup_size && caps.subgroup_size <= caps.subgroup_size_max) {
+        caps.subgroup_size_stages = p13.requiredSubgroupSizeStages;
+    }
+    if (caps.subgroup_size_min != caps.subgroup_size_max) {
+        const VkShaderStageFlags used = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                        VK_SHADER_STAGE_COMPUTE_BIT;
+        const bool all = (caps.subgroup_size_stages & used) == used;
+        ::SecondSon::Log::Logf(::SecondSon::Log::Category::GPU, all ? ::SecondSon::Log::Level::Info : ::SecondSon::Log::Level::Warning,
+                 "native backend: subgroups of {} to {}; the shaders' size {} asked for in stages {:#x} (vertex, "
+                 "fragment, compute: {:#x}){}",
+                 caps.subgroup_size_min, caps.subgroup_size_max, caps.subgroup_size, caps.subgroup_size_stages, used,
+                 all ? "" : " - the other stages may run at another size");
     }
     caps.occlusion_precise = f2.features.occlusionQueryPrecise == VK_TRUE;
     // what the backend does not use and only costs
