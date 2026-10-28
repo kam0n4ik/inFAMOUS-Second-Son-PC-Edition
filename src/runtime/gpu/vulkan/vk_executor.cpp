@@ -57,7 +57,7 @@ constexpr u32 kDbHtileBase = 0xA005;
 constexpr u32 kDbDepthBoundsMin = 0xA008, kDbDepthBoundsMax = 0xA009;
 constexpr u32 kDbStencilClear = 0xA00A, kDbDepthClear = 0xA00B;
 constexpr u32 kScreenScissorTl = 0xA00C, kScreenScissorBr = 0xA00D;
-constexpr u32 kDbZInfo = 0xA010, kDbStencilInfo = 0xA011;
+constexpr u32 kDbZInfo = 0xA010, kDbStencilInfo = 0xA011, kDbZReadBase = 0xA012;
 constexpr u32 kTaBcBase = 0xA020;
 constexpr u32 kWindowOffset = 0xA080, kWindowScissorTl = 0xA081, kWindowScissorBr = 0xA082;
 constexpr u32 kCbTargetMask = 0xA08E;
@@ -5750,6 +5750,22 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     CachedImage* depth_img = nullptr;
     const u32 dc = regs.Get(kDbDepthControl);
     bool depth_clear = false;
+    // a draw inside a guest occlusion query with a valid depth buffer but its test off (the glow proxies' "all of it"
+    // count): the depth buffer is bound all the same, as the DB is on the console. The pipeline was made with its
+    // format (BuildGraphicsPipelineState: DB_Z_INFO valid), and a query over a render pass without it hung AMD's GPU
+    // in the copy of the count (issue #2: RX 5600 XT, VK_ERROR_DEVICE_LOST right after such a draw, 4 reports of 4)
+    // (SSPC_OCC_DEPTH=0: the earlier targets, for A/B)
+    static const bool occ_depth_on = [] {
+        char v[8] = {};
+        return !(GetEnvironmentVariableA("SSPC_OCC_DEPTH", v, sizeof(v)) > 0 && v[0] == '0');
+    }();
+    const bool occ_depth = occ_depth_on && occ_.open && ((dc >> 1) & 1) == 0 && (regs.Get(kDbZInfo) & 3) != 0 &&
+                           regs.Get(kDbZReadBase) != 0;
+    if (occ_depth && !occ_depth_logged_) {
+        occ_depth_logged_ = true;
+        SSPC_LOG(GPU, Info, "occlusion queries: a draw with the depth test off inside a query - its depth buffer is "
+                            "bound all the same (SSPC_OCC_DEPTH=0: not)");
+    }
     // the last draw's targets when nothing they are built from changed (e1: 9.9 ms a frame, ~1.8 us a draw, rebuilding
     // the same targets draw after draw)
     TargetInputs tin{};
@@ -5757,7 +5773,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
                     regs.Version(Cp::Group::DepthFormat), regs.Version(Cp::Group::DepthTarget)};
     tin.mode = mode;
     tin.target_mask = target_mask;
-    tin.depth_control = dc & 7; // stencil, depth test, depth write (the depth view)
+    tin.depth_control = (dc & 7) | (occ_depth ? 8u : 0u); // stencil, depth test, depth write (the depth view)
     tin.mrt_mask = st->mrt_mask;
     tin.cb_extent = d.cb_extent;
     tin.db_extent = d.db_extent;
@@ -5828,7 +5844,7 @@ void Executor::RecordDraw(const Cp::DrawDescriptor& d, const PreparedCommand& pc
     }
     key.color_count = num_color;
     const bool depth_valid = (regs.Get(kDbZInfo) & 3) != 0, stencil_valid = (regs.Get(kDbStencilInfo) & 1) != 0;
-    if ((((dc >> 1) & 1) && depth_valid) || ((dc & 1) && stencil_valid)) {
+    if ((((dc >> 1) & 1) && depth_valid) || ((dc & 1) && stencil_valid) || occ_depth) {
         const ImageLayout layout = LayoutFromDepthTarget(regs, d.db_extent);
         depth_img = images_.Find(layout, ImageCache::Use::DepthTarget, cur_.cb, cur_.value, err);
         if (depth_img == nullptr) {

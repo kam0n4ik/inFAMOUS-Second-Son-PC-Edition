@@ -1185,6 +1185,7 @@ private:
     VkQueryPool occ_pool_ = VK_NULL_HANDLE;
     u32 occ_next_ = 0;
     u64 occ_queries_ = 0, occ_draws_ = 0, occ_refused_ = 0, occ_abandoned_ = 0, occ_overflow_ = 0;
+    bool occ_depth_logged_ = false; ///< issue #2: the first draw inside a query with its depth buffer bound for it
     void OcclusionResetSlots(const std::vector<u32>& slots);
     u32 next_query_slot_ = 0;
     // SSPC-020 / P4.6 night: the GPU's time at each held clock fence's place (SSPC_DIAG_CLOCK=completion: the time the
