@@ -45,6 +45,15 @@ BufferCache::BufferCache(DeviceContext& ctx, GuestBuffers& guest, PageTracker* t
         SSPC_LOG(GPU, Warning, "DIAGNOSTIC EXPERIMENT: SSPC_DIAG_BUFFER_CACHE=off - the buffer cache is disabled for this run");
         return;
     }
+    // issue #2 (RX 5600 XT, driver 0x800161): with the sparse mirror the GPU hung and the driver crashed in
+    // vkBeginCommandBuffer 20-40 s into the city, wherever the frame was; without it the game runs (the reporter's
+    // runs). Off on AMD's GPUs; SSPC_BUFFER_CACHE=on keeps it on
+    if (char on[4] = {}; ctx_.VendorId() == 0x1002 &&
+                         !(GetEnvironmentVariableA("SSPC_BUFFER_CACHE", on, sizeof(on)) == 2 && std::string_view(on) == "on")) {
+        stats_.first_error = "off on AMD GPUs (issue #2: the sparse mirror lost the device; SSPC_BUFFER_CACHE=on: on)";
+        SSPC_LOG(GPU, Warning, "native backend: buffer cache {}", stats_.first_error);
+        return;
+    }
     if (char hr[4] = {}; GetEnvironmentVariableA("SSPC_REA_HEAP_READS", hr, sizeof(hr)) == 1 && hr[0] == '1') {
         heap_reads_ = true;
         SSPC_LOG(GPU, Warning, "REA-2: SSPC_REA_HEAP_READS=1 - the game's vertex-data heaps (read-only bindings >= 256 MiB) "
