@@ -4,6 +4,7 @@
 #include "runtime/gpu/vulkan/vk_diagnostics.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 
 #include <fmt/format.h>
@@ -20,6 +21,12 @@ std::atomic<u64> g_diag_submission{0};
 namespace {
 
 constexpr u64 kRing = 65536;
+std::atomic<Diagnostics*> g_active{nullptr};
+
+s64 SteadyNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 std::mutex g_vlog_mutex;
 FILE* g_vlog = nullptr;
@@ -145,11 +152,14 @@ Diagnostics::Diagnostics(DeviceContext& ctx, bool enabled, const std::filesystem
                 markers_[1] = 0;
                 markers_[2] = 0;
                 markers_[3] = 0;
+                markers_[4] = 0; // [4], [5]: the presenter's (PresentBegin / PresentEnd)
+                markers_[5] = 0;
             } else {
                 SSPC_LOG(GPU, Warning, "native backend diagnostics: no buffer markers (host-visible memory)");
             }
         }
     }
+    g_active.store(this, std::memory_order_release);
     SSPC_LOG(GPU, Info,
              "native backend diagnostics ON: command journal, checkpoints {}, buffer markers {}, device fault {}, "
              "object names {}",
@@ -158,6 +168,8 @@ Diagnostics::Diagnostics(DeviceContext& ctx, bool enabled, const std::filesystem
 }
 
 Diagnostics::~Diagnostics() {
+    Diagnostics* self = this;
+    g_active.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
     const auto& f = Fn();
     if (marker_memory_ != VK_NULL_HANDLE) {
         f.vkFreeMemory(ctx_.Device(), marker_memory_, nullptr);
@@ -197,6 +209,33 @@ void Diagnostics::End(VkCommandBuffer cb, u64 id, u8 lane) {
     }
     Fn().vkCmdWriteBufferMarkerAMD(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, marker_buffer_, lane != 0 ? 12 : 4,
                                    static_cast<u32>(id));
+}
+
+Diagnostics* Diagnostics::Active() {
+    return g_active.load(std::memory_order_acquire);
+}
+
+void Diagnostics::PresentBegin(VkCommandBuffer cb, u64 flip) {
+    if (markers_ != nullptr) {
+        Fn().vkCmdWriteBufferMarkerAMD(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, marker_buffer_, 16, static_cast<u32>(flip));
+    }
+}
+
+void Diagnostics::PresentEnd(VkCommandBuffer cb, u64 flip) {
+    if (markers_ != nullptr) {
+        Fn().vkCmdWriteBufferMarkerAMD(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, marker_buffer_, 20,
+                                       static_cast<u32>(flip));
+    }
+}
+
+void Diagnostics::PresentStep(u32 step, u64 flip, s32 result) {
+    if (step < 3) {
+        present_flip_[step].store(flip, std::memory_order_relaxed);
+        present_ns_[step].store(SteadyNs(), std::memory_order_relaxed);
+    }
+    if (step == 2) {
+        present_result_.store(result, std::memory_order_relaxed);
+    }
 }
 
 void Diagnostics::Submitted(u64 batch, u64 first_cmd, u64 last_cmd, u8 lane) {
@@ -322,6 +361,22 @@ std::filesystem::path Diagnostics::DeviceLost(const std::string& where, u64 fail
                            started, completed, lane_started, lane_completed);
     } else {
         out += "buffer markers: not available\n";
+    }
+    // the presenter: its submissions share the game's queue (a present waits there for its swapchain image)
+    {
+        const s64 now = SteadyNs();
+        const auto ago = [&](u32 step) {
+            const s64 t = present_ns_[step].load(std::memory_order_relaxed);
+            return t != 0 ? fmt::format("{} ms ago", (now - t) / 1'000'000) : std::string("never");
+        };
+        out += fmt::format("presenter (host): image acquired for flip {} ({}), submitted flip {} ({}), presented flip {} "
+                           "({}, result {})\n",
+                           present_flip_[0].load(), ago(0), present_flip_[1].load(), ago(1), present_flip_[2].load(),
+                           ago(2), present_result_.load());
+        if (markers_ != nullptr) {
+            out += fmt::format("presenter (GPU markers): last started flip {}, last completed flip {} (low 32 bits)\n",
+                               markers_[4], markers_[5]);
+        }
     }
     if (enabled_) {
         std::scoped_lock lock{mutex_};

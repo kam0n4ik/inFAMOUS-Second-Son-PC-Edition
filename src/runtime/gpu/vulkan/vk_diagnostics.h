@@ -54,6 +54,16 @@ public:
     /// The image cache's aliasing decisions (once per key; nothing when off).
     void Alias(u64 key, const std::string& line);
 
+    /// The diagnostics of the running backend when on (--gpu-native-diag), else nullptr.
+    static Diagnostics* Active();
+    /// The presenter's submission of flip `flip` (its thread, the game's queue): "started" (top of pipe) and "completed"
+    /// (bottom of pipe) markers of its own - whether the queue is held by a present (its wait on the swapchain image)
+    void PresentBegin(VkCommandBuffer cb, u64 flip);
+    void PresentEnd(VkCommandBuffer cb, u64 flip);
+    /// The presenter's steps on the host: 0 the swapchain image acquired, 1 submitted, 2 handed to vkQueuePresentKHR
+    /// (its result)
+    void PresentStep(u32 step, u64 flip, s32 result = 0);
+
     /// The first device loss: one report (the later calls do nothing). Returns the report's path.
     std::filesystem::path DeviceLost(const std::string& where, u64 failing_batch, const std::string& in_flight);
     bool Lost() const { return lost_.load(std::memory_order_acquire); }
@@ -78,6 +88,9 @@ private:
     VkDeviceMemory marker_memory_ = VK_NULL_HANDLE;
     volatile u32* markers_ = nullptr; ///< [0] started (low 32 bits of the id), [1] completed; [2], [3] the AQ lane's
     std::atomic<bool> lost_{false};
+    std::atomic<u64> present_flip_[3]{}; ///< PresentStep's flips by step
+    std::atomic<s64> present_ns_[3]{};   ///< and when (steady clock)
+    std::atomic<s32> present_result_{0}; ///< the last vkQueuePresentKHR's result
     std::mutex alias_mutex_;
     std::vector<u64> alias_keys_;
     FILE* alias_log_ = nullptr;

@@ -211,8 +211,9 @@ void PrepareShaders(const SecondSon::App::Config& config) {
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-    SSPC_LOG(App, Info, "shader preparation: exit code {} after {:.1f} s", code,
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    SSPC_LOG(App, Info, "shader preparation: exit code {:#x} after {:.1f} s{}", code,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+             code > 1 ? " - failed (its log: logs\\shader_prepare.log); the game starts as before" : "");
 }
 
 /// The desktop mode (pixels) of the display named `name` as SDL names it on Windows (the monitor's friendly name from
@@ -708,8 +709,11 @@ int main(int argc, char* argv[]) {
         return Fail("--fault-test checks the first-chance recorder's own handlers, which --native exceptions replaces; "
                     "run it without (the dispatcher has its own self-test: --selftest --native exceptions)");
     }
-    if (!Log::Init(config->logs_dir / "SecondSonPC.log", config->log_level)) {
-        return Fail("cannot open " + (config->logs_dir / "SecondSonPC.log").string());
+    // the shader preparation (--predict-shaders, a process the game's starts and waits for) logs to a file of its own:
+    // the game's process has SecondSonPC.log open (one log for both lost the preparation's lines - its crash report)
+    const char* const log_name = config->predict_shaders.empty() ? "SecondSonPC.log" : "shader_prepare.log";
+    if (!Log::Init(config->logs_dir / log_name, config->log_level)) {
+        return Fail("cannot open " + (config->logs_dir / log_name).string());
     }
     // PC settings: what the user file gave, then the owner of the settings for the menu (capabilities: bootstrap).
     if (user_settings) {

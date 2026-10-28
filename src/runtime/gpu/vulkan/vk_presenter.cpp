@@ -23,6 +23,7 @@
 #include "runtime/gpu/vulkan/vk_reflex.h"
 #include "runtime/gpu/upscale/upscale_settings.h"
 #include "runtime/gpu/vulkan/vk_device_context.h"
+#include "runtime/gpu/vulkan/vk_diagnostics.h"
 #include "runtime/gpu/vulkan/vk_resources.h"
 
 #pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
@@ -1180,6 +1181,10 @@ void Presenter::Present(s32 frame, u64 flip_id) {
         return;
     }
     s.acquire_pending = !m.fg;
+    Diagnostics* const diag = Diagnostics::Active(); // (--gpu-native-diag: the present's own markers)
+    if (diag != nullptr) {
+        diag->PresentStep(0, flip_id);
+    }
     // SSPC_PRESENT_ACQUIRE_FENCE=1 (default off): the image waited for here, on the present thread. The present's
     // submission below shares the one queue with the game's batches: its wait on `acquired` holds that queue until the
     // presentation engine gives the image back (FIFO: up to a refresh) - the batches submitted after it wait too. With
@@ -1226,6 +1231,9 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     if (r != VK_SUCCESS) {
         m.ctx.Fail("begin presentation commands", r);
         return;
+    }
+    if (diag != nullptr) {
+        diag->PresentBegin(s.cb, flip_id);
     }
     const VkImage swap = m.images[index];
     VkImageMemoryBarrier2 b{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
@@ -1417,6 +1425,9 @@ void Presenter::Present(s32 frame, u64 flip_id) {
     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     f.vkCmdPipelineBarrier2(s.cb, &dep);
+    if (diag != nullptr) {
+        diag->PresentEnd(s.cb, flip_id);
+    }
     r = f.vkEndCommandBuffer(s.cb);
     if (r != VK_SUCCESS) {
         m.ctx.Fail("end presentation commands", r);
@@ -1451,6 +1462,9 @@ void Presenter::Present(s32 frame, u64 flip_id) {
         r = m.ctx.Failed() ? m.ctx.Failure() : f.vkQueueSubmit2(m.ctx.Queue(), 1, &si, s.fence);
         if (r == VK_SUCCESS) {
             s.submitted = true;
+            if (diag != nullptr) {
+                diag->PresentStep(1, flip_id);
+            }
             // NVIDIA Reflex: the present carries the frame's id (its flip id), as its markers do
             const bool reflex = !m.fg && Reflex::Attached();
             const VkPresentIdKHR present_id{.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
@@ -1484,6 +1498,9 @@ void Presenter::Present(s32 frame, u64 flip_id) {
                 }
             }
             StallTrace::Instant(StallTrace::Ev::PresentDone, flip_id); // (R10 timeline)
+            if (diag != nullptr) {
+                diag->PresentStep(2, flip_id, static_cast<s32>(pr));
+            }
             if (R10::Latency::On()) {
                 s.probe_flip = show ? flip_id : 0;
                 s.probe_tsc = __rdtsc();
