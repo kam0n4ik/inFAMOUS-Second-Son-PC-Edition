@@ -78,6 +78,7 @@ private:
     DeviceContext& ctx_;
     bool enabled_ = false;
     bool naming_ = false;
+    bool serialize_ = false; ///< SSPC_DIAG_SERIALIZE=1 (diagnostics): a full barrier before every recorded command
     std::filesystem::path dir_;
     std::mutex mutex_;
     std::vector<Record> ring_; ///< by id % size

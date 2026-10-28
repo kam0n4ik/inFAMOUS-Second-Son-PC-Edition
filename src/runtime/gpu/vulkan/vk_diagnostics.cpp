@@ -159,6 +159,11 @@ Diagnostics::Diagnostics(DeviceContext& ctx, bool enabled, const std::filesystem
             }
         }
     }
+    if (char v[4] = {}; GetEnvironmentVariableA("SSPC_DIAG_SERIALIZE", v, sizeof(v)) == 1 && v[0] == '1') {
+        serialize_ = true;
+        SSPC_LOG(GPU, Warning, "DIAGNOSTIC: SSPC_DIAG_SERIALIZE=1 - one command at a time is in flight (a full barrier "
+                               "before each); slow, and only to name the command a device loss hung in");
+    }
     g_active.store(this, std::memory_order_release);
     SSPC_LOG(GPU, Info,
              "native backend diagnostics ON: command journal, checkpoints {}, buffer markers {}, device fault {}, "
@@ -187,6 +192,19 @@ u64 Diagnostics::Begin(VkCommandBuffer cb, u64 batch, std::string text, u8 lane)
         return 0;
     }
     const auto& f = Fn();
+    if (serialize_) {
+        // SSPC_DIAG_SERIALIZE=1: everything recorded before this command finishes before it starts, so one command at
+        // a time is in flight - a device loss report then names the one command the GPU hung in, not the ~30 that were
+        // in flight. Slow (every command drains the GPU): a diagnostic, never a fix.
+        const VkMemoryBarrier2 all{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                   .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                   .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                   .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                   .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+        const VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                   .pMemoryBarriers = &all};
+        f.vkCmdPipelineBarrier2(cb, &dep);
+    }
     u64 id;
     {
         std::scoped_lock lock{mutex_};
