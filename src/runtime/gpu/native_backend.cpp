@@ -3035,6 +3035,52 @@ std::string BuildPredictedPipelines(Vk::DeviceContext& ctx, const GS::DeviceProf
     Vk::PipelineFactory factory(ctx, profile);
     factory.SetPersistence(pcache.Handle(), nullptr);
     const u32 workers = threads != 0 ? threads : std::max(1u, std::thread::hardware_concurrency() - 1);
+    // issue #2 (RX 5600 XT, driver 0x800161): the driver's compiler crashed (read of 0x28) in one of these pipelines
+    // and every start repeated the preparation to the same crash. The pipeline each worker builds is written into a
+    // mapped file (its pages reach the file when the process dies); the next preparation moves those to
+    // predict_quarantine.txt and skips them (the game builds one it uses on demand, as without the preparation)
+    const std::filesystem::path inflight_file = disk.Dir() / "predict_inflight.bin";
+    const std::filesystem::path quarantine_file = disk.Dir() / "predict_quarantine.txt";
+    std::unordered_set<u64> quarantine;
+    {
+        std::ifstream q(quarantine_file);
+        for (std::string line; std::getline(q, line);) {
+            if (const u64 h = std::strtoull(line.c_str(), nullptr, 16); h != 0) {
+                quarantine.insert(h);
+            }
+        }
+    }
+    if (std::ifstream f(inflight_file, std::ios::binary); f) {
+        std::vector<u64> suspects;
+        for (u64 h = 0; f.read(reinterpret_cast<char*>(&h), sizeof(h));) {
+            if (h != 0 && quarantine.insert(h).second) {
+                suspects.push_back(h);
+            }
+        }
+        if (!suspects.empty()) {
+            std::ofstream q(quarantine_file, std::ios::app);
+            for (const u64 h : suspects) {
+                q << fmt::format("{:016x}\n", h);
+            }
+            SSPC_LOG(GPU, Warning, "predicted pipelines: the last preparation ended while building {} of them - skipped "
+                     "from now on ({})", suspects.size(), quarantine_file.string());
+        }
+    }
+    volatile u64* inflight = nullptr;
+    HANDLE inflight_handle = CreateFileW(inflight_file.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                         FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE inflight_map = nullptr;
+    if (inflight_handle != INVALID_HANDLE_VALUE) {
+        inflight_map = CreateFileMappingW(inflight_handle, nullptr, PAGE_READWRITE, 0, workers * sizeof(u64), nullptr);
+        if (inflight_map != nullptr) {
+            inflight = static_cast<volatile u64*>(MapViewOfFile(inflight_map, FILE_MAP_WRITE, 0, 0, 0));
+        }
+    }
+    if (inflight == nullptr) {
+        SSPC_LOG(GPU, Warning, "predicted pipelines: {} not mapped (error {}) - a driver crash is not remembered",
+                 inflight_file.string(), GetLastError());
+    }
+    std::atomic<u64> skipped{0};
     struct Count {
         std::atomic<u64> built{0}, failed{0}, hits{0}, missing{0}, ns{0};
     };
@@ -3044,7 +3090,7 @@ std::string BuildPredictedPipelines(Vk::DeviceContext& ctx, const GS::DeviceProf
         std::atomic<size_t> next{0};
         std::vector<std::thread> pool;
         for (u32 t = 0; t < workers; ++t) {
-            pool.emplace_back([&] {
+            pool.emplace_back([&, t] {
                 const VkDevice dev = factory.Device();
                 std::vector<u32> vs, ps;
                 for (size_t i; (i = next.fetch_add(1)) < count;) {
@@ -3052,9 +3098,17 @@ std::string BuildPredictedPipelines(Vk::DeviceContext& ctx, const GS::DeviceProf
                     if (progress && prog != nullptr) {
                         prog->done.fetch_add(1, std::memory_order_relaxed);
                     }
+                    const u64 h = d.Hash();
+                    if (quarantine.contains(h)) {
+                        skipped.fetch_add(progress ? 1 : 0, std::memory_order_relaxed);
+                        continue;
+                    }
                     if (!disk.LoadSpirv(d.vs, vs) || (d.has_ps && !disk.LoadSpirv(d.ps, ps))) {
                         n.missing.fetch_add(1, std::memory_order_relaxed);
                         continue;
+                    }
+                    if (inflight != nullptr) {
+                        inflight[t] = h;
                     }
                     VkShaderModule vm = VK_NULL_HANDLE, pm = VK_NULL_HANDLE;
                     const auto make = [dev](const std::vector<u32>& code, VkShaderModule& out) {
@@ -3089,6 +3143,9 @@ std::string BuildPredictedPipelines(Vk::DeviceContext& ctx, const GS::DeviceProf
                     if (pm != VK_NULL_HANDLE) {
                         Vk::Fn().vkDestroyShaderModule(dev, pm, nullptr);
                     }
+                    if (inflight != nullptr) {
+                        inflight[t] = 0;
+                    }
                     if (!ok) {
                         n.failed.fetch_add(1, std::memory_order_relaxed);
                         std::scoped_lock lock{error_mutex};
@@ -3118,14 +3175,25 @@ std::string BuildPredictedPipelines(Vk::DeviceContext& ctx, const GS::DeviceProf
     Count again;
     const size_t sample = std::min<size_t>(descs.size(), 1024);
     run(sample, again, false);
+    // every pipeline built or skipped: nothing in flight to remember
+    if (inflight != nullptr) {
+        UnmapViewOfFile(const_cast<u64*>(inflight));
+    }
+    if (inflight_map != nullptr) {
+        CloseHandle(inflight_map);
+    }
+    if (inflight_handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(inflight_handle);
+        DeleteFileW(inflight_file.c_str());
+    }
     const bool saved = pcache.Save();
     return fmt::format(
         "predicted pipelines: {} described, built {} in {:.1f} s ({:.2f} ms each on {} threads; already in the driver's "
-        "cache {}), failed {} (SPIR-V missing {}){}; created again from the cache: {} of {}, {:.2f} ms each (hits {}); "
-        "the driver's cache {}",
+        "cache {}), failed {} (SPIR-V missing {}), skipped {} (they crashed the driver: {}){}; created again from the "
+        "cache: {} of {}, {:.2f} ms each (hits {}); the driver's cache {}",
         descs.size(), first.built.load(), wall,
         static_cast<double>(first.ns.load()) / 1e6 / static_cast<double>(std::max<u64>(first.built.load(), 1)), workers,
-        first.hits.load(), first.failed.load(), first.missing.load(),
+        first.hits.load(), first.failed.load(), first.missing.load(), skipped.load(), quarantine_file.filename().string(),
         first_error.empty() ? std::string() : " - first failure: " + first_error, again.built.load(), sample,
         static_cast<double>(again.ns.load()) / 1e6 / static_cast<double>(std::max<u64>(again.built.load(), 1)),
         again.hits.load(),
